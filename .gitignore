@@ -1,0 +1,25 @@
+# Build directories
+build/
+bin/
+obj/
+
+# IDE files
+.vscode/
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# Output files
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.log
+*.exp
+*.lib
+
+# Temporary files
+*.tmp
+*.bak
