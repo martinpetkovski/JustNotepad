@@ -139,7 +139,7 @@ Document g_Document;
 // Config
 std::deque<std::wstring> recentFiles;
 TCHAR szConfigPath[MAX_PATH] = {0};
-std::wstring g_StatusText[5]; // Cache for owner-draw status bar
+std::wstring g_StatusText[6]; // Cache for owner-draw status bar
 
 // Encoding currentEncoding = ENC_UTF8; // Moved to Document
 
@@ -167,7 +167,7 @@ class ProgressHelper {
     
 public:
     ProgressHelper(HWND parent, const TCHAR* title, int maxRange) : hParent(parent) {
-        if (maxRange < 10 * 1024 * 1024) // Only show modal for < 10MB
+        if (maxRange >= 5 * 1024 * 1024 && maxRange < 10 * 1024 * 1024) // Only show modal for 5MB <= size < 10MB
         {
             hProgressDlg = CreateWindowEx(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, _T("#32770"), title,
                 WS_POPUP | WS_CAPTION | WS_VISIBLE | DS_MODALFRAME, 
@@ -228,6 +228,7 @@ struct StreamContext {
     HANDLE hFile;
     BOOL bHex;
     std::vector<char> inBuffer;
+    size_t inBufferPos;
     DWORD dwOffset;
     std::string outBuffer;
     ProgressHelper* pProgress;
@@ -298,27 +299,40 @@ DWORD CALLBACK StreamInCallback(DWORD_PTR dwCookie, LPBYTE pbBuff, LONG cb, LONG
             LONG bytesCopied = 0;
             while (bytesCopied < cb)
             {
-                if (ctx->inBuffer.empty())
+                if (ctx->inBufferPos >= ctx->inBuffer.size())
                 {
+                    ctx->inBuffer.clear();
+                    ctx->inBufferPos = 0;
+
                     if (ctx->dwMapPos >= ctx->dwTotalSize) break; // EOF
 
-                    DWORD bytesRead = min(16, ctx->dwTotalSize - ctx->dwMapPos);
-                    BYTE* buf = ctx->pData + ctx->dwMapPos;
-                    
-                    UpdateStreamProgress(ctx, bytesRead);
+                    DWORD bytesToProcess = min(4096, ctx->dwTotalSize - ctx->dwMapPos);
+                    std::string batchOutput;
+                    batchOutput.reserve(bytesToProcess * 5);
 
-                    std::string line;
-                    FormatHexLine(ctx->dwOffset, buf, bytesRead, line);
-                    ctx->dwOffset += bytesRead;
-                    ctx->dwMapPos += bytesRead;
+                    DWORD processed = 0;
+                    while (processed < bytesToProcess)
+                    {
+                        DWORD chunk = min(16, bytesToProcess - processed);
+                        BYTE* buf = ctx->pData + ctx->dwMapPos + processed;
+                        
+                        FormatHexLine(ctx->dwOffset, buf, chunk, batchOutput);
+                        
+                        ctx->dwOffset += chunk;
+                        processed += chunk;
+                    }
                     
-                    ctx->inBuffer.insert(ctx->inBuffer.end(), line.begin(), line.end());
+                    ctx->dwMapPos += processed;
+                    UpdateStreamProgress(ctx, processed);
+                    
+                    ctx->inBuffer.insert(ctx->inBuffer.end(), batchOutput.begin(), batchOutput.end());
                 }
                 
-                LONG toCopy = min((LONG)ctx->inBuffer.size(), cb - bytesCopied);
-                memcpy(pbBuff + bytesCopied, ctx->inBuffer.data(), toCopy);
+                size_t available = ctx->inBuffer.size() - ctx->inBufferPos;
+                LONG toCopy = min((LONG)available, cb - bytesCopied);
+                memcpy(pbBuff + bytesCopied, ctx->inBuffer.data() + ctx->inBufferPos, toCopy);
                 
-                ctx->inBuffer.erase(ctx->inBuffer.begin(), ctx->inBuffer.begin() + toCopy);
+                ctx->inBufferPos += toCopy;
                 bytesCopied += toCopy;
             }
             *pcb = bytesCopied;
@@ -352,28 +366,40 @@ DWORD CALLBACK StreamInCallback(DWORD_PTR dwCookie, LPBYTE pbBuff, LONG cb, LONG
         LONG bytesCopied = 0;
         while (bytesCopied < cb)
         {
-            if (ctx->inBuffer.empty())
+            if (ctx->inBufferPos >= ctx->inBuffer.size())
             {
-                BYTE buf[16];
+                ctx->inBuffer.clear();
+                ctx->inBufferPos = 0;
+
+                BYTE buf[4096];
                 DWORD bytesRead = 0;
-                if (!ReadFile(ctx->hFile, buf, 16, &bytesRead, NULL) || bytesRead == 0)
+                if (!ReadFile(ctx->hFile, buf, 4096, &bytesRead, NULL) || bytesRead == 0)
                 {
                     break; // EOF or Error
                 }
                 
                 UpdateStreamProgress(ctx, bytesRead);
 
-                std::string line;
-                FormatHexLine(ctx->dwOffset, buf, bytesRead, line);
-                ctx->dwOffset += bytesRead;
+                std::string batchOutput;
+                batchOutput.reserve(bytesRead * 5);
+
+                DWORD processed = 0;
+                while (processed < bytesRead)
+                {
+                    DWORD chunk = min(16, bytesRead - processed);
+                    FormatHexLine(ctx->dwOffset, buf + processed, chunk, batchOutput);
+                    ctx->dwOffset += chunk;
+                    processed += chunk;
+                }
                 
-                ctx->inBuffer.insert(ctx->inBuffer.end(), line.begin(), line.end());
+                ctx->inBuffer.insert(ctx->inBuffer.end(), batchOutput.begin(), batchOutput.end());
             }
             
-            LONG toCopy = min((LONG)ctx->inBuffer.size(), cb - bytesCopied);
-            memcpy(pbBuff + bytesCopied, ctx->inBuffer.data(), toCopy);
+            size_t available = ctx->inBuffer.size() - ctx->inBufferPos;
+            LONG toCopy = min((LONG)available, cb - bytesCopied);
+            memcpy(pbBuff + bytesCopied, ctx->inBuffer.data() + ctx->inBufferPos, toCopy);
             
-            ctx->inBuffer.erase(ctx->inBuffer.begin(), ctx->inBuffer.begin() + toCopy);
+            ctx->inBufferPos += toCopy;
             bytesCopied += toCopy;
         }
         *pcb = bytesCopied;
@@ -1569,6 +1595,14 @@ void UpdateStatusBar()
     GETTEXTLENGTHEX gtl = { GTL_DEFAULT, 1200 }; // 1200 is CP_UNICODE
     long nLen = SendMessage(hEditor, EM_GETTEXTLENGTHEX, (WPARAM)&gtl, 0);
 
+    // Get file size
+    const EncodingInfo* info = GetEncodingInfo(doc.currentEncoding);
+    GETTEXTLENGTHEX gtlSize = { GTL_NUMBYTES | GTL_PRECISE, info->codePage };
+    long nBytes = SendMessage(hEditor, EM_GETTEXTLENGTHEX, (WPARAM)&gtlSize, 0);
+    
+    TCHAR szSize[64];
+    StrFormatByteSize(nBytes, szSize, 64);
+
     // Get Zoom
     int nNum, nDen;
     SendMessage(hEditor, EM_GETZOOM, (WPARAM)&nNum, (LPARAM)&nDen);
@@ -1583,16 +1617,19 @@ void UpdateStatusBar()
     g_StatusText[1] = szStatus;
     SendMessage(hStatus, SB_SETTEXT, 1 | SBT_OWNERDRAW, 0);
 
-    StringCchPrintf(szStatus, 256, _T("Zoom: %d%%"), nZoom);
+    StringCchPrintf(szStatus, 256, _T("Size: %s"), szSize);
     g_StatusText[2] = szStatus;
     SendMessage(hStatus, SB_SETTEXT, 2 | SBT_OWNERDRAW, 0);
 
-    g_StatusText[3] = _T("Windows (CRLF)");
+    StringCchPrintf(szStatus, 256, _T("Zoom: %d%%"), nZoom);
+    g_StatusText[3] = szStatus;
     SendMessage(hStatus, SB_SETTEXT, 3 | SBT_OWNERDRAW, 0);
-    
-    const EncodingInfo* info = GetEncodingInfo(doc.currentEncoding);
-    g_StatusText[4] = info->name;
+
+    g_StatusText[4] = _T("Windows (CRLF)");
     SendMessage(hStatus, SB_SETTEXT, 4 | SBT_OWNERDRAW, 0);
+    
+    g_StatusText[5] = info->name;
+    SendMessage(hStatus, SB_SETTEXT, 5 | SBT_OWNERDRAW, 0);
 }
 
 
@@ -3001,8 +3038,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0,
             hwnd, (HMENU)IDC_STATUSBAR, hInst, NULL);
             
-        int statwidths[] = {150, 300, 400, 550, -1};
-        SendMessage(hStatus, SB_SETPARTS, 5, (LPARAM)statwidths);
+        int statwidths[] = {150, 300, 450, 550, 700, -1};
+        SendMessage(hStatus, SB_SETPARTS, 6, (LPARAM)statwidths);
 
         // Create Progress Bar in Status Bar
         hProgressBarStatus = CreateWindowEx(0, PROGRESS_CLASS, NULL, WS_CHILD,
@@ -3184,7 +3221,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             SetTextColor(hdc, crText);
             
             // Draw Text
-            if (nPart >= 0 && nPart < 5)
+            if (nPart >= 0 && nPart < 6)
             {
                 // Add some padding
                 rc.left += 4;
@@ -3205,7 +3242,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         else if (pnm->hwndFrom == hStatus && pnm->code == NM_CLICK)
         {
             NMMOUSE *pMouse = (NMMOUSE *)lParam;
-            if (pMouse->dwItemSpec == 2) // Zoom
+            if (pMouse->dwItemSpec == 3) // Zoom
             {
                 int nNum = 0, nDen = 0;
                 SendMessage(hEditor, EM_GETZOOM, (WPARAM)&nNum, (LPARAM)&nDen);
@@ -3255,7 +3292,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     UpdateStatusBar();
                 }
             }
-            else if (pMouse->dwItemSpec == 4) // Encoding
+            else if (pMouse->dwItemSpec == 5) // Encoding
             {
                 HMENU hMenu = CreatePopupMenu();
                 for (const auto& info : g_Encodings)

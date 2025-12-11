@@ -202,30 +202,60 @@ std::basic_string<TCHAR> ToSentenceCase(const std::basic_string<TCHAR>& input)
     return out;
 }
 
+static const char g_HexLookup[] = "0123456789ABCDEF";
+
 void FormatHexLine(DWORD offset, const BYTE* data, DWORD len, std::string& out)
 {
-    char buf[256];
-    int pos = 0;
-    pos += sprintf(buf + pos, "%08X  ", offset);
-    
+    char buf[128];
+    char* p = buf;
+
+    // Offset: %08X
+    *p++ = g_HexLookup[(offset >> 28) & 0xF];
+    *p++ = g_HexLookup[(offset >> 24) & 0xF];
+    *p++ = g_HexLookup[(offset >> 20) & 0xF];
+    *p++ = g_HexLookup[(offset >> 16) & 0xF];
+    *p++ = g_HexLookup[(offset >> 12) & 0xF];
+    *p++ = g_HexLookup[(offset >> 8) & 0xF];
+    *p++ = g_HexLookup[(offset >> 4) & 0xF];
+    *p++ = g_HexLookup[offset & 0xF];
+    *p++ = ' ';
+    *p++ = ' ';
+
+    // Hex bytes
     for (DWORD i = 0; i < 16; i++)
     {
         if (i < len)
-            pos += sprintf(buf + pos, "%02X ", data[i]);
+        {
+            BYTE b = data[i];
+            *p++ = g_HexLookup[(b >> 4) & 0xF];
+            *p++ = g_HexLookup[b & 0xF];
+            *p++ = ' ';
+        }
         else
-            pos += sprintf(buf + pos, "   ");
+        {
+            *p++ = ' ';
+            *p++ = ' ';
+            *p++ = ' ';
+        }
         
-        if (i == 7) pos += sprintf(buf + pos, " ");
+        if (i == 7) *p++ = ' ';
     }
-    
-    pos += sprintf(buf + pos, " |");
+
+    *p++ = ' ';
+    *p++ = '|';
+
+    // ASCII
     for (DWORD i = 0; i < len; i++)
     {
         unsigned char c = data[i];
-        pos += sprintf(buf + pos, "%c", (c >= 32 && c <= 126) ? c : '.');
+        *p++ = (c >= 32 && c <= 126) ? c : '.';
     }
-    pos += sprintf(buf + pos, "|\r\n");
-    out.append(buf);
+    
+    *p++ = '|';
+    *p++ = '\r';
+    *p++ = '\n';
+    
+    out.append(buf, p - buf);
 }
 
 bool ParseHexLine(const std::string& line, std::vector<BYTE>& bytes)
