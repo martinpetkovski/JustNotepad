@@ -82,21 +82,33 @@ std::basic_string<TCHAR> SortLines(const std::basic_string<TCHAR>& input)
 
 std::basic_string<TCHAR> IndentLines(const std::basic_string<TCHAR>& input)
 {
-    bool endsWithNewline = false;
-    if (!input.empty())
-    {
-        if (input.back() == '\n') endsWithNewline = true;
-    }
-
-    std::vector<std::basic_string<TCHAR>> lines = SplitLines(input);
     std::basic_string<TCHAR> out;
-    for (size_t i = 0; i < lines.size(); i++)
+    out.reserve(input.length() + 10);
+
+    bool atStartOfLine = true;
+    for (size_t i = 0; i < input.length(); i++)
     {
-        out += _T("\t");
-        out += lines[i];
-        if (i < lines.size() - 1 || endsWithNewline)
+        if (atStartOfLine)
         {
-            out += _T("\r\n");
+            out += _T("\t");
+            atStartOfLine = false;
+        }
+        
+        TCHAR c = input[i];
+        out += c;
+        
+        if (c == '\r')
+        {
+            if (i + 1 < input.length() && input[i+1] == '\n')
+            {
+                out += input[i+1];
+                i++;
+            }
+            atStartOfLine = true;
+        }
+        else if (c == '\n')
+        {
+            atStartOfLine = true;
         }
     }
     return out;
@@ -104,27 +116,46 @@ std::basic_string<TCHAR> IndentLines(const std::basic_string<TCHAR>& input)
 
 std::basic_string<TCHAR> UnindentLines(const std::basic_string<TCHAR>& input)
 {
-    bool endsWithNewline = false;
-    if (!input.empty())
-    {
-        if (input.back() == '\n') endsWithNewline = true;
-    }
-
-    std::vector<std::basic_string<TCHAR>> lines = SplitLines(input);
     std::basic_string<TCHAR> out;
-    for (size_t i = 0; i < lines.size(); i++)
+    out.reserve(input.length());
+
+    bool atStartOfLine = true;
+    for (size_t i = 0; i < input.length(); i++)
     {
-        auto& line = lines[i];
-        if (!line.empty())
+        if (atStartOfLine)
         {
-            if (line[0] == '\t') line.erase(0, 1);
-            else if (line.size() >= 4 && line.substr(0, 4) == _T("    ")) line.erase(0, 4);
-            else if (line[0] == ' ') line.erase(0, 1);
+            if (input[i] == '\t')
+            {
+                atStartOfLine = false;
+                continue;
+            }
+            else if (input[i] == ' ')
+            {
+                if (i + 3 < input.length() && input[i+1] == ' ' && input[i+2] == ' ' && input[i+3] == ' ')
+                {
+                    i += 3;
+                }
+                atStartOfLine = false;
+                continue;
+            }
+            atStartOfLine = false;
         }
-        out += line;
-        if (i < lines.size() - 1 || endsWithNewline)
+        
+        TCHAR c = input[i];
+        out += c;
+        
+        if (c == '\r')
         {
-            out += _T("\r\n");
+            if (i + 1 < input.length() && input[i+1] == '\n')
+            {
+                out += input[i+1];
+                i++;
+            }
+            atStartOfLine = true;
+        }
+        else if (c == '\n')
+        {
+            atStartOfLine = true;
         }
     }
     return out;

@@ -1236,11 +1236,28 @@ LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 long lineStart = SendMessage(hwnd, EM_EXLINEFROMCHAR, 0, cr.cpMin);
                 long lineEnd = SendMessage(hwnd, EM_EXLINEFROMCHAR, 0, cr.cpMax);
                 
-                if (lineStart != lineEnd)
+                if (lineStart != lineEnd || cr.cpMin != cr.cpMax)
                 {
                     DoIndent();
                     return 0;
                 }
+            }
+        }
+    }
+    else if (msg == WM_CHAR)
+    {
+        if (wParam == VK_TAB)
+        {
+            if (GetKeyState(VK_SHIFT) & 0x8000)
+            {
+                return 0;
+            }
+            
+            CHARRANGE cr;
+            SendMessage(hwnd, EM_EXGETSEL, 0, (LPARAM)&cr);
+            if (cr.cpMin != cr.cpMax)
+            {
+                return 0;
             }
         }
     }
@@ -2188,10 +2205,17 @@ void DoIndent()
     SendMessage(hEditor, EM_SETSEL, r.start, r.end);
     SendMessage(hEditor, EM_REPLACESEL, TRUE, (LPARAM)out.c_str());
     
-    // Restore original selection offsets (accounting for added indentation)
+    // Restore original selection offsets
     long offsetStart = cr.cpMin - r.start;
     long offsetEnd = cr.cpMax - r.start;
-    CHARRANGE crNew = {r.start + offsetStart, r.start + offsetEnd};
+    
+    std::basic_string<TCHAR> subStart = sub.substr(0, offsetStart);
+    std::basic_string<TCHAR> subEnd = sub.substr(0, offsetEnd);
+    
+    long newOffsetStart = (long)IndentLines(subStart).length();
+    long newOffsetEnd = (long)IndentLines(subEnd).length();
+    
+    CHARRANGE crNew = {r.start + newOffsetStart, r.start + newOffsetEnd};
     SendMessage(hEditor, EM_EXSETSEL, 0, (LPARAM)&crNew);
 }
 
@@ -2209,10 +2233,17 @@ void DoUnindent()
     SendMessage(hEditor, EM_SETSEL, r.start, r.end);
     SendMessage(hEditor, EM_REPLACESEL, TRUE, (LPARAM)out.c_str());
     
-    // Restore original selection offsets (accounting for removed indentation)
+    // Restore original selection offsets
     long offsetStart = cr.cpMin - r.start;
     long offsetEnd = cr.cpMax - r.start;
-    CHARRANGE crNew = {r.start + offsetStart, r.start + offsetEnd};
+    
+    std::basic_string<TCHAR> subStart = sub.substr(0, offsetStart);
+    std::basic_string<TCHAR> subEnd = sub.substr(0, offsetEnd);
+    
+    long newOffsetStart = (long)UnindentLines(subStart).length();
+    long newOffsetEnd = (long)UnindentLines(subEnd).length();
+    
+    CHARRANGE crNew = {r.start + newOffsetStart, r.start + newOffsetEnd};
     SendMessage(hEditor, EM_EXSETSEL, 0, (LPARAM)&crNew);
 }
 
