@@ -1,23 +1,37 @@
 #include <windows.h>
 #include "resource.h"
 
+IDI_ICON ICON "just_notepad.ico"
+
 IDR_MAINMENU MENU
 BEGIN
     POPUP "&File"
     BEGIN
         MENUITEM "&New\tCtrl+N", ID_FILE_NEW
         MENUITEM "&Open...\tCtrl+O", ID_FILE_OPEN
+        POPUP "Open &Recent"
+        BEGIN
+            MENUITEM "Empty", ID_FILE_RECENT_FIRST, GRAYED
+        END
         MENUITEM "&Save\tCtrl+S", ID_FILE_SAVE
-        MENUITEM "Save &As...", ID_FILE_SAVEAS
+        MENUITEM "Save &As...\tCtrl+Shift+S", ID_FILE_SAVEAS
+        MENUITEM "Discard Changes", ID_FILE_RELOAD
         MENUITEM SEPARATOR
         MENUITEM "Page Set&up...", ID_FILE_PAGESETUP
         MENUITEM "&Print...\tCtrl+P", ID_FILE_PRINT
         MENUITEM SEPARATOR
+        POPUP "&Encoding"
+        BEGIN
+            MENUITEM "&ANSI", ID_ENCODING_ANSI
+            MENUITEM "&UTF-8", ID_ENCODING_UTF8
+            MENUITEM "UTF-16 &LE", ID_ENCODING_UTF16LE
+            MENUITEM "UTF-16 &BE", ID_ENCODING_UTF16BE
+        END
+        MENUITEM "&Read Only", ID_FILE_TOGGLEREADONLY
+        MENUITEM SEPARATOR
         MENUITEM "Open Containing &Folder", ID_FILE_OPENFOLDER
         MENUITEM "Open in &Command Prompt", ID_FILE_OPENCMD
         MENUITEM "Open in &Default App", ID_FILE_OPENDEFAULT
-        MENUITEM SEPARATOR
-        MENUITEM "&Read Only", ID_FILE_TOGGLEREADONLY
         MENUITEM SEPARATOR
         MENUITEM "E&xit", ID_FILE_EXIT
     END
@@ -30,42 +44,15 @@ BEGIN
         MENUITEM "&Copy\tCtrl+C", ID_EDIT_COPY
         MENUITEM "&Paste\tCtrl+V", ID_EDIT_PASTE
         MENUITEM "De&lete\tDel", ID_EDIT_DELETE
-        MENUITEM SEPARATOR
-        MENUITEM "Copy Line\tCtrl+L", ID_EDIT_COPYLINE
-        MENUITEM "Delete Line\tCtrl+Shift+K", ID_EDIT_DELETELINE
-        MENUITEM "Duplicate Line\tShift+Alt+Down", ID_EDIT_DUPLICATELINE
-        MENUITEM "Duplicate Selection", ID_EDIT_DUPLICATESELECTION
-        MENUITEM "Move Line Up\tAlt+Up", ID_EDIT_MOVELINEUP
-        MENUITEM "Move Line Down\tAlt+Down", ID_EDIT_MOVELINEDOWN
-        MENUITEM SEPARATOR
+    END
+    POPUP "&Find"
+    BEGIN
         MENUITEM "&Find...\tCtrl+F", ID_EDIT_FIND
         MENUITEM "Find &Next\tF3", ID_EDIT_FINDNEXT
         MENUITEM "Find Pre&vious\tShift+F3", ID_EDIT_FINDPREV
         MENUITEM "&Replace...\tCtrl+H", ID_EDIT_REPLACE
+        MENUITEM "Ad&vanced Search...\tCtrl+Shift+F", ID_EDIT_ADVANCED_SEARCH
         MENUITEM "&Go To...\tCtrl+G", ID_EDIT_GOTO
-        MENUITEM SEPARATOR
-        MENUITEM "Expand Selection\tShift+Alt+Right", ID_EDIT_EXPAND_SELECTION
-        MENUITEM "Expand Selection to Line\tCtrl+L", ID_EDIT_SELECTLINE
-        MENUITEM "Shrink Selection\tShift+Alt+Left", ID_EDIT_SHRINK_SELECTION
-        MENUITEM SEPARATOR
-        POPUP "Con&vert Case"
-        BEGIN
-            MENUITEM "&Uppercase", ID_EDIT_UPPERCASE
-            MENUITEM "&Lowercase", ID_EDIT_LOWERCASE
-            MENUITEM "&Capitalize", ID_EDIT_CAPITALIZE
-            MENUITEM "&Sentence Case", ID_EDIT_SENTENCECASE
-        END
-        POPUP "&Lines"
-        BEGIN
-            MENUITEM "&Sort Lines", ID_EDIT_SORTLINES
-            MENUITEM "&Join Lines", ID_EDIT_JOINLINES
-            MENUITEM "&Indent", ID_EDIT_INDENT
-            MENUITEM "&Unindent", ID_EDIT_UNINDENT
-        END
-        MENUITEM "Next Subword\tCtrl+Alt+Right", ID_EDIT_NEXTSUBWORD
-        MENUITEM "Previous Subword\tCtrl+Alt+Left", ID_EDIT_PREVSUBWORD
-        MENUITEM SEPARATOR
-        MENUITEM "Select &All\tCtrl+A", ID_EDIT_SELECTALL
     END
     POPUP "&View"
     BEGIN
@@ -75,6 +62,52 @@ BEGIN
         MENUITEM "&Status Bar", ID_VIEW_STATUSBAR
         MENUITEM "&Word Wrap", ID_VIEW_WORDWRAP
     END
+    POPUP "&Options"
+    BEGIN
+        MENUITEM "Add to Explorer Context Menu", ID_OPTIONS_ADD_TO_SHELL
+        MENUITEM "Associate with .txt files", ID_OPTIONS_ASSOCIATE_TXT
+    END
+    POPUP "&Help"
+    BEGIN
+        MENUITEM "&About", ID_HELP_ABOUT
+    END
+END
+
+
+IDR_CONTEXTMENU MENU
+BEGIN
+    POPUP "Context"
+    BEGIN
+        MENUITEM "Cu&t\tCtrl+X", ID_EDIT_CUT
+        MENUITEM "&Copy\tCtrl+C", ID_EDIT_COPY
+        MENUITEM "&Paste\tCtrl+V", ID_EDIT_PASTE
+        MENUITEM "De&lete\tDel", ID_EDIT_DELETE
+        MENUITEM SEPARATOR
+        MENUITEM "Select &All\tCtrl+A", ID_EDIT_SELECTALL
+        MENUITEM "Expand Selection\tShift+Alt+Right", ID_EDIT_EXPAND_SELECTION
+        MENUITEM "Shrink Selection\tShift+Alt+Left", ID_EDIT_SHRINK_SELECTION
+        MENUITEM "Expand Selection to Line", ID_EDIT_SELECTLINE
+        MENUITEM "Duplicate Selection\tCtrl+D", ID_EDIT_DUPLICATESELECTION
+        MENUITEM SEPARATOR
+        MENUITEM "Next Subword", ID_EDIT_NEXTSUBWORD
+        MENUITEM "Previous Subword", ID_EDIT_PREVSUBWORD
+        MENUITEM SEPARATOR
+        MENUITEM "&Uppercase\tCtrl+Shift+U", ID_EDIT_UPPERCASE
+        MENUITEM "&Lowercase\tCtrl+U", ID_EDIT_LOWERCASE
+        MENUITEM "&Capitalize", ID_EDIT_CAPITALIZE
+        MENUITEM "&Sentence Case", ID_EDIT_SENTENCECASE
+        MENUITEM SEPARATOR
+        MENUITEM "&Sort Lines", ID_EDIT_SORTLINES
+        // MENUITEM "&Join Lines", ID_EDIT_JOINLINES // removed
+        MENUITEM "&Indent Line", ID_EDIT_INDENT
+        MENUITEM "&Unindent", ID_EDIT_UNINDENT
+        MENUITEM SEPARATOR
+        MENUITEM "Copy Line", ID_EDIT_COPYLINE
+        MENUITEM "Delete Line\tCtrl+Shift+L", ID_EDIT_DELETELINE
+        MENUITEM "Duplicate\tCtrl+D", ID_EDIT_DUPLICATESELECTION
+        MENUITEM "Move Line Up", ID_EDIT_MOVELINEUP
+        MENUITEM "Move Line Down", ID_EDIT_MOVELINEDOWN
+    END
 END
 
 IDR_ACCELERATOR ACCELERATORS
@@ -82,6 +115,7 @@ BEGIN
     "N", ID_FILE_NEW, VIRTKEY, CONTROL
     "O", ID_FILE_OPEN, VIRTKEY, CONTROL
     "S", ID_FILE_SAVE, VIRTKEY, CONTROL
+    "S", ID_FILE_SAVEAS, VIRTKEY, SHIFT, CONTROL
     "P", ID_FILE_PRINT, VIRTKEY, CONTROL
     "Z", ID_EDIT_UNDO, VIRTKEY, CONTROL
     "Y", ID_EDIT_REDO, VIRTKEY, CONTROL
@@ -89,6 +123,7 @@ BEGIN
     "C", ID_EDIT_COPY, VIRTKEY, CONTROL
     "V", ID_EDIT_PASTE, VIRTKEY, CONTROL
     "F", ID_EDIT_FIND, VIRTKEY, CONTROL
+    "F", ID_EDIT_ADVANCED_SEARCH, VIRTKEY, SHIFT, CONTROL
     VK_F3, ID_EDIT_FINDNEXT, VIRTKEY
     VK_F3, ID_EDIT_FINDPREV, VIRTKEY, SHIFT
     "H", ID_EDIT_REPLACE, VIRTKEY, CONTROL
@@ -97,12 +132,17 @@ BEGIN
     VK_RIGHT, ID_EDIT_EXPAND_SELECTION, VIRTKEY, SHIFT, ALT
     VK_LEFT, ID_EDIT_SHRINK_SELECTION, VIRTKEY, SHIFT, ALT
     "L", ID_EDIT_COPYLINE, VIRTKEY, CONTROL
-    "K", ID_EDIT_DELETELINE, VIRTKEY, SHIFT, CONTROL
+    "L", ID_EDIT_DELETELINE, VIRTKEY, SHIFT, CONTROL
+    "D", ID_EDIT_DUPLICATESELECTION, VIRTKEY, CONTROL
     VK_DOWN, ID_EDIT_DUPLICATELINE, VIRTKEY, SHIFT, ALT
     VK_UP, ID_EDIT_MOVELINEUP, VIRTKEY, ALT
     VK_DOWN, ID_EDIT_MOVELINEDOWN, VIRTKEY, ALT
     VK_RIGHT, ID_EDIT_NEXTSUBWORD, VIRTKEY, CONTROL, ALT
     VK_LEFT, ID_EDIT_PREVSUBWORD, VIRTKEY, CONTROL, ALT
+    "U", ID_EDIT_UPPERCASE, VIRTKEY, SHIFT, CONTROL
+    "U", ID_EDIT_LOWERCASE, VIRTKEY, CONTROL
+    VK_ESCAPE, ID_EDIT_CANCEL_SELECTION, VIRTKEY
+    // No accelerator for Join Lines (removed)
     VK_ADD, ID_VIEW_ZOOMIN, VIRTKEY, CONTROL
     VK_SUBTRACT, ID_VIEW_ZOOMOUT, VIRTKEY, CONTROL
 END
@@ -116,4 +156,46 @@ BEGIN
     EDITTEXT        IDC_GOTO_LINE,7,17,172,14,ES_AUTOHSCROLL | ES_NUMBER
     DEFPUSHBUTTON   "Go To",IDOK,75,41,50,14
     PUSHBUTTON      "Cancel",IDCANCEL,129,41,50,14
+END
+
+IDD_ADVANCED_SEARCH DIALOGEX 0, 0, 450, 350
+STYLE DS_SETFONT | DS_FIXEDSYS | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME
+CAPTION "Advanced Search"
+FONT 8, "MS Shell Dlg 2", 400, 0, 0x1
+BEGIN
+    LTEXT           "Find what:",IDC_STATIC_FIND_LABEL,7,9,35,8
+    EDITTEXT        IDC_SEARCH_TEXT,45,7,340,14,ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "Find All",IDC_SEARCH_BTN,393,7,50,14
+    
+    LTEXT           "Replace with:",IDC_STATIC_REPLACE_LABEL,7,26,45,8
+    EDITTEXT        IDC_REPLACE_TEXT,55,24,330,14,ES_AUTOHSCROLL
+    PUSHBUTTON      "Replace All",IDC_REPLACE_ALL_BTN,393,24,50,14
+
+    GROUPBOX        "Options",IDC_STATIC_OPTIONS_GROUP,7,42,436,28
+    CONTROL         "Regular Expression",IDC_SEARCH_REGEX,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,15,53,80,10
+    CONTROL         "Fuzzy Match",IDC_SEARCH_FUZZY,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,100,53,60,10
+    
+    LTEXT           "Results:",IDC_STATIC_RESULTS_LABEL,7,75,40,8
+    CONTROL         "",IDC_SEARCH_PROGRESS,"msctls_progress32",WS_BORDER,50,75,393,10
+    LISTBOX         IDC_SEARCH_LIST,7,87,436,220,LBS_NOINTEGRALHEIGHT | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP | WS_HSCROLL
+    
+    PUSHBUTTON      "Previous",IDC_PREV_PAGE,7,314,50,14
+    CTEXT           "Page 1 of 1",IDC_PAGE_INFO,65,316,100,8
+    PUSHBUTTON      "Next",IDC_NEXT_PAGE,170,314,50,14
+
+    PUSHBUTTON      "Replace Selected",IDC_REPLACE_BTN,250,314,70,14
+    PUSHBUTTON      "Close",IDCANCEL,393,314,50,14
+END
+
+IDD_ABOUT DIALOGEX 0, 0, 180, 90
+STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "About Just Notepad"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    ICON            IDI_ICON,-1,14,14,21,20
+    LTEXT           "Just Notepad v 0.1",-1,45,14,100,8
+    LTEXT           "Created by Martin Petkovski",-1,45,26,120,8
+    LTEXT           "This software is Freeware.",-1,45,38,120,8
+    CONTROL         "<a href=""https://www.najjak.com/justnotepad"">Official Website</a>",-1,"SysLink",WS_TABSTOP,45,50,120,10
+    DEFPUSHBUTTON   "OK",IDOK,65,70,50,14
 END

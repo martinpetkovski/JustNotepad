@@ -15,9 +15,11 @@ add_executable(JustNotepad WIN32
 
 # Link Windows libs
 if(MSVC)
-    target_link_libraries(JustNotepad PRIVATE user32 gdi32 comdlg32 ole32 comctl32)
+    target_link_libraries(JustNotepad PRIVATE user32 gdi32 comdlg32 ole32 comctl32 shlwapi dwmapi uxtheme)
+    # Enable Common Controls v6 (needed for SysLink and visual styles)
+    target_link_options(JustNotepad PRIVATE "/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'")
 else()
-    target_link_libraries(JustNotepad PRIVATE user32 gdi32 comdlg32 ole32 comctl32)
+    target_link_libraries(JustNotepad PRIVATE user32 gdi32 comdlg32 ole32 comctl32 shlwapi dwmapi uxtheme)
 endif()
 
 # Tests
@@ -42,4 +44,5 @@ add_test(NAME UnitTests COMMAND UnitTests)
 # Output directory
 set_target_properties(JustNotepad PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    OUTPUT_NAME "Just Notepad"
 )
