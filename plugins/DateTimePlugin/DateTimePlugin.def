@@ -1,0 +1,6 @@
+LIBRARY DateTimePlugin
+EXPORTS
+    GetPluginName
+    GetPluginDescription
+    GetPluginVersion
+    GetPluginMenuItems

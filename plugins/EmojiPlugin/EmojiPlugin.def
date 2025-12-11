@@ -1,0 +1,6 @@
+LIBRARY EmojiPlugin
+EXPORTS
+    GetPluginName
+    GetPluginDescription
+    GetPluginVersion
+    GetPluginMenuItems

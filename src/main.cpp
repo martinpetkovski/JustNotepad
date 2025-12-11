@@ -24,6 +24,7 @@
 #include <atomic>
 #include "resource.h"
 #include "TextHelpers.h"
+#include "PluginManager.h"
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -141,6 +142,7 @@ std::vector<CHARRANGE> vecSelectionStack;
 std::vector<SelectionLevel> vecSelectionLevelStack;
 
 Document g_Document;
+PluginManager g_PluginManager;
 
 // Config
 std::deque<std::wstring> recentFiles;
@@ -251,6 +253,7 @@ struct StreamContext {
 // Forward declarations
 void UpdateStatusBar();
 void UpdateTitle();
+void UpdatePluginsMenu(HWND hwnd);
 void LoadConfig();
 void SaveConfig();
 void AddRecentFile(LPCTSTR pszPath);
@@ -1509,7 +1512,7 @@ void CreateNewDocument(LPCTSTR pszFile)
         SendMessage(g_Document.hEditor, EM_EXLIMITTEXT, 0, -1);
         SendMessage(g_Document.hEditor, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE);
         
-        HFONT hFont = CreateFont(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, 
+        HFONT hFont = CreateFont(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 
                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, 
                                      DEFAULT_PITCH | FF_SWISS, _T("Consolas"));
         SendMessage(g_Document.hEditor, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -1550,12 +1553,82 @@ void UpdateTitle()
 {
     Document& doc = g_Document;
     
+    // Set the full path as a window property for plugins to access
+    // We cast the pointer to HANDLE. Since plugins run in the same process, they can read this memory.
+    SetProp(hMain, _T("FullPath"), (HANDLE)doc.szFileName);
+    
     TCHAR szTitle[MAX_PATH + 32];
     if (doc.szFileName[0])
         StringCchPrintf(szTitle, MAX_PATH + 32, _T("%s%s - Just Notepad"), PathFindFileName(doc.szFileName), doc.bIsDirty ? _T("*") : _T(""));
     else
         StringCchPrintf(szTitle, MAX_PATH + 32, _T("Untitled%s - Just Notepad"), doc.bIsDirty ? _T("*") : _T(""));
     SetWindowText(hMain, szTitle);
+}
+
+void UpdatePluginsMenu(HWND hwnd) {
+    HMENU hMenu = GetMenu(hwnd);
+    if (!hMenu) return;
+    
+    // Check if Plugins menu already exists and remove it to rebuild
+    int count = GetMenuItemCount(hMenu);
+    for (int i = 0; i < count; ++i) {
+        TCHAR buffer[256];
+        GetMenuString(hMenu, i, buffer, 256, MF_BYPOSITION);
+        if (_tcscmp(buffer, _T("Plugins")) == 0) {
+            RemoveMenu(hMenu, i, MF_BYPOSITION);
+            break;
+        }
+    }
+
+    HMENU hPluginsMenu = CreatePopupMenu();
+    
+    // Add Search item
+    AppendMenu(hPluginsMenu, MF_STRING, ID_PLUGIN_SEARCH, _T("Search Plugins...\tCtrl+Shift+P"));
+    AppendMenu(hPluginsMenu, MF_SEPARATOR, 0, NULL);
+    
+    const auto& plugins = g_PluginManager.GetPlugins();
+    if (plugins.empty()) {
+        AppendMenu(hPluginsMenu, MF_STRING | MF_GRAYED, 0, _T("(No plugins loaded)"));
+    } else {
+        for (const auto& plugin : plugins) {
+            if (plugin.items.empty()) continue;
+
+            if (plugin.items.size() == 1) {
+                // Single item: Add directly to the menu using the plugin name
+                AppendMenu(hPluginsMenu, MF_STRING, plugin.items[0].commandId, plugin.name.c_str());
+            } else {
+                // Multiple items: Create a submenu
+                HMENU hSubMenu = CreatePopupMenu();
+                for (const auto& item : plugin.items) {
+                    AppendMenu(hSubMenu, MF_STRING, item.commandId, item.name.c_str());
+                }
+                
+                // Add the plugin submenu to the main Plugins menu
+                AppendMenu(hPluginsMenu, MF_POPUP | MF_STRING, (UINT_PTR)hSubMenu, plugin.name.c_str());
+            }
+        }
+    }
+
+
+    // Insert "Plugins" menu before "Help" (usually the last one)
+    count = GetMenuItemCount(hMenu);
+    int helpIndex = -1;
+    for (int i = 0; i < count; ++i) {
+        TCHAR buffer[256];
+        GetMenuString(hMenu, i, buffer, 256, MF_BYPOSITION);
+        // Check for "Help" or "&Help"
+        if (_tcscmp(buffer, _T("Help")) == 0 || _tcscmp(buffer, _T("&Help")) == 0) {
+            helpIndex = i;
+            break;
+        }
+    }
+    
+    if (helpIndex != -1) {
+        InsertMenu(hMenu, helpIndex, MF_BYPOSITION | MF_POPUP | MF_STRING, (UINT_PTR)hPluginsMenu, _T("Plugins"));
+    } else {
+        AppendMenu(hMenu, MF_POPUP | MF_STRING, (UINT_PTR)hPluginsMenu, _T("Plugins"));
+    }
+    DrawMenuBar(hwnd);
 }
 
 BOOL IsAppInShellMenu()
@@ -3238,6 +3311,78 @@ void DoAdvancedSearch()
     DialogBox(hInst, MAKEINTRESOURCE(IDD_ADVANCED_SEARCH), hMain, AdvancedSearchDlgProc);
 }
 
+struct PluginSearchState {
+    std::vector<PluginCommand> allCommands;
+    std::vector<PluginCommand> filteredCommands;
+} g_PluginSearch;
+
+void UpdatePluginSearchList(HWND hDlg) {
+    HWND hList = GetDlgItem(hDlg, IDC_PLUGIN_SEARCH_LIST);
+    SendMessage(hList, LB_RESETCONTENT, 0, 0);
+    
+    TCHAR szSearch[256];
+    GetDlgItemText(hDlg, IDC_PLUGIN_SEARCH_TEXT, szSearch, 256);
+    std::wstring search = szSearch;
+    std::transform(search.begin(), search.end(), search.begin(), ::towlower);
+    
+    g_PluginSearch.filteredCommands.clear();
+    
+    for (const auto& cmd : g_PluginSearch.allCommands) {
+        std::wstring name = cmd.commandName;
+        std::wstring plugin = cmd.pluginName;
+        std::wstring full = plugin + L": " + name;
+        std::wstring fullLower = full;
+        std::transform(fullLower.begin(), fullLower.end(), fullLower.begin(), ::towlower);
+        
+        if (search.empty() || fullLower.find(search) != std::wstring::npos) {
+            g_PluginSearch.filteredCommands.push_back(cmd);
+            SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)full.c_str());
+        }
+    }
+}
+
+INT_PTR CALLBACK PluginSearchDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_INITDIALOG:
+        UpdatePluginSearchList(hDlg);
+        SetFocus(GetDlgItem(hDlg, IDC_PLUGIN_SEARCH_TEXT));
+        return FALSE; // We set focus
+        
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_PLUGIN_SEARCH_TEXT && HIWORD(wParam) == EN_CHANGE) {
+            UpdatePluginSearchList(hDlg);
+        }
+        else if (LOWORD(wParam) == IDC_PLUGIN_SEARCH_LIST && HIWORD(wParam) == LBN_DBLCLK) {
+            SendMessage(hDlg, WM_COMMAND, IDOK, 0);
+        }
+        else if (LOWORD(wParam) == IDOK) {
+            HWND hList = GetDlgItem(hDlg, IDC_PLUGIN_SEARCH_LIST);
+            int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+            if (sel != LB_ERR && sel < (int)g_PluginSearch.filteredCommands.size()) {
+                int cmdId = g_PluginSearch.filteredCommands[sel].commandId;
+                EndDialog(hDlg, cmdId);
+            } else {
+                EndDialog(hDlg, 0);
+            }
+            return TRUE;
+        }
+        else if (LOWORD(wParam) == IDCANCEL) {
+            EndDialog(hDlg, 0);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+void DoPluginSearch() {
+    g_PluginSearch.allCommands = g_PluginManager.GetAllCommands();
+    INT_PTR result = DialogBox(hInst, MAKEINTRESOURCE(IDD_PLUGIN_SEARCH), hMain, PluginSearchDlgProc);
+    if (result > 0) {
+        g_PluginManager.ExecutePluginCommand((int)result, g_Document.hEditor);
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (msg == uFindReplaceMsg)
@@ -3822,6 +3967,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_FILE_RELOAD: DoReload(); break;
         case ID_FILE_PAGESETUP: DoPageSetup(); break;
         case ID_FILE_PRINT: DoPrint(); break;
+        case ID_PLUGIN_SEARCH: DoPluginSearch(); break;
         case ID_FILE_EXIT: 
             if (CheckAllSaveChanges()) 
             {
@@ -4044,6 +4190,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             break;
         }
         
+        // Handle Plugins
+        if (LOWORD(wParam) >= ID_PLUGIN_FIRST && LOWORD(wParam) <= ID_PLUGIN_LAST) {
+            g_PluginManager.ExecutePluginCommand(LOWORD(wParam), g_Document.hEditor);
+        }
+
         // Handle Recent Files
         if (LOWORD(wParam) >= ID_FILE_RECENT_FIRST && LOWORD(wParam) < ID_FILE_RECENT_LAST)
         {
@@ -4125,6 +4276,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     SetMenu(hwnd, hMenu);
     
+    // Load Plugins
+    TCHAR szExePath[MAX_PATH];
+    GetModuleFileName(NULL, szExePath, MAX_PATH);
+    PathRemoveFileSpec(szExePath);
+    PathAppend(szExePath, _T("plugins"));
+    g_PluginManager.LoadPlugins(szExePath);
+    UpdatePluginsMenu(hwnd);
+
     LoadConfig();
 
     HACCEL hAccel = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDR_ACCELERATOR));

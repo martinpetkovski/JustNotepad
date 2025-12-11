@@ -7,10 +7,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Windows-specific definitions
 add_definitions(-DUNICODE -D_UNICODE)
 
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 add_executable(JustNotepad WIN32
     src/main.cpp
     src/resources.rc
     src/TextHelpers.cpp
+    src/PluginManager.cpp
 )
 
 # Link Windows libs
@@ -38,7 +43,12 @@ endif()
 
 add_test(NAME UnitTests COMMAND UnitTests)
 
-
+add_subdirectory(plugins/HelloPlugin)
+add_subdirectory(plugins/DateTimePlugin)
+add_subdirectory(plugins/GuidPlugin)
+add_subdirectory(plugins/EmojiPlugin)
+add_subdirectory(plugins/ClangFormatPlugin)
+add_subdirectory(plugins/GitPlugin)
 
 
 # Output directory

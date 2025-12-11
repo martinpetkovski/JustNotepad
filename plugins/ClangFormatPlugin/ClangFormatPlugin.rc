@@ -1,0 +1,3 @@
+#include "resource.h"
+
+IDR_CLANG_FORMAT BINARY "res\\clang-format.exe"
