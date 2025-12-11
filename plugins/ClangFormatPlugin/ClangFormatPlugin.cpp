@@ -77,8 +77,21 @@ std::wstring GetClangFormatPath() {
     return L"clang-format"; // Fallback to PATH
 }
 
+// Helper to get file path from main window
+std::wstring GetCurrentFilePath(HWND hEditor) {
+    HWND hMain = GetParent(hEditor);
+    HANDLE hProp = GetProp(hMain, L"FullPath");
+    if (hProp) {
+        TCHAR* path = (TCHAR*)hProp;
+        if (path && path[0]) {
+            return std::wstring(path);
+        }
+    }
+    return L"test.cpp"; // Default fallback
+}
+
 // Helper to run clang-format
-std::wstring RunClangFormat(const std::wstring& input) {
+std::wstring RunClangFormat(const std::wstring& input, const std::wstring& filename) {
     // Convert input to UTF-8 for clang-format
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, input.c_str(), (int)input.length(), NULL, 0, NULL, NULL);
     std::string inputUtf8(size_needed, 0);
@@ -115,6 +128,10 @@ std::wstring RunClangFormat(const std::wstring& input) {
     std::wstring exePath = GetClangFormatPath();
     std::wstring cmdLineStr = L"\"" + exePath + L"\" -style=Google";
     
+    if (!filename.empty()) {
+        cmdLineStr += L" -assume-filename=\"" + filename + L"\"";
+    }
+
     // Create a mutable buffer for CreateProcess
     std::vector<wchar_t> cmdLine(cmdLineStr.begin(), cmdLineStr.end());
     cmdLine.push_back(0);
@@ -204,7 +221,8 @@ extern "C" {
         SendMessage(hEditorWnd, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
         
         std::wstring text(buffer.data());
-        std::wstring formatted = RunClangFormat(text);
+        std::wstring filename = GetCurrentFilePath(hEditorWnd);
+        std::wstring formatted = RunClangFormat(text, filename);
         
         if (formatted != text && !formatted.empty()) {
             SendMessage(hEditorWnd, EM_REPLACESEL, TRUE, (LPARAM)formatted.c_str());

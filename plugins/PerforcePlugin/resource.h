@@ -1,0 +1,11 @@
+#pragma once
+
+#define IDD_P4_OUTPUT 101
+#define IDC_P4_OUTPUT_TEXT 1001
+
+#define IDD_P4_LOGIN 102
+#define IDC_P4_SERVER 1002
+#define IDC_P4_USER 1003
+#define IDC_P4_CLIENT 1004
+#define IDC_P4_PASSWORD 1005
+#define IDC_STATIC -1

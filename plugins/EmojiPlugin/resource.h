@@ -1,7 +1,7 @@
 #ifndef RESOURCE_H
 #define RESOURCE_H
 
-#define IDD_EMOJI_PICKER 101
+#define IDD_EMOJI_PICKER 201
 #define IDC_EMOJI_SEARCH 1001
 #define IDC_EMOJI_LIST   1002
 

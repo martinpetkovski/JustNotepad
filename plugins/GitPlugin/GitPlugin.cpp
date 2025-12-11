@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <filesystem>
 #include <shlwapi.h>
 #include "resource.h"
 
@@ -12,6 +13,7 @@
 HINSTANCE g_hInst = NULL;
 std::wstring g_LastOutput;
 std::wstring g_CommitMessage;
+DWORD g_LastCheck = 0;
 
 // Helper to get file path from main window title
 std::wstring GetCurrentFilePath(HWND hEditor) {
@@ -241,6 +243,26 @@ void GitStatus(HWND hEditor) {
     ShowGitOutput(GetParent(hEditor), output);
 }
 
+void GitAdd(HWND hEditor) {
+    std::wstring path = GetCurrentFilePath(hEditor);
+    if (path.empty()) {
+        MessageBox(hEditor, L"Please save the file first.", L"Git Plugin", MB_OK);
+        return;
+    }
+
+    TCHAR dir[MAX_PATH];
+    wcscpy_s(dir, path.c_str());
+    PathRemoveFileSpec(dir);
+    
+    std::wstring filename = PathFindFileName(path.c_str());
+    std::wstring output = RunGitCommand(L"add \"" + filename + L"\"", dir);
+    
+    g_LastCheck = 0; // Invalidate cache
+    
+    if (output.empty()) output = L"Added " + filename;
+    ShowGitOutput(GetParent(hEditor), output);
+}
+
 void GitDiff(HWND hEditor) {
     std::wstring path = GetCurrentFilePath(hEditor);
     if (path.empty()) {
@@ -260,24 +282,6 @@ void GitDiff(HWND hEditor) {
     }
     else if (output.empty()) output = L"No changes.";
 
-    ShowGitOutput(GetParent(hEditor), output);
-}
-
-void GitAdd(HWND hEditor) {
-    std::wstring path = GetCurrentFilePath(hEditor);
-    if (path.empty()) {
-        MessageBox(hEditor, L"Please save the file first.", L"Git Plugin", MB_OK);
-        return;
-    }
-
-    TCHAR dir[MAX_PATH];
-    wcscpy_s(dir, path.c_str());
-    PathRemoveFileSpec(dir);
-    
-    std::wstring filename = PathFindFileName(path.c_str());
-    std::wstring output = RunGitCommand(L"add \"" + filename + L"\"", dir);
-    
-    if (output.empty()) output = L"File added to git index.";
     ShowGitOutput(GetParent(hEditor), output);
 }
 
@@ -342,6 +346,7 @@ void GitCommit(HWND hEditor) {
         }
 
         std::wstring output = RunGitCommand(L"commit \"" + filename + L"\" -m \"" + msg + L"\"", dir);
+        g_LastCheck = 0; // Invalidate cache
         ShowGitOutput(GetParent(hEditor), output);
     }
 }
@@ -358,6 +363,7 @@ void GitPull(HWND hEditor) {
     PathRemoveFileSpec(dir);
 
     std::wstring output = RunGitCommand(L"pull", dir);
+    g_LastCheck = 0; // Invalidate cache
     ShowGitOutput(GetParent(hEditor), output);
 }
 
@@ -373,6 +379,7 @@ void GitPush(HWND hEditor) {
     PathRemoveFileSpec(dir);
 
     std::wstring output = RunGitCommand(L"push", dir);
+    g_LastCheck = 0; // Invalidate cache
     ShowGitOutput(GetParent(hEditor), output);
 }
 
@@ -390,6 +397,8 @@ void GitDiscard(HWND hEditor) {
         
         std::wstring filename = PathFindFileName(path.c_str());
         std::wstring output = RunGitCommand(L"checkout \"" + filename + L"\"", dir);
+        
+        g_LastCheck = 0; // Invalidate cache
         
         // Reload file if successful (simple way: tell user to reload, or trigger reload if we had API)
         // Since we don't have a "Reload" API exposed to plugins easily, we'll just show output.
@@ -409,6 +418,50 @@ extern "C" {
     
     PLUGIN_API const wchar_t* GetPluginVersion() {
         return L"1.1";
+    }
+
+    std::wstring g_StatusCache;
+    std::wstring g_LastFile;
+
+    PLUGIN_API const wchar_t* GetPluginStatus(const wchar_t* filePath) {
+        if (!filePath || !filePath[0]) return NULL;
+        
+        // Simple cache to avoid running git too often
+        if (g_LastFile == filePath && GetTickCount() - g_LastCheck < 2000) {
+            return g_StatusCache.empty() ? NULL : g_StatusCache.c_str();
+        }
+        
+        g_LastFile = filePath;
+        g_LastCheck = GetTickCount();
+        g_StatusCache = L"";
+
+        std::filesystem::path p(filePath);
+        std::wstring dir = p.parent_path().wstring();
+        
+        // Check branch
+        std::wstring branch = RunGitCommand(L"rev-parse --abbrev-ref HEAD", dir);
+        if (branch.empty() || branch.find(L"fatal") != std::wstring::npos) {
+            return NULL;
+        }
+        
+        // Trim newline
+        if (!branch.empty() && branch.back() == '\n') branch.pop_back();
+
+        // Check file status
+        std::wstring filename = p.filename().wstring();
+        std::wstring statusCmd = L"status --porcelain \"" + filename + L"\"";
+        std::wstring statusOut = RunGitCommand(statusCmd, dir);
+        
+        std::wstring statusStr = L"";
+        if (statusOut.length() >= 1) {
+             if (statusOut.find(L"??") == 0) statusStr = L" [Untracked]";
+             else if (statusOut.find(L"M") != std::wstring::npos) statusStr = L" [Modified]";
+             else if (statusOut.find(L"A") != std::wstring::npos) statusStr = L" [Added]";
+             else statusStr = L" [Changed]";
+        }
+
+        g_StatusCache = L"Git: " + branch + statusStr;
+        return g_StatusCache.c_str();
     }
 
     PluginMenuItem g_Items[] = {

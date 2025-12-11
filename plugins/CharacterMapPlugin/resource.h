@@ -1,0 +1,9 @@
+#ifndef RESOURCE_H
+#define RESOURCE_H
+
+#define IDD_CHARMAP 202
+#define IDC_FONT_COMBO 1001
+#define IDC_RANGE_COMBO 1002
+#define IDC_CHAR_GRID 1003
+
+#endif

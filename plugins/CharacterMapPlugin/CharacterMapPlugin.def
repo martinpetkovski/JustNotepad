@@ -1,0 +1,6 @@
+LIBRARY CharacterMapPlugin
+EXPORTS
+    GetPluginName
+    GetPluginDescription
+    GetPluginVersion
+    GetPluginMenuItems

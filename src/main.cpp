@@ -10,7 +10,6 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
-#include <regex>
 #include <string_view>
 #include <shlwapi.h>
 #include <shellapi.h>
@@ -20,8 +19,8 @@
 #include <uxtheme.h>
 #include <ole2.h>
 #include <thread>
-#include <mutex>
 #include <atomic>
+#include <map>
 #include "resource.h"
 #include "TextHelpers.h"
 #include "PluginManager.h"
@@ -147,7 +146,7 @@ PluginManager g_PluginManager;
 // Config
 std::deque<std::wstring> recentFiles;
 TCHAR szConfigPath[MAX_PATH] = {0};
-std::wstring g_StatusText[6]; // Cache for owner-draw status bar
+std::wstring g_StatusText[7]; // Cache for owner-draw status bar
 
 // Encoding currentEncoding = ENC_UTF8; // Moved to Document
 
@@ -890,6 +889,8 @@ BOOL LoadFromFile(LPCTSTR pszFile)
             if (hMap) CloseHandle(hMap);
             CloseHandle(hFile);
             doc.bLoading = FALSE;
+            // Ensure event mask is set so we get EN_CHANGE notifications
+            SendMessage(doc.hEditor, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE);
         }
         
         StringCchCopy(doc.szFileName, MAX_PATH, pszFile);
@@ -1231,6 +1232,144 @@ INT_PTR CALLBACK AboutDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
         {
             EndDialog(hDlg, LOWORD(wParam));
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
+
+// Map to track pending changes: filename -> enabled
+static std::map<std::wstring, bool> g_PendingPluginStates;
+static bool g_bUpdatingList = false;
+
+void UpdateManagePluginsList(HWND hDlg) {
+    g_bUpdatingList = true;
+    HWND hList = GetDlgItem(hDlg, IDC_MANAGE_PLUGINS_LIST);
+    ListView_DeleteAllItems(hList);
+    
+    TCHAR szSearch[256];
+    GetDlgItemText(hDlg, IDC_MANAGE_PLUGINS_SEARCH, szSearch, 256);
+    std::wstring search = szSearch;
+    std::transform(search.begin(), search.end(), search.begin(), ::towlower);
+
+    const auto& plugins = g_PluginManager.GetPlugins();
+    int itemIndex = 0;
+    for (size_t i = 0; i < plugins.size(); ++i) {
+        const auto& plugin = plugins[i];
+        
+        std::wstring nameLower = plugin.name;
+        std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::towlower);
+        
+        if (search.empty() || nameLower.find(search) != std::wstring::npos) {
+            // Determine check state
+            bool enabled = plugin.enabled;
+            auto it = g_PendingPluginStates.find(plugin.filename);
+            if (it != g_PendingPluginStates.end()) {
+                enabled = it->second;
+            } else {
+                g_PendingPluginStates[plugin.filename] = enabled;
+            }
+
+            LVITEM lvi;
+            lvi.mask = LVIF_TEXT | LVIF_PARAM;
+            lvi.iItem = itemIndex;
+            lvi.iSubItem = 0;
+            lvi.pszText = (LPWSTR)plugin.name.c_str();
+            lvi.lParam = (LPARAM)i; // Store original index in PluginManager
+            
+            ListView_InsertItem(hList, &lvi);
+            ListView_SetCheckState(hList, itemIndex, enabled);
+            itemIndex++;
+        }
+    }
+    g_bUpdatingList = false;
+}
+
+INT_PTR CALLBACK ManagePluginsDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_INITDIALOG:
+        {
+            g_PendingPluginStates.clear();
+            
+            HWND hList = GetDlgItem(hDlg, IDC_MANAGE_PLUGINS_LIST);
+            ListView_SetExtendedListViewStyle(hList, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT);
+            
+            LVCOLUMN lvc;
+            lvc.mask = LVCF_FMT | LVCF_WIDTH | LVCF_TEXT | LVCF_SUBITEM;
+            lvc.iSubItem = 0;
+            lvc.pszText = (LPWSTR)L"Plugin";
+            lvc.cx = 200;
+            lvc.fmt = LVCFMT_LEFT;
+            ListView_InsertColumn(hList, 0, &lvc);
+
+            UpdateManagePluginsList(hDlg);
+        }
+        return (INT_PTR)TRUE;
+
+    case WM_NOTIFY:
+        {
+            LPNMHDR pnmh = (LPNMHDR)lParam;
+            if (pnmh->idFrom == IDC_MANAGE_PLUGINS_LIST) {
+                if (pnmh->code == LVN_ITEMCHANGED) {
+                    LPNMLISTVIEW pnmv = (LPNMLISTVIEW)lParam;
+                    if (pnmv->uChanged & LVIF_STATE) {
+                        // Check if selection changed to update description
+                        if ((pnmv->uNewState & LVIS_SELECTED) && !(pnmv->uOldState & LVIS_SELECTED)) {
+                            int idx = pnmv->iItem;
+                            int originalIdx = (int)pnmv->lParam;
+                            const auto& plugins = g_PluginManager.GetPlugins();
+                            if (originalIdx >= 0 && originalIdx < (int)plugins.size()) {
+                                SetDlgItemText(hDlg, IDC_MANAGE_PLUGINS_DESC, plugins[originalIdx].description.c_str());
+                            }
+                        }
+                        
+                        // Check if check state changed
+                        // LVIS_STATEIMAGEMASK covers the checkbox (indices 1 and 2)
+                        if (!g_bUpdatingList && (pnmv->uChanged & LVIF_STATE) && 
+                            ((pnmv->uNewState & LVIS_STATEIMAGEMASK) != (pnmv->uOldState & LVIS_STATEIMAGEMASK))) {
+                             
+                             int originalIdx = (int)pnmv->lParam;
+                             const auto& plugins = g_PluginManager.GetPlugins();
+                             if (originalIdx >= 0 && originalIdx < (int)plugins.size()) {
+                                 // Get new state directly from uNewState
+                                 int stateImageIndex = (pnmv->uNewState & LVIS_STATEIMAGEMASK) >> 12;
+                                 if (stateImageIndex == 1 || stateImageIndex == 2) {
+                                     BOOL bChecked = (stateImageIndex == 2);
+                                     g_PendingPluginStates[plugins[originalIdx].filename] = bChecked;
+                                 }
+                             }
+                        }
+                    }
+                }
+            }
+        }
+        break;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_MANAGE_PLUGINS_SEARCH && HIWORD(wParam) == EN_CHANGE) {
+            UpdateManagePluginsList(hDlg);
+        }
+        else if (LOWORD(wParam) == IDOK) {
+            // Apply pending changes
+            for (const auto& pair : g_PendingPluginStates) {
+                g_PluginManager.SetPluginEnabled(pair.first, pair.second);
+            }
+            
+            // Save settings
+            TCHAR szPath[MAX_PATH];
+            GetModuleFileName(NULL, szPath, MAX_PATH);
+            PathRemoveFileSpec(szPath);
+            PathAppend(szPath, _T("config.ini"));
+            g_PluginManager.SaveSettings(szPath);
+            
+            EndDialog(hDlg, IDOK);
+            return (INT_PTR)TRUE;
+        }
+        else if (LOWORD(wParam) == IDCANCEL) {
+            EndDialog(hDlg, IDCANCEL);
             return (INT_PTR)TRUE;
         }
         break;
@@ -1582,8 +1721,9 @@ void UpdatePluginsMenu(HWND hwnd) {
 
     HMENU hPluginsMenu = CreatePopupMenu();
     
-    // Add Search item
-    AppendMenu(hPluginsMenu, MF_STRING, ID_PLUGIN_SEARCH, _T("Search Plugins...\tCtrl+Shift+P"));
+    // Add Manage Plugins item first
+    AppendMenu(hPluginsMenu, MF_STRING, ID_MANAGE_PLUGINS, _T("Manage Plugins..."));
+    AppendMenu(hPluginsMenu, MF_STRING, ID_PLUGIN_SEARCH, _T("Plugin Commands...\tCtrl+Shift+P"));
     AppendMenu(hPluginsMenu, MF_SEPARATOR, 0, NULL);
     
     const auto& plugins = g_PluginManager.GetPlugins();
@@ -1591,6 +1731,7 @@ void UpdatePluginsMenu(HWND hwnd) {
         AppendMenu(hPluginsMenu, MF_STRING | MF_GRAYED, 0, _T("(No plugins loaded)"));
     } else {
         for (const auto& plugin : plugins) {
+            if (!plugin.enabled) continue; // Skip disabled plugins
             if (plugin.items.empty()) continue;
 
             if (plugin.items.size() == 1) {
@@ -1631,274 +1772,7 @@ void UpdatePluginsMenu(HWND hwnd) {
     DrawMenuBar(hwnd);
 }
 
-BOOL IsAppInShellMenu()
-{
-    HKEY hKey;
-    if (RegOpenKeyEx(HKEY_CURRENT_USER, _T("Software\\Classes\\*\\shell\\JustNotepad"), 0, KEY_READ, &hKey) == ERROR_SUCCESS)
-    {
-        RegCloseKey(hKey);
-        return TRUE;
-    }
-    return FALSE;
-}
 
-void AddAppToShellMenu()
-{
-    TCHAR szPath[MAX_PATH];
-    GetModuleFileName(NULL, szPath, MAX_PATH);
-    
-    HKEY hKey;
-    if (RegCreateKeyEx(HKEY_CURRENT_USER, _T("Software\\Classes\\*\\shell\\JustNotepad"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
-    {
-        RegSetValueEx(hKey, NULL, 0, REG_SZ, (BYTE*)_T("Edit in Just Notepad"), (DWORD)(_tcslen(_T("Edit in Just Notepad")) + 1) * sizeof(TCHAR));
-        RegSetValueEx(hKey, _T("Icon"), 0, REG_SZ, (BYTE*)szPath, (DWORD)(_tcslen(szPath) + 1) * sizeof(TCHAR));
-        
-        HKEY hKeyCmd;
-        if (RegCreateKeyEx(hKey, _T("command"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKeyCmd, NULL) == ERROR_SUCCESS)
-        {
-            TCHAR szCmd[MAX_PATH + 10];
-            StringCchPrintf(szCmd, MAX_PATH + 10, _T("\"%s\" \"%%1\""), szPath);
-            RegSetValueEx(hKeyCmd, NULL, 0, REG_SZ, (BYTE*)szCmd, (DWORD)(_tcslen(szCmd) + 1) * sizeof(TCHAR));
-            RegCloseKey(hKeyCmd);
-        }
-        RegCloseKey(hKey);
-    }
-    
-    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
-}
-
-void RemoveAppFromShellMenu()
-{
-    // RegDeleteTree is available on Vista+
-    // For older systems, we might need a recursive delete function, but let's assume Vista+
-    HMODULE hAdvApi32 = LoadLibrary(_T("Advapi32.dll"));
-    if (hAdvApi32)
-    {
-        typedef LSTATUS (APIENTRY *PFN_RegDeleteTree)(HKEY, LPCTSTR);
-        PFN_RegDeleteTree pfnRegDeleteTree = (PFN_RegDeleteTree)GetProcAddress(hAdvApi32, "RegDeleteTreeW");
-        #ifdef UNICODE
-        if (!pfnRegDeleteTree) pfnRegDeleteTree = (PFN_RegDeleteTree)GetProcAddress(hAdvApi32, "RegDeleteTreeW");
-        #else
-        if (!pfnRegDeleteTree) pfnRegDeleteTree = (PFN_RegDeleteTree)GetProcAddress(hAdvApi32, "RegDeleteTreeA");
-        #endif
-        
-        if (pfnRegDeleteTree)
-        {
-            pfnRegDeleteTree(HKEY_CURRENT_USER, _T("Software\\Classes\\*\\shell\\JustNotepad"));
-        }
-        FreeLibrary(hAdvApi32);
-    }
-}
-
-BOOL IsTxtAssociated();
-
-void DisassociateTxtFiles()
-{
-    HMODULE hAdvApi32 = LoadLibrary(_T("Advapi32.dll"));
-    if (hAdvApi32)
-    {
-        typedef LSTATUS (APIENTRY *PFN_RegDeleteTree)(HKEY, LPCTSTR);
-        PFN_RegDeleteTree pfnRegDeleteTree = (PFN_RegDeleteTree)GetProcAddress(hAdvApi32, "RegDeleteTreeW");
-        #ifdef UNICODE
-        if (!pfnRegDeleteTree) pfnRegDeleteTree = (PFN_RegDeleteTree)GetProcAddress(hAdvApi32, "RegDeleteTreeW");
-        #else
-        if (!pfnRegDeleteTree) pfnRegDeleteTree = (PFN_RegDeleteTree)GetProcAddress(hAdvApi32, "RegDeleteTreeA");
-        #endif
-        
-        if (pfnRegDeleteTree)
-        {
-            // Check if .txt is associated with JustNotepad.txt
-            if (IsTxtAssociated())
-            {
-                // Delete .txt key (or just the default value? Deleting the key might be too aggressive if there are other subkeys)
-                // Actually, we should just delete the default value or set it to empty.
-                // But to be clean, let's try to delete the key if it only contains our association.
-                // For safety, let's just delete the default value.
-                HKEY hKey;
-                if (RegOpenKeyEx(HKEY_CURRENT_USER, _T("Software\\Classes\\.txt"), 0, KEY_WRITE, &hKey) == ERROR_SUCCESS)
-                {
-                    RegDeleteValue(hKey, NULL);
-                    RegCloseKey(hKey);
-                }
-
-                // Delete JustNotepad.txt ProgID
-                pfnRegDeleteTree(HKEY_CURRENT_USER, _T("Software\\Classes\\JustNotepad.txt"));
-            }
-        }
-        FreeLibrary(hAdvApi32);
-    }
-    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
-}
-
-BOOL IsTxtAssociated()
-{
-    HKEY hKey;
-    TCHAR szValue[256];
-    DWORD dwSize = sizeof(szValue);
-    if (RegOpenKeyEx(HKEY_CURRENT_USER, _T("Software\\Classes\\.txt"), 0, KEY_READ, &hKey) == ERROR_SUCCESS)
-    {
-        if (RegQueryValueEx(hKey, NULL, NULL, NULL, (LPBYTE)szValue, &dwSize) == ERROR_SUCCESS)
-        {
-            RegCloseKey(hKey);
-            return _tcscmp(szValue, _T("JustNotepad.txt")) == 0;
-        }
-        RegCloseKey(hKey);
-    }
-    return FALSE;
-}
-
-BOOL IsUserAdmin()
-{
-    BOOL b;
-    SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
-    PSID AdministratorsGroup; 
-    b = AllocateAndInitializeSid(&NtAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &AdministratorsGroup); 
-    if(b) 
-    {
-        if (!CheckTokenMembership( NULL, AdministratorsGroup, &b)) 
-        {
-             b = FALSE;
-        } 
-        FreeSid(AdministratorsGroup); 
-    }
-
-    return b;
-}
-
-#ifndef MB_ICONSHIELD
-#define MB_ICONSHIELD 0x0000000CL // Vista+
-#endif
-
-void AssociateTxtFiles()
-{
-    if (!IsUserAdmin())
-    {
-        int result = MessageBox(hMain, _T("This feature requires Administrator privileges to set system-wide associations.\nDo you want to restart Just Notepad as Administrator?"), _T("Administrator Required"), MB_YESNO | MB_ICONINFORMATION);
-        if (result == IDYES)
-        {
-            TCHAR szPath[MAX_PATH];
-            GetModuleFileName(NULL, szPath, MAX_PATH);
-            ShellExecute(NULL, _T("runas"), szPath, NULL, NULL, SW_SHOWNORMAL);
-            SendMessage(hMain, WM_CLOSE, 0, 0);
-        }
-        return;
-    }
-
-    TCHAR szPath[MAX_PATH];
-    GetModuleFileName(NULL, szPath, MAX_PATH);
-
-    HKEY hKey;
-    // .txt -> JustNotepad.txt (HKCR)
-    if (RegCreateKeyEx(HKEY_CLASSES_ROOT, _T(".txt"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
-    {
-        RegSetValueEx(hKey, NULL, 0, REG_SZ, (BYTE*)_T("JustNotepad.txt"), (DWORD)(_tcslen(_T("JustNotepad.txt")) + 1) * sizeof(TCHAR));
-        RegCloseKey(hKey);
-    }
-
-    // JustNotepad.txt -> Text Document (HKCR)
-    if (RegCreateKeyEx(HKEY_CLASSES_ROOT, _T("JustNotepad.txt"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
-    {
-        RegSetValueEx(hKey, NULL, 0, REG_SZ, (BYTE*)_T("Text Document"), (DWORD)(_tcslen(_T("Text Document")) + 1) * sizeof(TCHAR));
-        
-        // DefaultIcon
-        HKEY hKeyIcon;
-        if (RegCreateKeyEx(hKey, _T("DefaultIcon"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKeyIcon, NULL) == ERROR_SUCCESS)
-        {
-            TCHAR szIcon[MAX_PATH + 5];
-            StringCchPrintf(szIcon, MAX_PATH + 5, _T("%s,0"), szPath);
-            RegSetValueEx(hKeyIcon, NULL, 0, REG_SZ, (BYTE*)szIcon, (DWORD)(_tcslen(szIcon) + 1) * sizeof(TCHAR));
-            RegCloseKey(hKeyIcon);
-        }
-
-        // shell\open\command
-        HKEY hKeyShell;
-        if (RegCreateKeyEx(hKey, _T("shell\\open\\command"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKeyShell, NULL) == ERROR_SUCCESS)
-        {
-            TCHAR szCmd[MAX_PATH + 10];
-            StringCchPrintf(szCmd, MAX_PATH + 10, _T("\"%s\" \"%%1\""), szPath);
-            RegSetValueEx(hKeyShell, NULL, 0, REG_SZ, (BYTE*)szCmd, (DWORD)(_tcslen(szCmd) + 1) * sizeof(TCHAR));
-            RegCloseKey(hKeyShell);
-        }
-        RegCloseKey(hKey);
-    }
-
-    // Also do HKCU for good measure (per-user override)
-    if (RegCreateKeyEx(HKEY_CURRENT_USER, _T("Software\\Classes\\.txt"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
-    {
-        RegSetValueEx(hKey, NULL, 0, REG_SZ, (BYTE*)_T("JustNotepad.txt"), (DWORD)(_tcslen(_T("JustNotepad.txt")) + 1) * sizeof(TCHAR));
-        RegCloseKey(hKey);
-    }
-
-    if (RegCreateKeyEx(HKEY_CURRENT_USER, _T("Software\\Classes\\JustNotepad.txt"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
-    {
-        RegSetValueEx(hKey, NULL, 0, REG_SZ, (BYTE*)_T("Text Document"), (DWORD)(_tcslen(_T("Text Document")) + 1) * sizeof(TCHAR));
-        
-        HKEY hKeyIcon;
-        if (RegCreateKeyEx(hKey, _T("DefaultIcon"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKeyIcon, NULL) == ERROR_SUCCESS)
-        {
-            TCHAR szIcon[MAX_PATH + 5];
-            StringCchPrintf(szIcon, MAX_PATH + 5, _T("%s,0"), szPath);
-            RegSetValueEx(hKeyIcon, NULL, 0, REG_SZ, (BYTE*)szIcon, (DWORD)(_tcslen(szIcon) + 1) * sizeof(TCHAR));
-            RegCloseKey(hKeyIcon);
-        }
-
-        HKEY hKeyShell;
-        if (RegCreateKeyEx(hKey, _T("shell\\open\\command"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKeyShell, NULL) == ERROR_SUCCESS)
-        {
-            TCHAR szCmd[MAX_PATH + 10];
-            StringCchPrintf(szCmd, MAX_PATH + 10, _T("\"%s\" \"%%1\""), szPath);
-            RegSetValueEx(hKeyShell, NULL, 0, REG_SZ, (BYTE*)szCmd, (DWORD)(_tcslen(szCmd) + 1) * sizeof(TCHAR));
-            RegCloseKey(hKeyShell);
-        }
-        RegCloseKey(hKey);
-    }
-
-    // Register in RegisteredApplications
-    if (RegCreateKeyEx(HKEY_CURRENT_USER, _T("Software\\JustNotepad\\Capabilities"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
-    {
-        RegSetValueEx(hKey, _T("ApplicationDescription"), 0, REG_SZ, (BYTE*)_T("Just Notepad"), (DWORD)(_tcslen(_T("Just Notepad")) + 1) * sizeof(TCHAR));
-        RegSetValueEx(hKey, _T("ApplicationName"), 0, REG_SZ, (BYTE*)_T("Just Notepad"), (DWORD)(_tcslen(_T("Just Notepad")) + 1) * sizeof(TCHAR));
-        
-        HKEY hKeyExt;
-        if (RegCreateKeyEx(hKey, _T("FileAssociations"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKeyExt, NULL) == ERROR_SUCCESS)
-        {
-            RegSetValueEx(hKeyExt, _T(".txt"), 0, REG_SZ, (BYTE*)_T("JustNotepad.txt"), (DWORD)(_tcslen(_T("JustNotepad.txt")) + 1) * sizeof(TCHAR));
-            RegCloseKey(hKeyExt);
-        }
-        RegCloseKey(hKey);
-    }
-    
-    if (RegCreateKeyEx(HKEY_CURRENT_USER, _T("Software\\RegisteredApplications"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
-    {
-        RegSetValueEx(hKey, _T("JustNotepad"), 0, REG_SZ, (BYTE*)_T("Software\\JustNotepad\\Capabilities"), (DWORD)(_tcslen(_T("Software\\JustNotepad\\Capabilities")) + 1) * sizeof(TCHAR));
-        RegCloseKey(hKey);
-    }
-    
-    // Add to OpenWithProgids
-    if (RegCreateKeyEx(HKEY_CURRENT_USER, _T("Software\\Classes\\.txt\\OpenWithProgids"), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
-    {
-        RegSetValueEx(hKey, _T("JustNotepad.txt"), 0, REG_NONE, NULL, 0);
-        RegCloseKey(hKey);
-    }
-    
-    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
-    
-    // Try to launch Open With dialog to let user pick default
-    // Create a dummy file
-    TCHAR szDummy[MAX_PATH];
-    GetTempPath(MAX_PATH, szDummy);
-    StringCchCat(szDummy, MAX_PATH, _T("JustNotepad_Assoc.txt"));
-    HANDLE hFile = CreateFile(szDummy, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
-    
-    // Launch Open With
-    SHELLEXECUTEINFO sei = { sizeof(sei) };
-    sei.fMask = SEE_MASK_INVOKEIDLIST;
-    sei.lpVerb = _T("openas");
-    sei.lpFile = szDummy;
-    sei.nShow = SW_SHOWNORMAL;
-    ShellExecuteEx(&sei);
-}
 
 void UpdateStatusBar()
 {
@@ -1960,6 +1834,24 @@ void UpdateStatusBar()
     
     g_StatusText[5] = info->name;
     SendMessage(hStatus, SB_SETTEXT, 5 | SBT_OWNERDRAW, 0);
+
+    // Plugin Status
+    std::wstring pluginStatus;
+    const auto& plugins = g_PluginManager.GetPlugins();
+    for (const auto& p : plugins) {
+        if (p.enabled && p.GetPluginStatus) {
+            const wchar_t* status = p.GetPluginStatus(g_Document.szFileName);
+            if (status && status[0]) {
+                if (!pluginStatus.empty()) pluginStatus += L" | ";
+                pluginStatus += status;
+            }
+        }
+    }
+    
+    static std::wstring s_lastPluginStatus;
+    s_lastPluginStatus = pluginStatus;
+    g_StatusText[6] = s_lastPluginStatus.c_str();
+    SendMessage(hStatus, SB_SETTEXT, 6 | SBT_OWNERDRAW, 0);
 }
 
 
@@ -2585,731 +2477,7 @@ void DoToggleReadOnly()
     CheckMenuItem(hMenu, ID_FILE_TOGGLEREADONLY, (dwAttrs & FILE_ATTRIBUTE_READONLY) ? MF_UNCHECKED : MF_CHECKED); // Inverted logic because we just toggled
 }
 
-// Advanced Search Logic
-struct SearchMatch {
-    int lineNum; // 0-based
-    int matchStart; // Index in line
-    int matchLen;
-    int score;
-    long absolutePos; // Absolute character position
-    std::basic_string<TCHAR> lineText; // Cache the line text
-};
 
-bool FuzzyMatch(const std::string& text, const std::string& query, int& score) {
-    if (query.empty()) return true;
-    
-    int tIdx = 0;
-    int qIdx = 0;
-    int tLen = (int)text.length();
-    int qLen = (int)query.length();
-    
-    score = 0;
-    int consecutive = 0;
-    
-    while (tIdx < tLen && qIdx < qLen) {
-        if (tolower(text[tIdx]) == tolower(query[qIdx])) {
-            score += 10;
-            score += consecutive * 5;
-            consecutive++;
-            qIdx++;
-        } else {
-            consecutive = 0;
-            score -= 1;
-        }
-        tIdx++;
-    }
-    
-    return qIdx == qLen;
-}
-
-HFONT hDialogListFont = NULL;
-std::mutex g_SearchMutex;
-
-struct SearchState {
-    std::atomic<bool> bActive;
-    std::vector<TCHAR> buffer;
-    std::basic_string<TCHAR> query;
-    BOOL bRegex;
-    BOOL bFuzzy;
-    
-    // Optimization buffers
-    std::basic_string<TCHAR> queryLower;
-
-    // Results
-    std::vector<SearchMatch>* pMatches;
-    HWND hDlg;
-    int itemsPerPage;
-    int* pCurrentPage;
-    
-    // UI Update Throttling
-    DWORD lastUpdateTime;
-    BOOL bFirstPageFilled;
-    
-    std::thread workerThread;
-};
-
-SearchState g_SearchState = {0};
-#define WM_SEARCH_UPDATE (WM_USER + 100)
-#define WM_SEARCH_COMPLETE (WM_USER + 101)
-
-void UpdateSearchList(HWND hDlg, const std::vector<SearchMatch>& matches, int page, int itemsPerPage, BOOL bAppendIfPossible = FALSE);
-
-
-void SearchWorker()
-{
-    const TCHAR* pBuffer = g_SearchState.buffer.data();
-    size_t maxLen = g_SearchState.buffer.size();
-    if (maxLen > 0 && pBuffer[maxLen-1] == 0) maxLen--; // Exclude null terminator if present
-
-    size_t bufferPos = 0;
-    int lineNum = 0;
-    long correction = 0;
-    
-    std::vector<TCHAR> lowerBuffer;
-    std::vector<SearchMatch> pendingMatches;
-    
-    #ifdef UNICODE
-    std::wstring wQuery = g_SearchState.query;
-    #else
-    std::string sQuery = g_SearchState.query;
-    #endif
-
-    DWORD lastReportTime = GetTickCount();
-
-    while(g_SearchState.bActive && bufferPos < maxLen)
-    {
-        size_t lineStart = bufferPos;
-        size_t lineEnd = lineStart;
-        
-        // Scan for newline (handle \r, \n, \r\n)
-        while(lineEnd < maxLen) {
-            if (pBuffer[lineEnd] == _T('\n')) break;
-            if (pBuffer[lineEnd] == _T('\r')) {
-                if (lineEnd + 1 < maxLen && pBuffer[lineEnd+1] == _T('\n')) {
-                    // Found \r\n, treat as end of line
-                }
-                break;
-            }
-            lineEnd++;
-        }
-        
-        size_t contentLen = lineEnd - lineStart;
-        
-        std::basic_string_view<TCHAR> lineView(pBuffer + lineStart, contentLen);
-        long internalOffset = (long)lineStart; 
-        
-        if (g_SearchState.bRegex)
-        {
-            try {
-                #ifdef UNICODE
-                std::wregex re(wQuery, std::regex_constants::icase);
-                std::wcmatch m;
-                const wchar_t* searchStart = lineView.data();
-                const wchar_t* searchEnd = lineView.data() + lineView.length();
-                auto current = searchStart;
-                while (std::regex_search(current, searchEnd, m, re))
-                #else
-                std::regex re(sQuery, std::regex_constants::icase);
-                std::cmatch m;
-                const char* searchStart = lineView.data();
-                const char* searchEnd = lineView.data() + lineView.length();
-                auto current = searchStart;
-                while (std::regex_search(current, searchEnd, m, re))
-                #endif
-                {
-                    SearchMatch sm;
-                    sm.lineNum = lineNum;
-                    sm.matchStart = (int)(m.position() + (current - searchStart));
-                    sm.matchLen = (int)m.length();
-                    sm.score = 0;
-                    sm.absolutePos = (internalOffset + sm.matchStart) - correction;
-                    sm.lineText = std::basic_string<TCHAR>(lineView);
-                    pendingMatches.push_back(sm);
-                    
-                    current += m.position() + m.length();
-                    if (m.length() == 0) current++;
-                }
-            }
-            catch (...) {}
-        }
-        else if (g_SearchState.bFuzzy)
-        {
-            int score = 0;
-            std::string lineStr;
-            std::string queryStr;
-            
-            #ifdef UNICODE
-            lineStr.reserve(lineView.length());
-            for(auto c : lineView) lineStr += (char)c;
-            for(auto c : wQuery) queryStr += (char)c;
-            #else
-            lineStr = std::string(lineView);
-            queryStr = sQuery;
-            #endif
-            
-            if (FuzzyMatch(lineStr, queryStr, score))
-            {
-                SearchMatch m;
-                m.lineNum = lineNum;
-                m.matchStart = -1; 
-                m.matchLen = 0;
-                m.score = score;
-                m.absolutePos = internalOffset - correction; 
-                m.lineText = std::basic_string<TCHAR>(lineView);
-                pendingMatches.push_back(m);
-            }
-        }
-        else
-        {
-            // Normal search
-            size_t len = lineView.length();
-            if (lowerBuffer.size() < len + 1) {
-                lowerBuffer.resize(len + 256);
-            }
-            
-            TCHAR* pLower = lowerBuffer.data();
-            if (len > 0) {
-                memcpy(pLower, lineView.data(), len * sizeof(TCHAR));
-            }
-            pLower[len] = 0;
-            
-            CharLowerBuff(pLower, (DWORD)len);
-            
-            std::basic_string_view<TCHAR> textLower(pLower, len);
-            const std::basic_string<TCHAR>& queryLower = g_SearchState.queryLower;
-            
-            size_t pos = 0;
-            while ((pos = textLower.find(queryLower, pos)) != std::basic_string_view<TCHAR>::npos)
-            {
-                SearchMatch sm;
-                sm.lineNum = lineNum;
-                sm.matchStart = (int)pos;
-                sm.matchLen = (int)queryLower.length();
-                sm.score = 0;
-                sm.absolutePos = (internalOffset + sm.matchStart) - correction;
-                sm.lineText = std::basic_string<TCHAR>(lineView);
-                pendingMatches.push_back(sm);
-                pos += queryLower.length();
-            }
-        }
-        
-        // Advance bufferPos and update correction
-        if (lineEnd < maxLen) {
-            if (pBuffer[lineEnd] == _T('\r')) {
-                if (lineEnd + 1 < maxLen && pBuffer[lineEnd+1] == _T('\n')) {
-                    bufferPos = lineEnd + 2;
-                    correction++; // Buffer has \r\n (2 chars), Internal has \r (1 char)
-                } else {
-                    bufferPos = lineEnd + 1;
-                }
-            } else if (pBuffer[lineEnd] == _T('\n')) {
-                bufferPos = lineEnd + 1;
-            } else {
-                // Should not happen given the loop above
-                bufferPos = lineEnd + 1;
-            }
-        } else {
-            bufferPos = maxLen;
-        }
-        
-        lineNum++;
-        
-        // Batch update
-        if (pendingMatches.size() >= 100 || (GetTickCount() - lastReportTime > 100 && !pendingMatches.empty()))
-        {
-            {
-                std::lock_guard<std::mutex> lock(g_SearchMutex);
-                g_SearchState.pMatches->insert(g_SearchState.pMatches->end(), pendingMatches.begin(), pendingMatches.end());
-            }
-            pendingMatches.clear();
-            PostMessage(g_SearchState.hDlg, WM_SEARCH_UPDATE, (WPARAM)bufferPos, 0);
-            lastReportTime = GetTickCount();
-        }
-        else if (GetTickCount() - lastReportTime > 100)
-        {
-             // Report progress even if no matches
-             PostMessage(g_SearchState.hDlg, WM_SEARCH_UPDATE, (WPARAM)bufferPos, 0);
-             lastReportTime = GetTickCount();
-        }
-    }
-    
-    // Final flush
-    if (!pendingMatches.empty())
-    {
-        std::lock_guard<std::mutex> lock(g_SearchMutex);
-        g_SearchState.pMatches->insert(g_SearchState.pMatches->end(), pendingMatches.begin(), pendingMatches.end());
-    }
-    
-    PostMessage(g_SearchState.hDlg, WM_SEARCH_COMPLETE, 0, 0);
-}
-
-void StartSearch(HWND hDlg, std::vector<SearchMatch>& matches, int* pCurrentPage)
-{
-    TCHAR szQuery[256];
-    GetDlgItemText(hDlg, IDC_SEARCH_TEXT, szQuery, 256);
-    
-    // Stop existing search
-    if (g_SearchState.bActive) {
-        g_SearchState.bActive = FALSE;
-        if (g_SearchState.workerThread.joinable()) {
-            g_SearchState.workerThread.join();
-        }
-    }
-    
-    g_SearchState.bRegex = IsDlgButtonChecked(hDlg, IDC_SEARCH_REGEX);
-    g_SearchState.bFuzzy = IsDlgButtonChecked(hDlg, IDC_SEARCH_FUZZY);
-    g_SearchState.query = szQuery;
-    if (!g_SearchState.bRegex && !g_SearchState.bFuzzy) {
-        g_SearchState.queryLower = ToLowerCase(g_SearchState.query);
-    }
-    g_SearchState.pMatches = &matches;
-    g_SearchState.hDlg = hDlg;
-    g_SearchState.itemsPerPage = 100; 
-    g_SearchState.pCurrentPage = pCurrentPage;
-    g_SearchState.lastUpdateTime = GetTickCount();
-    g_SearchState.bFirstPageFilled = FALSE;
-    
-    int nLen = SendMessage(hEditor, WM_GETTEXTLENGTH, 0, 0);
-    g_SearchState.buffer.resize(nLen + 1);
-    SendMessage(hEditor, WM_GETTEXT, nLen + 1, (LPARAM)g_SearchState.buffer.data());
-    
-    matches.clear();
-    *pCurrentPage = 1;
-
-    g_SearchState.bActive = TRUE;
-    
-    // Reset Progress
-    SendDlgItemMessage(hDlg, IDC_SEARCH_PROGRESS, PBM_SETRANGE32, 0, nLen);
-    SendDlgItemMessage(hDlg, IDC_SEARCH_PROGRESS, PBM_SETPOS, 0, 0);
-    ShowWindow(GetDlgItem(hDlg, IDC_SEARCH_PROGRESS), SW_SHOW);
-    
-    // Start Thread
-    g_SearchState.workerThread = std::thread(SearchWorker);
-}
-
-
-
-void UpdateSearchList(HWND hDlg, const std::vector<SearchMatch>& matches, int page, int itemsPerPage, BOOL bAppendIfPossible)
-{
-    int startIdx = (page - 1) * itemsPerPage;
-    int endIdx = min((int)matches.size(), startIdx + itemsPerPage);
-    
-    int currentCount = (int)SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETCOUNT, 0, 0);
-    
-    // Check if "No matches found" is displayed
-    BOOL bNoMatchesDisplayed = FALSE;
-    if (currentCount == 1) {
-        int len = (int)SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETTEXTLEN, 0, 0);
-        if (len > 0) {
-            std::vector<TCHAR> buf(len + 1);
-            SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETTEXT, 0, (LPARAM)buf.data());
-            if (_tcscmp(buf.data(), _T("No matches found.")) == 0) bNoMatchesDisplayed = TRUE;
-        }
-    }
-
-    if (matches.empty())
-    {
-        if (!bNoMatchesDisplayed) {
-            SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_RESETCONTENT, 0, 0);
-            SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_ADDSTRING, 0, (LPARAM)_T("No matches found."));
-            SetDlgItemText(hDlg, IDC_PAGE_INFO, _T("Page 0 of 0"));
-            EnableWindow(GetDlgItem(hDlg, IDC_PREV_PAGE), FALSE);
-            EnableWindow(GetDlgItem(hDlg, IDC_NEXT_PAGE), FALSE);
-        }
-        return;
-    }
-
-    if (bNoMatchesDisplayed) {
-        SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_RESETCONTENT, 0, 0);
-        currentCount = 0;
-    }
-
-    BOOL bDoAppend = FALSE;
-    if (bAppendIfPossible && currentCount >= 0 && currentCount < (endIdx - startIdx))
-    {
-        // Verify we are on the right page (heuristic: if count > 0, first item should match)
-        if (currentCount > 0) {
-            int firstMatchIdx = (int)SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETITEMDATA, 0, 0);
-            if (firstMatchIdx == startIdx) {
-                bDoAppend = TRUE;
-            }
-        } else {
-            bDoAppend = TRUE;
-        }
-    }
-
-    if (bDoAppend)
-    {
-        SendMessage(GetDlgItem(hDlg, IDC_SEARCH_LIST), WM_SETREDRAW, FALSE, 0);
-        for (int i = startIdx + currentCount; i < endIdx; i++)
-        {
-            const auto& m = matches[i];
-            int line = m.lineNum;
-            int col = m.matchStart + 1;
-            TCHAR buf[512];
-            StringCchPrintf(buf, 512, _T("Ln %d, Col %d: %s"), line + 1, col, m.lineText.c_str());
-            int idx = SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_ADDSTRING, 0, (LPARAM)buf);
-            SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_SETITEMDATA, idx, (LPARAM)i);
-        }
-        SendMessage(GetDlgItem(hDlg, IDC_SEARCH_LIST), WM_SETREDRAW, TRUE, 0);
-    }
-    else
-    {
-        SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_RESETCONTENT, 0, 0);
-        SendMessage(GetDlgItem(hDlg, IDC_SEARCH_LIST), WM_SETREDRAW, FALSE, 0);
-
-        for (int i = startIdx; i < endIdx; i++)
-        {
-            const auto& m = matches[i];
-            int line = m.lineNum;
-            int col = m.matchStart + 1;
-            
-            {
-                TCHAR buf[512];
-                StringCchPrintf(buf, 512, _T("Ln %d, Col %d: %s"), line + 1, col, m.lineText.c_str());
-                int idx = SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_ADDSTRING, 0, (LPARAM)buf);
-                SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_SETITEMDATA, idx, (LPARAM)i);
-            }
-        }
-
-        SendMessage(GetDlgItem(hDlg, IDC_SEARCH_LIST), WM_SETREDRAW, TRUE, 0);
-        InvalidateRect(GetDlgItem(hDlg, IDC_SEARCH_LIST), NULL, TRUE);
-    }
-    
-    int totalPages = (int)((matches.size() + itemsPerPage - 1) / itemsPerPage);
-    if (page < 1) page = 1;
-    if (page > totalPages) page = totalPages;
-    
-    TCHAR pageInfo[64];
-    StringCchPrintf(pageInfo, 64, _T("Page %d of %d"), page, totalPages);
-    SetDlgItemText(hDlg, IDC_PAGE_INFO, pageInfo);
-    
-    EnableWindow(GetDlgItem(hDlg, IDC_PREV_PAGE), page > 1);
-    EnableWindow(GetDlgItem(hDlg, IDC_NEXT_PAGE), page < totalPages);
-}
-
-INT_PTR CALLBACK AdvancedSearchDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
-{
-    static std::vector<SearchMatch> matches;
-    static int currentPage = 1;
-    static const int itemsPerPage = 100;
-
-    switch (message)
-    {
-    case WM_INITDIALOG:
-    {
-        hDialogListFont = CreateFont(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, 
-                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, 
-                                 DEFAULT_PITCH | FF_SWISS, _T("Consolas"));
-        SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, WM_SETFONT, (WPARAM)hDialogListFont, TRUE);
-        
-        EnableWindow(GetDlgItem(hDlg, IDC_PREV_PAGE), FALSE);
-        EnableWindow(GetDlgItem(hDlg, IDC_NEXT_PAGE), FALSE);
-        SetDlgItemText(hDlg, IDC_PAGE_INFO, _T(""));
-        
-        // Resize dialog to 50% of screen and center it
-        RECT rcScreen;
-        GetWindowRect(GetDesktopWindow(), &rcScreen);
-        int screenW = rcScreen.right - rcScreen.left;
-        int screenH = rcScreen.bottom - rcScreen.top;
-        int width = screenW * 50 / 100;
-        int height = screenH * 50 / 100;
-        int x = rcScreen.left + (screenW - width) / 2;
-        int y = rcScreen.top + (screenH - height) / 2;
-        
-        SetWindowPos(hDlg, NULL, x, y, width, height, SWP_NOZORDER);
-        
-        return (INT_PTR)TRUE;
-    }
-    case WM_SIZE:
-    {
-        int width = LOWORD(lParam);
-        int height = HIWORD(lParam);
-        
-        int margin = 10;
-        int btnWidth = 90;
-        int btnHeight = 24;
-        int editHeight = 24;
-        int labelHeight = 16;
-        int labelWidth = 70;
-        
-        int editX = margin + labelWidth + 5;
-        int editW = width - editX - margin - btnWidth - 10;
-        int btnX = width - margin - btnWidth;
-        
-        int row1Y = 10;
-        int row2Y = row1Y + editHeight + 10;
-        int groupY = row2Y + editHeight + 15;
-        int groupH = 45;
-        int resultsY = groupY + groupH + 10;
-        int progressY = resultsY;
-        int listY = resultsY + 20;
-        int bottomY = height - btnHeight - 10;
-        
-        // Top Row: Find
-        SetWindowPos(GetDlgItem(hDlg, IDC_STATIC_FIND_LABEL), NULL, margin, row1Y + 4, labelWidth, labelHeight, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hDlg, IDC_SEARCH_TEXT), NULL, editX, row1Y, editW, editHeight, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hDlg, IDC_SEARCH_BTN), NULL, btnX, row1Y, btnWidth, btnHeight, SWP_NOZORDER);
-        
-        // Second Row: Replace
-        SetWindowPos(GetDlgItem(hDlg, IDC_STATIC_REPLACE_LABEL), NULL, margin, row2Y + 4, labelWidth, labelHeight, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hDlg, IDC_REPLACE_TEXT), NULL, editX, row2Y, editW, editHeight, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hDlg, IDC_REPLACE_ALL_BTN), NULL, btnX, row2Y, btnWidth, btnHeight, SWP_NOZORDER);
-        
-        // GroupBox
-        SetWindowPos(GetDlgItem(hDlg, IDC_STATIC_OPTIONS_GROUP), NULL, margin, groupY, width - margin*2, groupH, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hDlg, IDC_SEARCH_REGEX), NULL, margin + 10, groupY + 20, 120, 20, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hDlg, IDC_SEARCH_FUZZY), NULL, margin + 140, groupY + 20, 100, 20, SWP_NOZORDER);
-        
-        // Progress Bar
-        SetWindowPos(GetDlgItem(hDlg, IDC_STATIC_RESULTS_LABEL), NULL, margin, resultsY, 50, labelHeight, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hDlg, IDC_SEARCH_PROGRESS), NULL, margin + 55, resultsY, width - margin*2 - 55, 15, SWP_NOZORDER);
-        
-        // ListBox
-        SetWindowPos(GetDlgItem(hDlg, IDC_SEARCH_LIST), NULL, margin, listY, width - margin*2, bottomY - listY - 10, SWP_NOZORDER);
-        
-        // Bottom Controls
-        SetWindowPos(GetDlgItem(hDlg, IDC_PREV_PAGE), NULL, margin, bottomY, btnWidth, btnHeight, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hDlg, IDC_PAGE_INFO), NULL, margin + btnWidth + 10, bottomY + 5, 100, labelHeight, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hDlg, IDC_NEXT_PAGE), NULL, margin + btnWidth + 120, bottomY, btnWidth, btnHeight, SWP_NOZORDER);
-        
-        SetWindowPos(GetDlgItem(hDlg, IDCANCEL), NULL, width - margin - btnWidth, bottomY, btnWidth, btnHeight, SWP_NOZORDER);
-        SetWindowPos(GetDlgItem(hDlg, IDC_REPLACE_BTN), NULL, width - margin - btnWidth - 10 - 110, bottomY, 110, btnHeight, SWP_NOZORDER);
-        
-        return (INT_PTR)TRUE;
-    }
-    case WM_SEARCH_UPDATE:
-    {
-        size_t bufferPos = (size_t)wParam;
-        SendDlgItemMessage(hDlg, IDC_SEARCH_PROGRESS, PBM_SETPOS, bufferPos, 0);
-        
-        // Update list if needed
-        if (currentPage == 1 && !g_SearchState.bFirstPageFilled)
-        {
-            std::lock_guard<std::mutex> lock(g_SearchMutex);
-            if (matches.size() >= (size_t)itemsPerPage)
-            {
-                UpdateSearchList(hDlg, matches, currentPage, itemsPerPage, TRUE);
-                g_SearchState.bFirstPageFilled = TRUE;
-            }
-            else if (GetTickCount() - g_SearchState.lastUpdateTime > 200)
-            {
-                UpdateSearchList(hDlg, matches, currentPage, itemsPerPage, TRUE);
-                g_SearchState.lastUpdateTime = GetTickCount();
-            }
-        }
-        
-        // Update page info
-        static DWORD lastPageInfoUpdate = 0;
-        if (GetTickCount() - lastPageInfoUpdate > 200) {
-            std::lock_guard<std::mutex> lock(g_SearchMutex);
-            int totalPages = (int)((matches.size() + itemsPerPage - 1) / itemsPerPage);
-            if (totalPages < 1) totalPages = 1;
-            TCHAR pageInfo[64];
-            StringCchPrintf(pageInfo, 64, _T("Page %d of %d"), currentPage, totalPages);
-            SetDlgItemText(hDlg, IDC_PAGE_INFO, pageInfo);
-            EnableWindow(GetDlgItem(hDlg, IDC_NEXT_PAGE), currentPage < totalPages);
-            lastPageInfoUpdate = GetTickCount();
-        }
-        return (INT_PTR)TRUE;
-    }
-    case WM_SEARCH_COMPLETE:
-    {
-        if (g_SearchState.workerThread.joinable()) {
-            g_SearchState.workerThread.join();
-        }
-        g_SearchState.bActive = FALSE;
-        
-        if (g_SearchState.bFuzzy)
-        {
-            std::sort(matches.begin(), matches.end(), [](const SearchMatch& a, const SearchMatch& b) {
-                return a.score > b.score;
-            });
-            UpdateSearchList(hDlg, matches, currentPage, itemsPerPage);
-        }
-        else
-        {
-            UpdateSearchList(hDlg, matches, currentPage, itemsPerPage, TRUE);
-        }
-        
-        int totalPages = (int)((matches.size() + itemsPerPage - 1) / itemsPerPage);
-        if (totalPages < 1) totalPages = 1;
-        TCHAR pageInfo[64];
-        StringCchPrintf(pageInfo, 64, _T("Page %d of %d"), currentPage, totalPages);
-        SetDlgItemText(hDlg, IDC_PAGE_INFO, pageInfo);
-        EnableWindow(GetDlgItem(hDlg, IDC_NEXT_PAGE), currentPage < totalPages);
-        return (INT_PTR)TRUE;
-    }
-    case WM_DESTROY:
-        if (g_SearchState.bActive) {
-            g_SearchState.bActive = FALSE;
-            if (g_SearchState.workerThread.joinable()) {
-                g_SearchState.workerThread.join();
-            }
-        }
-        if (hDialogListFont) DeleteObject(hDialogListFont);
-        matches.clear();
-        return (INT_PTR)TRUE;
-
-    case WM_COMMAND:
-        if (LOWORD(wParam) == IDC_SEARCH_BTN)
-        {
-            StartSearch(hDlg, matches, &currentPage);
-        }
-        else if (LOWORD(wParam) == IDC_PREV_PAGE)
-        {
-            if (currentPage > 1)
-            {
-                currentPage--;
-                UpdateSearchList(hDlg, matches, currentPage, itemsPerPage);
-            }
-        }
-        else if (LOWORD(wParam) == IDC_NEXT_PAGE)
-        {
-            int totalPages = (int)((matches.size() + itemsPerPage - 1) / itemsPerPage);
-            if (currentPage < totalPages)
-            {
-                currentPage++;
-                UpdateSearchList(hDlg, matches, currentPage, itemsPerPage);
-            }
-        }
-        else if (LOWORD(wParam) == IDC_REPLACE_BTN)
-        {
-            int idx = SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETCURSEL, 0, 0);
-            if (idx != LB_ERR)
-            {
-                int matchIdx = (int)SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETITEMDATA, idx, 0);
-                if (matchIdx >= 0 && matchIdx < (int)matches.size())
-                {
-                    // Check if fuzzy
-                    BOOL bFuzzy = IsDlgButtonChecked(hDlg, IDC_SEARCH_FUZZY);
-                    if (bFuzzy) {
-                        MessageBox(hDlg, _T("Replace not supported in Fuzzy mode."), _T("Info"), MB_ICONINFORMATION);
-                        return TRUE;
-                    }
-
-                    const auto& m = matches[matchIdx];
-                    
-                    // Found match
-                    TCHAR szReplace[256];
-                    GetDlgItemText(hDlg, IDC_REPLACE_TEXT, szReplace, 256);
-                    
-                    if (m.matchStart != -1)
-                    {
-                        SendMessage(hEditor, EM_SETSEL, m.absolutePos, m.absolutePos + m.matchLen);
-                        SendMessage(hEditor, EM_REPLACESEL, TRUE, (LPARAM)szReplace);
-                        
-                        // Refresh search
-                        StartSearch(hDlg, matches, &currentPage);
-                    }
-                }
-            }
-        }
-        else if (LOWORD(wParam) == IDC_REPLACE_ALL_BTN)
-        {
-            BOOL bFuzzy = IsDlgButtonChecked(hDlg, IDC_SEARCH_FUZZY);
-            if (bFuzzy) {
-                MessageBox(hDlg, _T("Replace not supported in Fuzzy mode."), _T("Info"), MB_ICONINFORMATION);
-                return TRUE;
-            }
-
-            // Wait for search to finish if active?
-            if (g_SearchState.bActive)
-            {
-                 MessageBox(hDlg, _T("Please wait for search to complete."), _T("Info"), MB_ICONINFORMATION);
-                 return TRUE;
-            }
-            
-            if (matches.empty()) 
-            {
-                 StartSearch(hDlg, matches, &currentPage);
-                 // We can't replace immediately if search is async.
-                 // For now, let's just say "Search started, click Replace All again when done"
-                 // Or we could make Replace All synchronous.
-                 return TRUE;
-            }
-            
-            TCHAR szReplace[256];
-            GetDlgItemText(hDlg, IDC_REPLACE_TEXT, szReplace, 256);
-            
-            // Sort matches by line/position descending to avoid index shifts
-            std::sort(matches.begin(), matches.end(), [](const SearchMatch& a, const SearchMatch& b) {
-                if (a.lineNum != b.lineNum) return a.lineNum > b.lineNum;
-                return a.matchStart > b.matchStart;
-            });
-            
-            int count = 0;
-            for (const auto& m : matches)
-            {
-                if (m.matchStart != -1)
-                {
-                    SendMessage(hEditor, EM_SETSEL, m.absolutePos, m.absolutePos + m.matchLen);
-                    SendMessage(hEditor, EM_REPLACESEL, TRUE, (LPARAM)szReplace);
-                    count++;
-                }
-            }
-            
-            TCHAR msg[64];
-            StringCchPrintf(msg, 64, _T("Replaced %d occurrences."), count);
-            MessageBox(hDlg, msg, _T("Replace All"), MB_OK);
-            
-            StartSearch(hDlg, matches, &currentPage);
-        }
-        else if (LOWORD(wParam) == IDC_SEARCH_LIST)
-        {
-            if (HIWORD(wParam) == LBN_SELCHANGE || HIWORD(wParam) == LBN_DBLCLK)
-            {
-                int idx = SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETCURSEL, 0, 0);
-                if (idx != LB_ERR)
-                {
-                    int matchIdx = (int)SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETITEMDATA, idx, 0);
-                    if (matchIdx >= 0 && matchIdx < (int)matches.size())
-                    {
-                        const auto& m = matches[matchIdx];
-                        
-                        if (m.matchStart != -1)
-                        {
-                            // Scroll to start
-                            SendMessage(hEditor, EM_SETSEL, m.absolutePos, m.absolutePos);
-                            SendMessage(hEditor, EM_SCROLLCARET, 0, 0);
-                            
-                            // Select full match
-                            SendMessage(hEditor, EM_SETSEL, m.absolutePos, m.absolutePos + m.matchLen);
-                        }
-                        else
-                        {
-                            // Fallback for fuzzy or line-only matches if any
-                            int nIndex = SendMessage(hEditor, EM_LINEINDEX, m.lineNum, 0);
-                            if (nIndex != -1)
-                            {
-                                long nLineLen = SendMessage(hEditor, EM_LINELENGTH, nIndex, 0);
-                                SendMessage(hEditor, EM_SETSEL, nIndex, nIndex + nLineLen);
-                                SendMessage(hEditor, EM_SCROLLCARET, 0, 0);
-                            }
-                        }
-                        
-                        if (HIWORD(wParam) == LBN_DBLCLK)
-                        {
-                            EndDialog(hDlg, IDOK);
-                        }
-                    }
-                }
-            }
-        }
-        else if (LOWORD(wParam) == IDCANCEL)
-        {
-            EndDialog(hDlg, IDCANCEL);
-            return (INT_PTR)TRUE;
-        }
-        break;
-    }
-    return (INT_PTR)FALSE;
-}
-
-void DoAdvancedSearch()
-{
-    DialogBox(hInst, MAKEINTRESOURCE(IDD_ADVANCED_SEARCH), hMain, AdvancedSearchDlgProc);
-}
 
 struct PluginSearchState {
     std::vector<PluginCommand> allCommands;
@@ -3380,6 +2548,12 @@ void DoPluginSearch() {
     INT_PTR result = DialogBox(hInst, MAKEINTRESOURCE(IDD_PLUGIN_SEARCH), hMain, PluginSearchDlgProc);
     if (result > 0) {
         g_PluginManager.ExecutePluginCommand((int)result, g_Document.hEditor);
+    }
+}
+
+void DoManagePlugins() {
+    if (DialogBox(hInst, MAKEINTRESOURCE(IDD_MANAGE_PLUGINS), hMain, ManagePluginsDlgProc) == IDOK) {
+        UpdatePluginsMenu(hMain);
     }
 }
 
@@ -3565,8 +2739,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0,
             hwnd, (HMENU)IDC_STATUSBAR, hInst, NULL);
             
-        int statwidths[] = {150, 300, 450, 550, 700, -1};
-        SendMessage(hStatus, SB_SETPARTS, 6, (LPARAM)statwidths);
+        int statwidths[] = {150, 300, 450, 550, 700, 850, -1};
+        SendMessage(hStatus, SB_SETPARTS, 7, (LPARAM)statwidths);
 
         // Create Progress Bar in Status Bar
         hProgressBarStatus = CreateWindowEx(0, PROGRESS_CLASS, NULL, WS_CHILD,
@@ -3581,6 +2755,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         // Initial menu state
         HMENU hMenu = GetMenu(hwnd);
         CheckMenuItem(hMenu, ID_VIEW_STATUSBAR, MF_CHECKED);
+
+        // Load Plugin Settings
+        TCHAR szPath[MAX_PATH];
+        GetModuleFileName(NULL, szPath, MAX_PATH);
+        PathRemoveFileSpec(szPath);
+        PathAppend(szPath, _T("config.ini"));
+        g_PluginManager.LoadSettings(szPath);
 
         UpdateTitle();
         UpdateStatusBar();
@@ -3633,8 +2814,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             BOOL bReadOnly = (dwAttrs != INVALID_FILE_ATTRIBUTES) && (dwAttrs & FILE_ATTRIBUTE_READONLY);
             SendMessage(g_Document.hEditor, EM_SETREADONLY, bReadOnly, 0);
             
+            // Notify plugins
+            g_PluginManager.NotifyFileEvent(g_Document.szFileName, g_Document.hEditor, L"Loaded");
+
             ShowWindow(hProgressBarStatus, SW_HIDE);
             g_Document.bLoading = FALSE;
+            
+            // Ensure event mask is set
+            SendMessage(g_Document.hEditor, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE);
+            
+            UpdateStatusBar();
         }
         
         if (res) delete res;
@@ -3668,7 +2857,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                         SetTimer(hwnd, 1, 2000, NULL);
                     }
                 }
+
+                // Check for attribute changes (ReadOnly)
+                DWORD dwAttrs = GetFileAttributes(doc.szFileName);
+                if (dwAttrs != INVALID_FILE_ATTRIBUTES)
+                {
+                    BOOL bFileReadOnly = (dwAttrs & FILE_ATTRIBUTE_READONLY) != 0;
+                    
+                    // Check current editor state
+                    // Use EM_GETREADONLY for RichEdit
+                    // But we can also check the menu state or just force sync
+                    // Let's check the style
+                    DWORD dwStyle = GetWindowLong(g_Document.hEditor, GWL_STYLE);
+                    BOOL bEditorReadOnly = (dwStyle & ES_READONLY) != 0;
+                    
+                    if (bFileReadOnly != bEditorReadOnly)
+                    {
+                        SendMessage(g_Document.hEditor, EM_SETREADONLY, bFileReadOnly, 0);
+                        HMENU hMenu = GetMenu(hwnd);
+                        CheckMenuItem(hMenu, ID_FILE_TOGGLEREADONLY, bFileReadOnly ? MF_CHECKED : MF_UNCHECKED);
+                    }
+                }
             }
+            
+            // Update status bar periodically to reflect plugin status changes
+            UpdateStatusBar();
         }
         else if (wParam == IDT_BACKGROUND_LOAD)
         {
@@ -3741,6 +2954,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 BOOL bReadOnly = (dwAttrs != INVALID_FILE_ATTRIBUTES) && (dwAttrs & FILE_ATTRIBUTE_READONLY);
                 SendMessage(g_Document.hEditor, EM_SETREADONLY, bReadOnly, 0);
                 
+                // Notify plugins
+                g_PluginManager.NotifyFileEvent(g_Document.szFileName, g_Document.hEditor, L"Loaded");
+                
+                UpdateStatusBar();
+
                 // Re-enable ReadOnly menu item
                 HMENU hMenu = GetMenu(hwnd);
                 EnableMenuItem(hMenu, ID_FILE_TOGGLEREADONLY, MF_ENABLED);
@@ -3800,7 +3018,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             SetTextColor(hdc, crText);
             
             // Draw Text
-            if (nPart >= 0 && nPart < 6)
+            if (nPart >= 0 && nPart < 7)
             {
                 // Add some padding
                 rc.left += 4;
@@ -3928,8 +3146,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             EnableMenuItem(hMenu, ID_EDIT_UNINDENT, bCanUnindent ? MF_ENABLED : MF_GRAYED);
         }
 
-        CheckMenuItem(hMenu, ID_OPTIONS_ADD_TO_SHELL, IsAppInShellMenu() ? MF_CHECKED : MF_UNCHECKED);
-        // CheckMenuItem(hMenu, ID_OPTIONS_ASSOCIATE_TXT, IsTxtAssociated() ? MF_CHECKED : MF_UNCHECKED);
+
         
         Document& doc = g_Document;
         for (const auto& info : g_Encodings)
@@ -3955,6 +3172,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             {
                 doc.bIsDirty = TRUE;
                 UpdateTitle();
+                g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Modified");
             }
         }
 
@@ -3968,6 +3186,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_FILE_PAGESETUP: DoPageSetup(); break;
         case ID_FILE_PRINT: DoPrint(); break;
         case ID_PLUGIN_SEARCH: DoPluginSearch(); break;
+        case ID_MANAGE_PLUGINS: DoManagePlugins(); break;
         case ID_FILE_EXIT: 
             if (CheckAllSaveChanges()) 
             {
@@ -4013,15 +3232,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             break;
 
-        case ID_OPTIONS_ADD_TO_SHELL:
-            if (IsAppInShellMenu())
-                RemoveAppFromShellMenu();
-            else
-                AddAppToShellMenu();
-            break;
-        case ID_OPTIONS_ASSOCIATE_TXT:
-            AssociateTxtFiles();
-            break;
+
         
         case ID_HELP_ABOUT:
             DoAbout();
@@ -4057,7 +3268,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_EDIT_SELECTALL: SendMessage(hEditor, EM_SETSEL, 0, -1); break;
         
         case ID_EDIT_FIND: DoFind(); break;
-        case ID_EDIT_ADVANCED_SEARCH: DoAdvancedSearch(); break;
+
         case ID_EDIT_REPLACE: DoReplace(); break;
         case ID_EDIT_FINDNEXT: 
             if (szFindWhat[0]) FindNextText(FR_DOWN); 

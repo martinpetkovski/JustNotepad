@@ -910,7 +910,7 @@ extern "C" {
 
     void OpenEmojiPicker(HWND hEditorWnd) {
         INT_PTR result = DialogBox(g_hInst, MAKEINTRESOURCE(IDD_EMOJI_PICKER), hEditorWnd, EmojiDlgProc);
-        if (result != 0) {
+        if (result != 0 && result != -1) {
             const wchar_t* emoji = (const wchar_t*)result;
             SendMessage(hEditorWnd, EM_REPLACESEL, TRUE, (LPARAM)emoji);
         }

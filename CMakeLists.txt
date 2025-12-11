@@ -48,7 +48,12 @@ add_subdirectory(plugins/DateTimePlugin)
 add_subdirectory(plugins/GuidPlugin)
 add_subdirectory(plugins/EmojiPlugin)
 add_subdirectory(plugins/ClangFormatPlugin)
+add_subdirectory(plugins/AdvancedSearchPlugin)
+add_subdirectory(plugins/WindowsShellPlugin)
 add_subdirectory(plugins/GitPlugin)
+add_subdirectory(plugins/PerforcePlugin)
+add_subdirectory(plugins/CharacterMapPlugin)
+
 
 
 # Output directory
