@@ -17,6 +17,7 @@
 #include <deque>
 #include <dwmapi.h>
 #include <uxtheme.h>
+#include <ole2.h>
 #include "resource.h"
 #include "TextHelpers.h"
 
@@ -28,6 +29,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "ole32.lib")
 
 #define IDC_EDITOR 1001
 #define IDC_STATUSBAR 1002
@@ -569,7 +571,8 @@ BOOL LoadFromFile(LPCTSTR pszFile)
                 DWORD checkLen = min(fileSize, 1024);
                 for (DWORD i = 0; i < checkLen; i++)
                 {
-                    if (pData[i] == 0)
+                    BYTE b = pData[i];
+                    if (b < 0x20 && b != 0x09 && b != 0x0A && b != 0x0D)
                     {
                         isBinary = TRUE;
                         break;
@@ -602,7 +605,8 @@ BOOL LoadFromFile(LPCTSTR pszFile)
                     doc.currentEncoding = ENC_UTF8;
                     for (DWORD i = 0; i < read; i++)
                     {
-                        if (buf[i] == 0)
+                        BYTE b = buf[i];
+                        if (b < 0x20 && b != 0x09 && b != 0x0A && b != 0x0D)
                         {
                             isBinary = TRUE;
                             break;
@@ -705,6 +709,15 @@ BOOL LoadFromFile(LPCTSTR pszFile)
     return FALSE;
 }
 
+void OpenFile(LPCTSTR pszFile)
+{
+    if (CheckSaveChanges())
+    {
+        CreateNewDocument(pszFile);
+        AddRecentFile(pszFile);
+    }
+}
+
 void DoFileOpen()
 {
     OPENFILENAME ofn = {0};
@@ -720,11 +733,7 @@ void DoFileOpen()
 
     if (GetOpenFileName(&ofn))
     {
-        if (CheckSaveChanges())
-        {
-            CreateNewDocument(ofn.lpstrFile);
-            AddRecentFile(ofn.lpstrFile);
-        }
+        OpenFile(ofn.lpstrFile);
     }
 }
 
@@ -1220,7 +1229,23 @@ WNDPROC wpOrigEditProc;
 
 LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    if (msg == WM_KEYDOWN)
+    if (msg == WM_DROPFILES)
+    {
+        HDROP hDrop = (HDROP)wParam;
+        TCHAR szFile[MAX_PATH];
+        UINT nFiles = DragQueryFile(hDrop, 0xFFFFFFFF, NULL, 0);
+        
+        if (nFiles > 0)
+        {
+            if (DragQueryFile(hDrop, 0, szFile, MAX_PATH))
+            {
+                OpenFile(szFile);
+            }
+        }
+        DragFinish(hDrop);
+        return 0;
+    }
+    else if (msg == WM_KEYDOWN)
     {
         if (wParam == VK_TAB)
         {
@@ -1291,6 +1316,12 @@ void CreateNewDocument(LPCTSTR pszFile)
 
         // Subclass Editor
         wpOrigEditProc = (WNDPROC)SetWindowLongPtr(g_Document.hEditor, GWLP_WNDPROC, (LONG_PTR)EditorWndProc);
+        
+        // Disable OLE Drag & Drop to allow WM_DROPFILES
+        RevokeDragDrop(g_Document.hEditor);
+
+        // Enable Drag & Drop for Editor
+        DragAcceptFiles(g_Document.hEditor, TRUE);
     }
     else
     {
@@ -1614,8 +1645,17 @@ void UpdateStatusBar()
 
     // Get file size
     const EncodingInfo* info = GetEncodingInfo(doc.currentEncoding);
-    GETTEXTLENGTHEX gtlSize = { GTL_NUMBYTES | GTL_PRECISE, info->codePage };
-    long nBytes = SendMessage(hEditor, EM_GETTEXTLENGTHEX, (WPARAM)&gtlSize, 0);
+    long nBytes = 0;
+
+    if (g_BgLoad.bActive)
+    {
+        nBytes = g_BgLoad.dwTotalSize;
+    }
+    else
+    {
+        GETTEXTLENGTHEX gtlSize = { GTL_NUMBYTES | GTL_PRECISE, info->codePage };
+        nBytes = SendMessage(hEditor, EM_GETTEXTLENGTHEX, (WPARAM)&gtlSize, 0);
+    }
     
     TCHAR szSize[64];
     StrFormatByteSize(nBytes, szSize, 64);
@@ -3047,11 +3087,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         {
             if (DragQueryFile(hDrop, 0, szFile, MAX_PATH))
             {
-                if (CheckSaveChanges())
-                {
-                    CreateNewDocument(szFile);
-                    AddRecentFile(szFile);
-                }
+                OpenFile(szFile);
             }
         }
         DragFinish(hDrop);
