@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <regex>
+#include <string_view>
 #include <shlwapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -18,6 +19,9 @@
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <ole2.h>
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include "resource.h"
 #include "TextHelpers.h"
 
@@ -258,6 +262,206 @@ void DoIndent();
 void DoUnindent();
 
 void CreateNewDocument(LPCTSTR pszFile);
+
+#define WM_LOAD_COMPLETE (WM_USER + 102)
+#define WM_LOAD_PROGRESS (WM_USER + 103)
+
+struct LoadResult {
+    std::vector<wchar_t> buffer;
+    Encoding encoding;
+    BOOL bSuccess;
+};
+
+void ParallelConvert(const BYTE* pData, size_t size, Encoding encoding, std::vector<wchar_t>& outBuffer, HWND hMain)
+{
+    int numThreads = std::thread::hardware_concurrency();
+    if (numThreads == 0) numThreads = 2;
+    if (size < 1024 * 1024) numThreads = 1;
+
+    std::vector<std::thread> threads;
+    std::vector<std::vector<wchar_t>> chunks(numThreads);
+    std::atomic<size_t> processedBytes(0);
+    
+    size_t chunkSize = size / numThreads;
+    
+    for(int i=0; i<numThreads; i++)
+    {
+        size_t start = i * chunkSize;
+        size_t end = (i == numThreads - 1) ? size : (i + 1) * chunkSize;
+        
+        if (encoding == ENC_UTF8 && i > 0)
+        {
+            while(start < end && (pData[start] & 0xC0) == 0x80) start++;
+        }
+        
+        threads.emplace_back([=, &chunks, &pData, &processedBytes]() {
+            if (start >= end) return;
+            
+            size_t current = start;
+            size_t step = 1024 * 1024; // 1MB chunks for progress reporting
+            
+            while(current < end)
+            {
+                size_t blockEnd = min(current + step, end);
+                
+                // Adjust blockEnd for UTF-8 boundary if needed
+                if (encoding == ENC_UTF8 && blockEnd < end) {
+                    while(blockEnd < end && (pData[blockEnd] & 0xC0) == 0x80) blockEnd++;
+                }
+                
+                size_t len = blockEnd - current;
+                UINT cp = (encoding == ENC_UTF8) ? CP_UTF8 : CP_ACP;
+                
+                int needed = MultiByteToWideChar(cp, 0, (LPCSTR)(pData + current), (int)len, NULL, 0);
+                if (needed > 0) {
+                    size_t oldSize = chunks[i].size();
+                    chunks[i].resize(oldSize + needed);
+                    MultiByteToWideChar(cp, 0, (LPCSTR)(pData + current), (int)len, chunks[i].data() + oldSize, needed);
+                }
+                
+                current = blockEnd;
+                processedBytes += len;
+                
+                // Report progress
+                PostMessage(hMain, WM_LOAD_PROGRESS, (WPARAM)processedBytes.load(), 0);
+            }
+        });
+    }
+    
+    for(auto& t : threads) t.join();
+    
+    size_t total = 0;
+    for(const auto& c : chunks) total += c.size();
+    outBuffer.reserve(total + 1);
+    
+    for(const auto& c : chunks) outBuffer.insert(outBuffer.end(), c.begin(), c.end());
+    outBuffer.push_back(0);
+}
+
+void ParallelHexConvert(const BYTE* pData, size_t size, std::vector<wchar_t>& outBuffer, HWND hMain)
+{
+    int numThreads = std::thread::hardware_concurrency();
+    if (numThreads == 0) numThreads = 2;
+    if (size < 64 * 1024) numThreads = 1;
+
+    size_t totalLines = (size + 15) / 16;
+    size_t linesPerThread = (totalLines + numThreads - 1) / numThreads;
+    
+    std::vector<std::thread> threads;
+    std::vector<std::vector<wchar_t>> chunks(numThreads);
+    std::atomic<size_t> processedBytes(0);
+    
+    for(int i=0; i<numThreads; i++)
+    {
+        size_t startLine = i * linesPerThread;
+        size_t endLine = min((i + 1) * linesPerThread, totalLines);
+        
+        if (startLine >= endLine) continue;
+
+        threads.emplace_back([=, &chunks, &pData, &processedBytes]() {
+            size_t startByte = startLine * 16;
+            size_t endByte = min(endLine * 16, size);
+            
+            std::string lineBuf;
+            lineBuf.reserve(4096); 
+            
+            size_t current = startByte;
+            size_t step = 16 * 1024; 
+            
+            while(current < endByte)
+            {
+                size_t blockEnd = min(current + step, endByte);
+                
+                for (size_t pos = current; pos < blockEnd; pos += 16)
+                {
+                    DWORD chunkLen = min(16, (DWORD)(size - pos));
+                    FormatHexLine((DWORD)pos, pData + pos, chunkLen, lineBuf);
+                }
+                
+                size_t oldSize = chunks[i].size();
+                chunks[i].resize(oldSize + lineBuf.size());
+                for(size_t k=0; k<lineBuf.size(); k++) {
+                    chunks[i][oldSize + k] = (wchar_t)lineBuf[k];
+                }
+                lineBuf.clear();
+                
+                processedBytes += (blockEnd - current);
+                PostMessage(hMain, WM_LOAD_PROGRESS, (WPARAM)processedBytes.load(), 0);
+                
+                current = blockEnd;
+            }
+        });
+    }
+    
+    for(auto& t : threads) if(t.joinable()) t.join();
+    
+    size_t total = 0;
+    for(const auto& c : chunks) total += c.size();
+    outBuffer.reserve(total + 1);
+    
+    for(const auto& c : chunks) outBuffer.insert(outBuffer.end(), c.begin(), c.end());
+    outBuffer.push_back(0);
+}
+
+void LoadWorker(std::wstring filename, Encoding encoding, BOOL bHex, HWND hMain)
+{
+    HANDLE hFile = CreateFile(filename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    
+    DWORD size = GetFileSize(hFile, NULL);
+    HANDLE hMap = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) { CloseHandle(hFile); return; }
+    
+    const BYTE* pData = (const BYTE*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!pData) { CloseHandle(hMap); CloseHandle(hFile); return; }
+    
+    LoadResult* res = new LoadResult();
+    res->encoding = encoding;
+    res->bSuccess = TRUE;
+    
+    if (bHex) {
+        ParallelHexConvert(pData, size, res->buffer, hMain);
+    } else if (encoding == ENC_UTF16LE) {
+        size_t chars = size / 2;
+        res->buffer.resize(chars + 1);
+        
+        // Chunked copy for progress
+        size_t copied = 0;
+        size_t step = 1024 * 1024; // 1MB
+        while(copied < size) {
+            size_t chunk = min(step, size - copied);
+            memcpy((BYTE*)res->buffer.data() + copied, pData + copied, chunk);
+            copied += chunk;
+            PostMessage(hMain, WM_LOAD_PROGRESS, (WPARAM)copied, 0);
+        }
+        res->buffer[chars] = 0;
+    } else if (encoding == ENC_UTF16BE) {
+        size_t chars = size / 2;
+        res->buffer.resize(chars + 1);
+        const WORD* src = (const WORD*)pData;
+        
+        size_t processed = 0;
+        size_t step = 512 * 1024; // 512K chars
+        
+        while(processed < chars) {
+            size_t chunk = min(step, chars - processed);
+            for(size_t i=0; i<chunk; i++) {
+                res->buffer[processed + i] = _byteswap_ushort(src[processed + i]);
+            }
+            processed += chunk;
+            PostMessage(hMain, WM_LOAD_PROGRESS, (WPARAM)(processed * 2), 0);
+        }
+        res->buffer[chars] = 0;
+    } else {
+        ParallelConvert(pData, size, encoding, res->buffer, hMain);
+    }
+    
+    UnmapViewOfFile(pData);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+    
+    PostMessage(hMain, WM_LOAD_COMPLETE, 0, (LPARAM)res);
+}
 
 BOOL GetFileLastWriteTime(LPCTSTR pszFile, FILETIME* pft)
 {
@@ -656,30 +860,26 @@ BOOL LoadFromFile(LPCTSTR pszFile)
         
         if (bBackgroundLoad)
         {
-            // Setup background loading
-            g_BgLoad.bActive = TRUE;
-            g_BgLoad.hFile = hFile;
-            g_BgLoad.hMap = hMap;
-            g_BgLoad.pData = pData;
-            g_BgLoad.dwTotalSize = fileSize;
-            g_BgLoad.dwCurrentPos = ctx.dwMapPos;
-            g_BgLoad.bHex = doc.bHexMode;
-            g_BgLoad.encoding = doc.currentEncoding;
-            g_BgLoad.inBuffer = ctx.inBuffer;
-            g_BgLoad.dwOffset = ctx.dwOffset;
-            
-            // Disable events and editing for speed
-            g_BgLoad.dwOriginalEventMask = SendMessage(doc.hEditor, EM_GETEVENTMASK, 0, 0);
-            SendMessage(doc.hEditor, EM_SETEVENTMASK, 0, 0);
-            SendMessage(doc.hEditor, EM_SETREADONLY, TRUE, 0);
+            // Close handles used for preview
+            if (pData) UnmapViewOfFile(pData);
+            if (hMap) CloseHandle(hMap);
+            CloseHandle(hFile);
             
             // Show Progress Bar
             SendMessage(hProgressBarStatus, PBM_SETRANGE32, 0, fileSize);
-            SendMessage(hProgressBarStatus, PBM_SETPOS, ctx.dwMapPos, 0);
+            SendMessage(hProgressBarStatus, PBM_SETPOS, 0, 0);
             ShowWindow(hProgressBarStatus, SW_SHOW);
             
-            // Start Timer - Give it 100ms to render the first screen before blocking
-            SetTimer(hMain, IDT_BACKGROUND_LOAD, 100, NULL);
+            // Start Worker Thread
+            std::wstring filename = pszFile;
+            Encoding enc = doc.currentEncoding;
+            BOOL bHex = doc.bHexMode;
+            std::thread([filename, enc, bHex](){
+                LoadWorker(filename, enc, bHex, hMain);
+            }).detach();
+            
+            // Set ReadOnly while loading
+            SendMessage(doc.hEditor, EM_SETREADONLY, TRUE, 0);
         }
         else
         {
@@ -2350,83 +2550,50 @@ bool FuzzyMatch(const std::string& text, const std::string& query, int& score) {
 }
 
 HFONT hDialogListFont = NULL;
+std::mutex g_SearchMutex;
 
 struct SearchState {
-    BOOL bActive;
+    std::atomic<bool> bActive;
     std::vector<TCHAR> buffer;
     std::basic_string<TCHAR> query;
     BOOL bRegex;
     BOOL bFuzzy;
-    long currentOffset;
-    int lineNum;
-    long totalLen;
     
-    // For incremental processing
-    std::basic_stringstream<TCHAR> ss;
-    
+    // Optimization buffers
+    std::basic_string<TCHAR> queryLower;
+
     // Results
     std::vector<SearchMatch>* pMatches;
     HWND hDlg;
     int itemsPerPage;
     int* pCurrentPage;
+    
+    // UI Update Throttling
+    DWORD lastUpdateTime;
+    BOOL bFirstPageFilled;
+    
+    std::thread workerThread;
 };
 
 SearchState g_SearchState = {0};
-#define IDT_SEARCH_BG 1001
+#define WM_SEARCH_UPDATE (WM_USER + 100)
+#define WM_SEARCH_COMPLETE (WM_USER + 101)
 
-void UpdateSearchList(HWND hDlg, const std::vector<SearchMatch>& matches, int page, int itemsPerPage);
+void UpdateSearchList(HWND hDlg, const std::vector<SearchMatch>& matches, int page, int itemsPerPage, BOOL bAppendIfPossible = FALSE);
 
-void StartSearch(HWND hDlg, std::vector<SearchMatch>& matches, int* pCurrentPage)
+
+void SearchWorker()
 {
-    TCHAR szQuery[256];
-    GetDlgItemText(hDlg, IDC_SEARCH_TEXT, szQuery, 256);
-    
-    // Stop existing search
-    if (g_SearchState.bActive) {
-        KillTimer(hDlg, IDT_SEARCH_BG);
-        g_SearchState.bActive = FALSE;
-    }
-    
-    g_SearchState.bRegex = IsDlgButtonChecked(hDlg, IDC_SEARCH_REGEX);
-    g_SearchState.bFuzzy = IsDlgButtonChecked(hDlg, IDC_SEARCH_FUZZY);
-    g_SearchState.query = szQuery;
-    g_SearchState.pMatches = &matches;
-    g_SearchState.hDlg = hDlg;
-    g_SearchState.itemsPerPage = 30; // Max 30 results per page
-    g_SearchState.pCurrentPage = pCurrentPage;
-    
-    int nLen = SendMessage(hEditor, WM_GETTEXTLENGTH, 0, 0);
-    g_SearchState.buffer.resize(nLen + 1);
-    SendMessage(hEditor, WM_GETTEXT, nLen + 1, (LPARAM)g_SearchState.buffer.data());
-    g_SearchState.totalLen = nLen;
-    
-    matches.clear();
-    *pCurrentPage = 1;
+    const TCHAR* pBuffer = g_SearchState.buffer.data();
+    size_t maxLen = g_SearchState.buffer.size();
+    if (maxLen > 0 && pBuffer[maxLen-1] == 0) maxLen--; // Exclude null terminator if present
 
-    // Initialize stream
-    // Note: stringstream copies the buffer, which is not ideal for huge files but okay for now.
-    // For huge files we should use a custom stream or just pointers.
-    // But since we already have the buffer in memory...
-    g_SearchState.ss.str(std::basic_string<TCHAR>(g_SearchState.buffer.data()));
-    g_SearchState.ss.clear();
-    g_SearchState.currentOffset = 0;
-    g_SearchState.lineNum = 0;
-    g_SearchState.bActive = TRUE;
+    size_t bufferPos = 0;
+    int lineNum = 0;
+    long correction = 0;
     
-    // Reset Progress
-    SendDlgItemMessage(hDlg, IDC_SEARCH_PROGRESS, PBM_SETRANGE32, 0, nLen);
-    SendDlgItemMessage(hDlg, IDC_SEARCH_PROGRESS, PBM_SETPOS, 0, 0);
-    ShowWindow(GetDlgItem(hDlg, IDC_SEARCH_PROGRESS), SW_SHOW);
-    
-    // Start Timer for background processing
-    SetTimer(hDlg, IDT_SEARCH_BG, 10, NULL);
-}
-
-void ProcessSearchChunk()
-{
-    if (!g_SearchState.bActive) return;
-    
-    std::basic_string<TCHAR> segment;
+    std::vector<TCHAR> lowerBuffer;
+    std::vector<SearchMatch> pendingMatches;
     
     #ifdef UNICODE
     std::wstring wQuery = g_SearchState.query;
@@ -2434,62 +2601,60 @@ void ProcessSearchChunk()
     std::string sQuery = g_SearchState.query;
     #endif
 
-    // Process a chunk (e.g. 100 lines or 5ms)
-    int linesProcessed = 0;
-    const int LINES_PER_CHUNK = 100;
-    
-    while(linesProcessed < LINES_PER_CHUNK && std::getline(g_SearchState.ss, segment))
+    DWORD lastReportTime = GetTickCount();
+
+    while(g_SearchState.bActive && bufferPos < maxLen)
     {
-        size_t lineLenInStream = segment.length() + 1; // +1 for \n
-        if (!segment.empty() && segment.back() == '\r') 
-        {
-            segment.pop_back();
-            lineLenInStream = segment.length() + 2;
-        }
-        else
-        {
-            lineLenInStream = segment.length() + 1;
+        size_t lineStart = bufferPos;
+        size_t lineEnd = lineStart;
+        
+        // Scan for newline (handle \r, \n, \r\n)
+        while(lineEnd < maxLen) {
+            if (pBuffer[lineEnd] == _T('\n')) break;
+            if (pBuffer[lineEnd] == _T('\r')) {
+                if (lineEnd + 1 < maxLen && pBuffer[lineEnd+1] == _T('\n')) {
+                    // Found \r\n, treat as end of line
+                }
+                break;
+            }
+            lineEnd++;
         }
         
-        if (g_SearchState.ss.eof())
-        {
-            lineLenInStream--; 
-        }
-
-        long internalOffset = g_SearchState.currentOffset - g_SearchState.lineNum;
-        BOOL bMatchFound = FALSE;
+        size_t contentLen = lineEnd - lineStart;
+        
+        std::basic_string_view<TCHAR> lineView(pBuffer + lineStart, contentLen);
+        long internalOffset = (long)lineStart; 
         
         if (g_SearchState.bRegex)
         {
             try {
                 #ifdef UNICODE
                 std::wregex re(wQuery, std::regex_constants::icase);
+                std::wcmatch m;
+                const wchar_t* searchStart = lineView.data();
+                const wchar_t* searchEnd = lineView.data() + lineView.length();
+                auto current = searchStart;
+                while (std::regex_search(current, searchEnd, m, re))
                 #else
                 std::regex re(sQuery, std::regex_constants::icase);
-                #endif
-                
-                #ifdef UNICODE
-                std::wsmatch m;
-                auto searchStart = segment.cbegin();
-                while (std::regex_search(searchStart, segment.cend(), m, re))
-                #else
-                std::smatch m;
-                auto searchStart = segment.cbegin();
-                while (std::regex_search(searchStart, segment.cend(), m, re))
+                std::cmatch m;
+                const char* searchStart = lineView.data();
+                const char* searchEnd = lineView.data() + lineView.length();
+                auto current = searchStart;
+                while (std::regex_search(current, searchEnd, m, re))
                 #endif
                 {
                     SearchMatch sm;
-                    sm.lineNum = g_SearchState.lineNum;
-                    sm.matchStart = (int)(m.position() + (searchStart - segment.cbegin()));
+                    sm.lineNum = lineNum;
+                    sm.matchStart = (int)(m.position() + (current - searchStart));
                     sm.matchLen = (int)m.length();
                     sm.score = 0;
-                    sm.absolutePos = internalOffset + sm.matchStart;
-                    sm.lineText = segment;
-                    g_SearchState.pMatches->push_back(sm);
-                    bMatchFound = TRUE;
+                    sm.absolutePos = (internalOffset + sm.matchStart) - correction;
+                    sm.lineText = std::basic_string<TCHAR>(lineView);
+                    pendingMatches.push_back(sm);
                     
-                    searchStart += m.position() + m.length();
-                    if (m.length() == 0) searchStart++;
+                    current += m.position() + m.length();
+                    if (m.length() == 0) current++;
                 }
             }
             catch (...) {}
@@ -2501,137 +2666,246 @@ void ProcessSearchChunk()
             std::string queryStr;
             
             #ifdef UNICODE
-            for(auto c : segment) lineStr += (char)c;
+            lineStr.reserve(lineView.length());
+            for(auto c : lineView) lineStr += (char)c;
             for(auto c : wQuery) queryStr += (char)c;
             #else
-            lineStr = segment;
+            lineStr = std::string(lineView);
             queryStr = sQuery;
             #endif
             
             if (FuzzyMatch(lineStr, queryStr, score))
             {
                 SearchMatch m;
-                m.lineNum = g_SearchState.lineNum;
+                m.lineNum = lineNum;
                 m.matchStart = -1; 
                 m.matchLen = 0;
                 m.score = score;
-                m.absolutePos = internalOffset; // Start of line
-                m.lineText = segment;
-                g_SearchState.pMatches->push_back(m);
-                bMatchFound = TRUE;
+                m.absolutePos = internalOffset - correction; 
+                m.lineText = std::basic_string<TCHAR>(lineView);
+                pendingMatches.push_back(m);
             }
         }
         else
         {
-            size_t pos = 0;
-            std::basic_string<TCHAR> textLower = ToLowerCase(segment);
-            std::basic_string<TCHAR> queryLower = ToLowerCase(g_SearchState.query);
+            // Normal search
+            size_t len = lineView.length();
+            if (lowerBuffer.size() < len + 1) {
+                lowerBuffer.resize(len + 256);
+            }
             
-            while ((pos = textLower.find(queryLower, pos)) != std::basic_string<TCHAR>::npos)
+            TCHAR* pLower = lowerBuffer.data();
+            if (len > 0) {
+                memcpy(pLower, lineView.data(), len * sizeof(TCHAR));
+            }
+            pLower[len] = 0;
+            
+            CharLowerBuff(pLower, (DWORD)len);
+            
+            std::basic_string_view<TCHAR> textLower(pLower, len);
+            const std::basic_string<TCHAR>& queryLower = g_SearchState.queryLower;
+            
+            size_t pos = 0;
+            while ((pos = textLower.find(queryLower, pos)) != std::basic_string_view<TCHAR>::npos)
             {
                 SearchMatch sm;
-                sm.lineNum = g_SearchState.lineNum;
+                sm.lineNum = lineNum;
                 sm.matchStart = (int)pos;
                 sm.matchLen = (int)queryLower.length();
                 sm.score = 0;
-                sm.absolutePos = internalOffset + sm.matchStart;
-                sm.lineText = segment;
-                g_SearchState.pMatches->push_back(sm);
-                bMatchFound = TRUE;
+                sm.absolutePos = (internalOffset + sm.matchStart) - correction;
+                sm.lineText = std::basic_string<TCHAR>(lineView);
+                pendingMatches.push_back(sm);
                 pos += queryLower.length();
             }
         }
         
-        g_SearchState.currentOffset += lineLenInStream;
-        g_SearchState.lineNum++;
-        linesProcessed++;
-    }
-    
-    // Update Progress
-    SendDlgItemMessage(g_SearchState.hDlg, IDC_SEARCH_PROGRESS, PBM_SETPOS, g_SearchState.currentOffset, 0);
-    
-    // Update List ONLY if we haven't filled the first page yet
-    static BOOL bFirstPageFilled = FALSE;
-    if (*g_SearchState.pCurrentPage == 1 && !bFirstPageFilled)
-    {
-        if (g_SearchState.pMatches->size() >= (size_t)g_SearchState.itemsPerPage)
-        {
-            UpdateSearchList(g_SearchState.hDlg, *g_SearchState.pMatches, *g_SearchState.pCurrentPage, g_SearchState.itemsPerPage);
-            bFirstPageFilled = TRUE;
-        }
-        else
-        {
-             // Still filling first page, update it so user sees something
-             UpdateSearchList(g_SearchState.hDlg, *g_SearchState.pMatches, *g_SearchState.pCurrentPage, g_SearchState.itemsPerPage);
-        }
-    }
-    
-    // Always update page info
-    int totalPages = (int)((g_SearchState.pMatches->size() + g_SearchState.itemsPerPage - 1) / g_SearchState.itemsPerPage);
-    if (totalPages < 1) totalPages = 1;
-    TCHAR pageInfo[64];
-    StringCchPrintf(pageInfo, 64, _T("Page %d of %d"), *g_SearchState.pCurrentPage, totalPages);
-    SetDlgItemText(g_SearchState.hDlg, IDC_PAGE_INFO, pageInfo);
-    EnableWindow(GetDlgItem(g_SearchState.hDlg, IDC_NEXT_PAGE), *g_SearchState.pCurrentPage < totalPages);
-
-    if (g_SearchState.ss.eof())
-    {
-        // Done
-        KillTimer(g_SearchState.hDlg, IDT_SEARCH_BG);
-        g_SearchState.bActive = FALSE;
-        bFirstPageFilled = FALSE; // Reset for next search
-        
-        if (g_SearchState.bFuzzy)
-        {
-            std::sort(g_SearchState.pMatches->begin(), g_SearchState.pMatches->end(), [](const SearchMatch& a, const SearchMatch& b) {
-                return a.score > b.score;
-            });
-            // Refresh list after sort
-            UpdateSearchList(g_SearchState.hDlg, *g_SearchState.pMatches, *g_SearchState.pCurrentPage, g_SearchState.itemsPerPage);
+        // Advance bufferPos and update correction
+        if (lineEnd < maxLen) {
+            if (pBuffer[lineEnd] == _T('\r')) {
+                if (lineEnd + 1 < maxLen && pBuffer[lineEnd+1] == _T('\n')) {
+                    bufferPos = lineEnd + 2;
+                    correction++; // Buffer has \r\n (2 chars), Internal has \r (1 char)
+                } else {
+                    bufferPos = lineEnd + 1;
+                }
+            } else if (pBuffer[lineEnd] == _T('\n')) {
+                bufferPos = lineEnd + 1;
+            } else {
+                // Should not happen given the loop above
+                bufferPos = lineEnd + 1;
+            }
+        } else {
+            bufferPos = maxLen;
         }
         
-        // Hide progress bar or show 100%
-        // ShowWindow(GetDlgItem(g_SearchState.hDlg, IDC_SEARCH_PROGRESS), SW_HIDE);
+        lineNum++;
+        
+        // Batch update
+        if (pendingMatches.size() >= 100 || (GetTickCount() - lastReportTime > 100 && !pendingMatches.empty()))
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_SearchMutex);
+                g_SearchState.pMatches->insert(g_SearchState.pMatches->end(), pendingMatches.begin(), pendingMatches.end());
+            }
+            pendingMatches.clear();
+            PostMessage(g_SearchState.hDlg, WM_SEARCH_UPDATE, (WPARAM)bufferPos, 0);
+            lastReportTime = GetTickCount();
+        }
+        else if (GetTickCount() - lastReportTime > 100)
+        {
+             // Report progress even if no matches
+             PostMessage(g_SearchState.hDlg, WM_SEARCH_UPDATE, (WPARAM)bufferPos, 0);
+             lastReportTime = GetTickCount();
+        }
     }
+    
+    // Final flush
+    if (!pendingMatches.empty())
+    {
+        std::lock_guard<std::mutex> lock(g_SearchMutex);
+        g_SearchState.pMatches->insert(g_SearchState.pMatches->end(), pendingMatches.begin(), pendingMatches.end());
+    }
+    
+    PostMessage(g_SearchState.hDlg, WM_SEARCH_COMPLETE, 0, 0);
 }
 
-void UpdateSearchList(HWND hDlg, const std::vector<SearchMatch>& matches, int page, int itemsPerPage)
+void StartSearch(HWND hDlg, std::vector<SearchMatch>& matches, int* pCurrentPage)
 {
-    SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_RESETCONTENT, 0, 0);
+    TCHAR szQuery[256];
+    GetDlgItemText(hDlg, IDC_SEARCH_TEXT, szQuery, 256);
     
-    if (matches.empty())
-    {
-        SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_ADDSTRING, 0, (LPARAM)_T("No matches found."));
-        SetDlgItemText(hDlg, IDC_PAGE_INFO, _T("Page 0 of 0"));
-        EnableWindow(GetDlgItem(hDlg, IDC_PREV_PAGE), FALSE);
-        EnableWindow(GetDlgItem(hDlg, IDC_NEXT_PAGE), FALSE);
-        return;
+    // Stop existing search
+    if (g_SearchState.bActive) {
+        g_SearchState.bActive = FALSE;
+        if (g_SearchState.workerThread.joinable()) {
+            g_SearchState.workerThread.join();
+        }
     }
-
-    int totalPages = (int)((matches.size() + itemsPerPage - 1) / itemsPerPage);
-    if (page < 1) page = 1;
-    if (page > totalPages) page = totalPages;
     
+    g_SearchState.bRegex = IsDlgButtonChecked(hDlg, IDC_SEARCH_REGEX);
+    g_SearchState.bFuzzy = IsDlgButtonChecked(hDlg, IDC_SEARCH_FUZZY);
+    g_SearchState.query = szQuery;
+    if (!g_SearchState.bRegex && !g_SearchState.bFuzzy) {
+        g_SearchState.queryLower = ToLowerCase(g_SearchState.query);
+    }
+    g_SearchState.pMatches = &matches;
+    g_SearchState.hDlg = hDlg;
+    g_SearchState.itemsPerPage = 100; 
+    g_SearchState.pCurrentPage = pCurrentPage;
+    g_SearchState.lastUpdateTime = GetTickCount();
+    g_SearchState.bFirstPageFilled = FALSE;
+    
+    int nLen = SendMessage(hEditor, WM_GETTEXTLENGTH, 0, 0);
+    g_SearchState.buffer.resize(nLen + 1);
+    SendMessage(hEditor, WM_GETTEXT, nLen + 1, (LPARAM)g_SearchState.buffer.data());
+    
+    matches.clear();
+    *pCurrentPage = 1;
+
+    g_SearchState.bActive = TRUE;
+    
+    // Reset Progress
+    SendDlgItemMessage(hDlg, IDC_SEARCH_PROGRESS, PBM_SETRANGE32, 0, nLen);
+    SendDlgItemMessage(hDlg, IDC_SEARCH_PROGRESS, PBM_SETPOS, 0, 0);
+    ShowWindow(GetDlgItem(hDlg, IDC_SEARCH_PROGRESS), SW_SHOW);
+    
+    // Start Thread
+    g_SearchState.workerThread = std::thread(SearchWorker);
+}
+
+
+
+void UpdateSearchList(HWND hDlg, const std::vector<SearchMatch>& matches, int page, int itemsPerPage, BOOL bAppendIfPossible)
+{
     int startIdx = (page - 1) * itemsPerPage;
     int endIdx = min((int)matches.size(), startIdx + itemsPerPage);
     
-    SendMessage(GetDlgItem(hDlg, IDC_SEARCH_LIST), WM_SETREDRAW, FALSE, 0);
-
-    for (int i = startIdx; i < endIdx; i++)
-    {
-        const auto& m = matches[i];
-        int line = m.lineNum;
-        
-        {
-            TCHAR buf[512];
-            StringCchPrintf(buf, 512, _T("%4d: %s"), line + 1, m.lineText.c_str());
-            int idx = SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_ADDSTRING, 0, (LPARAM)buf);
-            SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_SETITEMDATA, idx, line);
+    int currentCount = (int)SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETCOUNT, 0, 0);
+    
+    // Check if "No matches found" is displayed
+    BOOL bNoMatchesDisplayed = FALSE;
+    if (currentCount == 1) {
+        int len = (int)SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETTEXTLEN, 0, 0);
+        if (len > 0) {
+            std::vector<TCHAR> buf(len + 1);
+            SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETTEXT, 0, (LPARAM)buf.data());
+            if (_tcscmp(buf.data(), _T("No matches found.")) == 0) bNoMatchesDisplayed = TRUE;
         }
     }
 
-    SendMessage(GetDlgItem(hDlg, IDC_SEARCH_LIST), WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(GetDlgItem(hDlg, IDC_SEARCH_LIST), NULL, TRUE);
+    if (matches.empty())
+    {
+        if (!bNoMatchesDisplayed) {
+            SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_RESETCONTENT, 0, 0);
+            SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_ADDSTRING, 0, (LPARAM)_T("No matches found."));
+            SetDlgItemText(hDlg, IDC_PAGE_INFO, _T("Page 0 of 0"));
+            EnableWindow(GetDlgItem(hDlg, IDC_PREV_PAGE), FALSE);
+            EnableWindow(GetDlgItem(hDlg, IDC_NEXT_PAGE), FALSE);
+        }
+        return;
+    }
+
+    if (bNoMatchesDisplayed) {
+        SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_RESETCONTENT, 0, 0);
+        currentCount = 0;
+    }
+
+    BOOL bDoAppend = FALSE;
+    if (bAppendIfPossible && currentCount >= 0 && currentCount < (endIdx - startIdx))
+    {
+        // Verify we are on the right page (heuristic: if count > 0, first item should match)
+        if (currentCount > 0) {
+            int firstMatchIdx = (int)SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETITEMDATA, 0, 0);
+            if (firstMatchIdx == startIdx) {
+                bDoAppend = TRUE;
+            }
+        } else {
+            bDoAppend = TRUE;
+        }
+    }
+
+    if (bDoAppend)
+    {
+        SendMessage(GetDlgItem(hDlg, IDC_SEARCH_LIST), WM_SETREDRAW, FALSE, 0);
+        for (int i = startIdx + currentCount; i < endIdx; i++)
+        {
+            const auto& m = matches[i];
+            int line = m.lineNum;
+            int col = m.matchStart + 1;
+            TCHAR buf[512];
+            StringCchPrintf(buf, 512, _T("Ln %d, Col %d: %s"), line + 1, col, m.lineText.c_str());
+            int idx = SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_ADDSTRING, 0, (LPARAM)buf);
+            SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_SETITEMDATA, idx, (LPARAM)i);
+        }
+        SendMessage(GetDlgItem(hDlg, IDC_SEARCH_LIST), WM_SETREDRAW, TRUE, 0);
+    }
+    else
+    {
+        SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_RESETCONTENT, 0, 0);
+        SendMessage(GetDlgItem(hDlg, IDC_SEARCH_LIST), WM_SETREDRAW, FALSE, 0);
+
+        for (int i = startIdx; i < endIdx; i++)
+        {
+            const auto& m = matches[i];
+            int line = m.lineNum;
+            int col = m.matchStart + 1;
+            
+            {
+                TCHAR buf[512];
+                StringCchPrintf(buf, 512, _T("Ln %d, Col %d: %s"), line + 1, col, m.lineText.c_str());
+                int idx = SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_ADDSTRING, 0, (LPARAM)buf);
+                SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_SETITEMDATA, idx, (LPARAM)i);
+            }
+        }
+
+        SendMessage(GetDlgItem(hDlg, IDC_SEARCH_LIST), WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(GetDlgItem(hDlg, IDC_SEARCH_LIST), NULL, TRUE);
+    }
+    
+    int totalPages = (int)((matches.size() + itemsPerPage - 1) / itemsPerPage);
+    if (page < 1) page = 1;
+    if (page > totalPages) page = totalPages;
     
     TCHAR pageInfo[64];
     StringCchPrintf(pageInfo, 64, _T("Page %d of %d"), page, totalPages);
@@ -2731,16 +3005,74 @@ INT_PTR CALLBACK AdvancedSearchDlgProc(HWND hDlg, UINT message, WPARAM wParam, L
         
         return (INT_PTR)TRUE;
     }
-    case WM_TIMER:
-        if (wParam == IDT_SEARCH_BG)
+    case WM_SEARCH_UPDATE:
+    {
+        size_t bufferPos = (size_t)wParam;
+        SendDlgItemMessage(hDlg, IDC_SEARCH_PROGRESS, PBM_SETPOS, bufferPos, 0);
+        
+        // Update list if needed
+        if (currentPage == 1 && !g_SearchState.bFirstPageFilled)
         {
-            ProcessSearchChunk();
+            std::lock_guard<std::mutex> lock(g_SearchMutex);
+            if (matches.size() >= (size_t)itemsPerPage)
+            {
+                UpdateSearchList(hDlg, matches, currentPage, itemsPerPage, TRUE);
+                g_SearchState.bFirstPageFilled = TRUE;
+            }
+            else if (GetTickCount() - g_SearchState.lastUpdateTime > 200)
+            {
+                UpdateSearchList(hDlg, matches, currentPage, itemsPerPage, TRUE);
+                g_SearchState.lastUpdateTime = GetTickCount();
+            }
         }
-        break;
+        
+        // Update page info
+        static DWORD lastPageInfoUpdate = 0;
+        if (GetTickCount() - lastPageInfoUpdate > 200) {
+            std::lock_guard<std::mutex> lock(g_SearchMutex);
+            int totalPages = (int)((matches.size() + itemsPerPage - 1) / itemsPerPage);
+            if (totalPages < 1) totalPages = 1;
+            TCHAR pageInfo[64];
+            StringCchPrintf(pageInfo, 64, _T("Page %d of %d"), currentPage, totalPages);
+            SetDlgItemText(hDlg, IDC_PAGE_INFO, pageInfo);
+            EnableWindow(GetDlgItem(hDlg, IDC_NEXT_PAGE), currentPage < totalPages);
+            lastPageInfoUpdate = GetTickCount();
+        }
+        return (INT_PTR)TRUE;
+    }
+    case WM_SEARCH_COMPLETE:
+    {
+        if (g_SearchState.workerThread.joinable()) {
+            g_SearchState.workerThread.join();
+        }
+        g_SearchState.bActive = FALSE;
+        
+        if (g_SearchState.bFuzzy)
+        {
+            std::sort(matches.begin(), matches.end(), [](const SearchMatch& a, const SearchMatch& b) {
+                return a.score > b.score;
+            });
+            UpdateSearchList(hDlg, matches, currentPage, itemsPerPage);
+        }
+        else
+        {
+            UpdateSearchList(hDlg, matches, currentPage, itemsPerPage, TRUE);
+        }
+        
+        int totalPages = (int)((matches.size() + itemsPerPage - 1) / itemsPerPage);
+        if (totalPages < 1) totalPages = 1;
+        TCHAR pageInfo[64];
+        StringCchPrintf(pageInfo, 64, _T("Page %d of %d"), currentPage, totalPages);
+        SetDlgItemText(hDlg, IDC_PAGE_INFO, pageInfo);
+        EnableWindow(GetDlgItem(hDlg, IDC_NEXT_PAGE), currentPage < totalPages);
+        return (INT_PTR)TRUE;
+    }
     case WM_DESTROY:
         if (g_SearchState.bActive) {
-            KillTimer(hDlg, IDT_SEARCH_BG);
             g_SearchState.bActive = FALSE;
+            if (g_SearchState.workerThread.joinable()) {
+                g_SearchState.workerThread.join();
+            }
         }
         if (hDialogListFont) DeleteObject(hDialogListFont);
         matches.clear();
@@ -2773,8 +3105,8 @@ INT_PTR CALLBACK AdvancedSearchDlgProc(HWND hDlg, UINT message, WPARAM wParam, L
             int idx = SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETCURSEL, 0, 0);
             if (idx != LB_ERR)
             {
-                int line = SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETITEMDATA, idx, 0);
-                if (line != -1)
+                int matchIdx = (int)SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETITEMDATA, idx, 0);
+                if (matchIdx >= 0 && matchIdx < (int)matches.size())
                 {
                     // Check if fuzzy
                     BOOL bFuzzy = IsDlgButtonChecked(hDlg, IDC_SEARCH_FUZZY);
@@ -2783,24 +3115,19 @@ INT_PTR CALLBACK AdvancedSearchDlgProc(HWND hDlg, UINT message, WPARAM wParam, L
                         return TRUE;
                     }
 
-                    for (const auto& m : matches)
+                    const auto& m = matches[matchIdx];
+                    
+                    // Found match
+                    TCHAR szReplace[256];
+                    GetDlgItemText(hDlg, IDC_REPLACE_TEXT, szReplace, 256);
+                    
+                    if (m.matchStart != -1)
                     {
-                        if (m.lineNum == line)
-                        {
-                            // Found match
-                            TCHAR szReplace[256];
-                            GetDlgItemText(hDlg, IDC_REPLACE_TEXT, szReplace, 256);
-                            
-                            if (m.matchStart != -1)
-                            {
-                                SendMessage(hEditor, EM_SETSEL, m.absolutePos, m.absolutePos + m.matchLen);
-                                SendMessage(hEditor, EM_REPLACESEL, TRUE, (LPARAM)szReplace);
-                                
-                                // Refresh search
-                                StartSearch(hDlg, matches, &currentPage);
-                            }
-                            break;
-                        }
+                        SendMessage(hEditor, EM_SETSEL, m.absolutePos, m.absolutePos + m.matchLen);
+                        SendMessage(hEditor, EM_REPLACESEL, TRUE, (LPARAM)szReplace);
+                        
+                        // Refresh search
+                        StartSearch(hDlg, matches, &currentPage);
                     }
                 }
             }
@@ -2862,36 +3189,24 @@ INT_PTR CALLBACK AdvancedSearchDlgProc(HWND hDlg, UINT message, WPARAM wParam, L
                 int idx = SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETCURSEL, 0, 0);
                 if (idx != LB_ERR)
                 {
-                    int line = SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETITEMDATA, idx, 0);
-                    if (line != -1)
+                    int matchIdx = (int)SendDlgItemMessage(hDlg, IDC_SEARCH_LIST, LB_GETITEMDATA, idx, 0);
+                    if (matchIdx >= 0 && matchIdx < (int)matches.size())
                     {
-                        int selStart = -1;
-                        int selEnd = -1;
-                        BOOL bFound = FALSE;
-
-                        // Find match info
-                        for(const auto& m : matches) {
-                            if (m.lineNum == line) {
-                                selStart = m.absolutePos;
-                                selEnd = selStart + m.matchLen;
-                                bFound = TRUE;
-                                break;
-                            }
-                        }
+                        const auto& m = matches[matchIdx];
                         
-                        if (bFound)
+                        if (m.matchStart != -1)
                         {
                             // Scroll to start
-                            SendMessage(hEditor, EM_SETSEL, selStart, selStart);
+                            SendMessage(hEditor, EM_SETSEL, m.absolutePos, m.absolutePos);
                             SendMessage(hEditor, EM_SCROLLCARET, 0, 0);
                             
-                            // Select full
-                            SendMessage(hEditor, EM_SETSEL, selStart, selEnd);
-                            SendMessage(hEditor, EM_SCROLLCARET, 0, 0);
+                            // Select full match
+                            SendMessage(hEditor, EM_SETSEL, m.absolutePos, m.absolutePos + m.matchLen);
                         }
                         else
                         {
-                            int nIndex = SendMessage(hEditor, EM_LINEINDEX, line, 0);
+                            // Fallback for fuzzy or line-only matches if any
+                            int nIndex = SendMessage(hEditor, EM_LINEINDEX, m.lineNum, 0);
                             if (nIndex != -1)
                             {
                                 long nLineLen = SendMessage(hEditor, EM_LINELENGTH, nIndex, 0);
@@ -3128,6 +3443,58 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SetTimer(hwnd, 1, 2000, NULL);
     }
     break;
+    case WM_LOAD_PROGRESS:
+        SendMessage(hProgressBarStatus, PBM_SETPOS, wParam, 0);
+        return 0;
+    case WM_LOAD_COMPLETE:
+    {
+        LoadResult* res = (LoadResult*)lParam;
+        if (res && res->bSuccess)
+        {
+            struct MemStreamContext {
+                LoadResult* res;
+                size_t offset;
+            } ctx;
+            ctx.res = res;
+            ctx.offset = 0;
+            
+            EDITSTREAM es = {0};
+            es.dwCookie = (DWORD_PTR)&ctx;
+            es.pfnCallback = [](DWORD_PTR dwCookie, LPBYTE pbBuff, LONG cb, LONG *pcb) -> DWORD {
+                MemStreamContext* c = (MemStreamContext*)dwCookie;
+                size_t remaining = c->res->buffer.size() * sizeof(wchar_t) - c->offset;
+                if (remaining == 0) {
+                    *pcb = 0;
+                    return 0;
+                }
+                
+                LONG toCopy = min(cb, (LONG)remaining);
+                memcpy(pbBuff, (BYTE*)c->res->buffer.data() + c->offset, toCopy);
+                c->offset += toCopy;
+                *pcb = toCopy;
+                return 0;
+            };
+            
+            SendMessage(g_Document.hEditor, WM_SETREDRAW, FALSE, 0);
+            
+            // Replace all content
+            SendMessage(g_Document.hEditor, EM_SETSEL, 0, -1);
+            SendMessage(g_Document.hEditor, EM_STREAMIN, SF_TEXT | SF_UNICODE, (LPARAM)&es);
+            
+            SendMessage(g_Document.hEditor, WM_SETREDRAW, TRUE, 0);
+            InvalidateRect(g_Document.hEditor, NULL, TRUE);
+            
+            DWORD dwAttrs = GetFileAttributes(g_Document.szFileName);
+            BOOL bReadOnly = (dwAttrs != INVALID_FILE_ATTRIBUTES) && (dwAttrs & FILE_ATTRIBUTE_READONLY);
+            SendMessage(g_Document.hEditor, EM_SETREADONLY, bReadOnly, 0);
+            
+            ShowWindow(hProgressBarStatus, SW_HIDE);
+            g_Document.bLoading = FALSE;
+        }
+        
+        if (res) delete res;
+        return 0;
+    }
     case WM_TIMER:
         if (wParam == 1)
         {
