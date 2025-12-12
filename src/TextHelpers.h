@@ -14,10 +14,6 @@ std::basic_string<TCHAR> ToLowerCase(const std::basic_string<TCHAR>& input);
 std::basic_string<TCHAR> ToCapitalize(const std::basic_string<TCHAR>& input);
 std::basic_string<TCHAR> ToSentenceCase(const std::basic_string<TCHAR>& input);
 
-// Hex helper
-void FormatHexLine(DWORD offset, const BYTE* data, DWORD len, std::string& out);
-bool ParseHexLine(const std::string& line, std::vector<BYTE>& bytes);
-
 // Navigation helpers
 int CalculateNextSubword(const TCHAR* text, int length);
 int CalculatePrevSubword(const TCHAR* text, int length);

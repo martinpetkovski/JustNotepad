@@ -21,6 +21,26 @@ HINSTANCE g_hInst = NULL;
 HWND g_hMain = NULL;
 HWND g_hEditor = NULL;
 
+// Settings
+BOOL g_bRegex = FALSE;
+BOOL g_bFuzzy = FALSE;
+std::wstring g_SettingsPath;
+
+extern "C" {
+    PLUGIN_API void Initialize(const wchar_t* settingsPath) {
+        g_SettingsPath = settingsPath;
+        g_bRegex = GetPrivateProfileInt(L"Settings", L"Regex", 0, g_SettingsPath.c_str());
+        g_bFuzzy = GetPrivateProfileInt(L"Settings", L"Fuzzy", 0, g_SettingsPath.c_str());
+    }
+
+    PLUGIN_API void Shutdown() {
+        if (!g_SettingsPath.empty()) {
+            WritePrivateProfileString(L"Settings", L"Regex", g_bRegex ? L"1" : L"0", g_SettingsPath.c_str());
+            WritePrivateProfileString(L"Settings", L"Fuzzy", g_bFuzzy ? L"1" : L"0", g_SettingsPath.c_str());
+        }
+    }
+}
+
 #define WM_SEARCH_UPDATE (WM_USER + 100)
 #define WM_SEARCH_COMPLETE (WM_USER + 101)
 
@@ -433,6 +453,9 @@ INT_PTR CALLBACK AdvancedSearchDlgProc(HWND hDlg, UINT message, WPARAM wParam, L
         
         SetWindowPos(hDlg, NULL, x, y, width, height, SWP_NOZORDER);
         
+        CheckDlgButton(hDlg, IDC_SEARCH_REGEX, g_bRegex ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_SEARCH_FUZZY, g_bFuzzy ? BST_CHECKED : BST_UNCHECKED);
+
         return (INT_PTR)TRUE;
     }
     case WM_SIZE:
@@ -573,6 +596,13 @@ INT_PTR CALLBACK AdvancedSearchDlgProc(HWND hDlg, UINT message, WPARAM wParam, L
         return (INT_PTR)TRUE;
 
     case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_SEARCH_REGEX) {
+            g_bRegex = IsDlgButtonChecked(hDlg, IDC_SEARCH_REGEX);
+        }
+        else if (LOWORD(wParam) == IDC_SEARCH_FUZZY) {
+            g_bFuzzy = IsDlgButtonChecked(hDlg, IDC_SEARCH_FUZZY);
+        }
+        
         if (LOWORD(wParam) == IDC_SEARCH_BTN)
         {
             HWND hFocus = GetFocus();
@@ -756,7 +786,7 @@ void ShowAdvancedSearch(HWND hEditor) {
 }
 
 PluginMenuItem g_MenuItems[] = {
-    { _T("Advanced Search..."), ShowAdvancedSearch }
+    { _T("Advanced Search..."), ShowAdvancedSearch, _T("Ctrl+Shift+F") }
 };
 
 extern "C" {

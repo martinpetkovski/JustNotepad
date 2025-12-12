@@ -1,0 +1,7 @@
+LIBRARY JsonViewerPlugin
+EXPORTS
+    GetPluginName
+    GetPluginDescription
+    GetPluginVersion
+    GetPluginStatus
+    GetPluginMenuItems

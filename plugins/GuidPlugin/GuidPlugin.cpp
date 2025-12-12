@@ -55,7 +55,7 @@ extern "C" {
     void InsertGuidClean(HWND h) { InsertGuid(h, false, false); }
 
     PluginMenuItem g_Items[] = {
-        { L"Insert GUID", InsertGuidDefault },
+        { L"Insert GUID", InsertGuidDefault, L"Ctrl+Shift+Alt+G" },
         { L"Insert GUID (No Braces)", InsertGuidNoBraces },
         { L"Insert GUID (Clean)", InsertGuidClean }
     };

@@ -121,7 +121,6 @@ struct Document {
     TCHAR szFileName[MAX_PATH];
     BOOL bIsDirty;
     BOOL bLoading;
-    BOOL bHexMode;
     BOOL bPinned;
     FILETIME ftLastWriteTime;
     Encoding currentEncoding;
@@ -160,7 +159,6 @@ struct BackgroundLoadState {
     LPBYTE pData;
     DWORD dwTotalSize;
     DWORD dwCurrentPos;
-    BOOL bHex;
     Encoding encoding;
     std::vector<char> inBuffer;
     DWORD dwOffset;
@@ -233,7 +231,6 @@ public:
 
 struct StreamContext {
     HANDLE hFile;
-    BOOL bHex;
     std::vector<char> inBuffer;
     size_t inBufferPos;
     DWORD dwOffset;
@@ -340,72 +337,7 @@ void ParallelConvert(const BYTE* pData, size_t size, Encoding encoding, std::vec
     outBuffer.push_back(0);
 }
 
-void ParallelHexConvert(const BYTE* pData, size_t size, std::vector<wchar_t>& outBuffer, HWND hMain)
-{
-    int numThreads = std::thread::hardware_concurrency();
-    if (numThreads == 0) numThreads = 2;
-    if (size < 64 * 1024) numThreads = 1;
-
-    size_t totalLines = (size + 15) / 16;
-    size_t linesPerThread = (totalLines + numThreads - 1) / numThreads;
-    
-    std::vector<std::thread> threads;
-    std::vector<std::vector<wchar_t>> chunks(numThreads);
-    std::atomic<size_t> processedBytes(0);
-    
-    for(int i=0; i<numThreads; i++)
-    {
-        size_t startLine = i * linesPerThread;
-        size_t endLine = min((i + 1) * linesPerThread, totalLines);
-        
-        if (startLine >= endLine) continue;
-
-        threads.emplace_back([=, &chunks, &pData, &processedBytes]() {
-            size_t startByte = startLine * 16;
-            size_t endByte = min(endLine * 16, size);
-            
-            std::string lineBuf;
-            lineBuf.reserve(4096); 
-            
-            size_t current = startByte;
-            size_t step = 16 * 1024; 
-            
-            while(current < endByte)
-            {
-                size_t blockEnd = min(current + step, endByte);
-                
-                for (size_t pos = current; pos < blockEnd; pos += 16)
-                {
-                    DWORD chunkLen = min(16, (DWORD)(size - pos));
-                    FormatHexLine((DWORD)pos, pData + pos, chunkLen, lineBuf);
-                }
-                
-                size_t oldSize = chunks[i].size();
-                chunks[i].resize(oldSize + lineBuf.size());
-                for(size_t k=0; k<lineBuf.size(); k++) {
-                    chunks[i][oldSize + k] = (wchar_t)lineBuf[k];
-                }
-                lineBuf.clear();
-                
-                processedBytes += (blockEnd - current);
-                PostMessage(hMain, WM_LOAD_PROGRESS, (WPARAM)processedBytes.load(), 0);
-                
-                current = blockEnd;
-            }
-        });
-    }
-    
-    for(auto& t : threads) if(t.joinable()) t.join();
-    
-    size_t total = 0;
-    for(const auto& c : chunks) total += c.size();
-    outBuffer.reserve(total + 1);
-    
-    for(const auto& c : chunks) outBuffer.insert(outBuffer.end(), c.begin(), c.end());
-    outBuffer.push_back(0);
-}
-
-void LoadWorker(std::wstring filename, Encoding encoding, BOOL bHex, HWND hMain)
+void LoadWorker(std::wstring filename, Encoding encoding, HWND hMain)
 {
     HANDLE hFile = CreateFile(filename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return;
@@ -421,9 +353,7 @@ void LoadWorker(std::wstring filename, Encoding encoding, BOOL bHex, HWND hMain)
     res->encoding = encoding;
     res->bSuccess = TRUE;
     
-    if (bHex) {
-        ParallelHexConvert(pData, size, res->buffer, hMain);
-    } else if (encoding == ENC_UTF16LE) {
+    if (encoding == ENC_UTF16LE) {
         size_t chars = size / 2;
         res->buffer.resize(chars + 1);
         
@@ -502,117 +432,23 @@ DWORD CALLBACK StreamInCallback(DWORD_PTR dwCookie, LPBYTE pbBuff, LONG cb, LONG
 
     if (ctx->pData) // Memory mapped
     {
-        if (ctx->bHex)
-        {
-            LONG bytesCopied = 0;
-            while (bytesCopied < cb)
-            {
-                if (ctx->inBufferPos >= ctx->inBuffer.size())
-                {
-                    ctx->inBuffer.clear();
-                    ctx->inBufferPos = 0;
+        if (ctx->dwMapPos >= ctx->dwTotalSize) return 0; // EOF
 
-                    if (ctx->dwMapPos >= ctx->dwTotalSize) break; // EOF
+        LONG toCopy = min(cb, (LONG)(ctx->dwTotalSize - ctx->dwMapPos));
+        memcpy(pbBuff, ctx->pData + ctx->dwMapPos, toCopy);
+        ctx->dwMapPos += toCopy;
+        *pcb = toCopy;
 
-                    DWORD bytesToProcess = min(4096, ctx->dwTotalSize - ctx->dwMapPos);
-                    std::string batchOutput;
-                    batchOutput.reserve(bytesToProcess * 5);
-
-                    DWORD processed = 0;
-                    while (processed < bytesToProcess)
-                    {
-                        DWORD chunk = min(16, bytesToProcess - processed);
-                        BYTE* buf = ctx->pData + ctx->dwMapPos + processed;
-                        
-                        FormatHexLine(ctx->dwOffset, buf, chunk, batchOutput);
-                        
-                        ctx->dwOffset += chunk;
-                        processed += chunk;
-                    }
-                    
-                    ctx->dwMapPos += processed;
-                    UpdateStreamProgress(ctx, processed);
-                    
-                    ctx->inBuffer.insert(ctx->inBuffer.end(), batchOutput.begin(), batchOutput.end());
-                }
-                
-                size_t available = ctx->inBuffer.size() - ctx->inBufferPos;
-                LONG toCopy = min((LONG)available, cb - bytesCopied);
-                memcpy(pbBuff + bytesCopied, ctx->inBuffer.data() + ctx->inBufferPos, toCopy);
-                
-                ctx->inBufferPos += toCopy;
-                bytesCopied += toCopy;
-            }
-            *pcb = bytesCopied;
-            return 0;
-        }
-        else
-        {
-            if (ctx->dwMapPos >= ctx->dwTotalSize) return 0; // EOF
-
-            LONG toCopy = min(cb, (LONG)(ctx->dwTotalSize - ctx->dwMapPos));
-            memcpy(pbBuff, ctx->pData + ctx->dwMapPos, toCopy);
-            ctx->dwMapPos += toCopy;
-            *pcb = toCopy;
-
-            UpdateStreamProgress(ctx, toCopy);
-            return 0;
-        }
-    }
-
-    if (!ctx->bHex)
-    {
-        if (ReadFile(ctx->hFile, pbBuff, cb, (LPDWORD)pcb, NULL))
-        {
-            UpdateStreamProgress(ctx, *pcb);
-            return 0;
-        }
-        return 1; // Error
-    }
-    else
-    {
-        LONG bytesCopied = 0;
-        while (bytesCopied < cb)
-        {
-            if (ctx->inBufferPos >= ctx->inBuffer.size())
-            {
-                ctx->inBuffer.clear();
-                ctx->inBufferPos = 0;
-
-                BYTE buf[4096];
-                DWORD bytesRead = 0;
-                if (!ReadFile(ctx->hFile, buf, 4096, &bytesRead, NULL) || bytesRead == 0)
-                {
-                    break; // EOF or Error
-                }
-                
-                UpdateStreamProgress(ctx, bytesRead);
-
-                std::string batchOutput;
-                batchOutput.reserve(bytesRead * 5);
-
-                DWORD processed = 0;
-                while (processed < bytesRead)
-                {
-                    DWORD chunk = min(16, bytesRead - processed);
-                    FormatHexLine(ctx->dwOffset, buf + processed, chunk, batchOutput);
-                    ctx->dwOffset += chunk;
-                    processed += chunk;
-                }
-                
-                ctx->inBuffer.insert(ctx->inBuffer.end(), batchOutput.begin(), batchOutput.end());
-            }
-            
-            size_t available = ctx->inBuffer.size() - ctx->inBufferPos;
-            LONG toCopy = min((LONG)available, cb - bytesCopied);
-            memcpy(pbBuff + bytesCopied, ctx->inBuffer.data() + ctx->inBufferPos, toCopy);
-            
-            ctx->inBufferPos += toCopy;
-            bytesCopied += toCopy;
-        }
-        *pcb = bytesCopied;
+        UpdateStreamProgress(ctx, toCopy);
         return 0;
     }
+
+    if (ReadFile(ctx->hFile, pbBuff, cb, (LPDWORD)pcb, NULL))
+    {
+        UpdateStreamProgress(ctx, *pcb);
+        return 0;
+    }
+    return 1; // Error
 }
 
 // Stream callback for writing file
@@ -621,38 +457,11 @@ DWORD CALLBACK StreamOutCallback(DWORD_PTR dwCookie, LPBYTE pbBuff, LONG cb, LON
     StreamContext* ctx = (StreamContext*)dwCookie;
     *pcb = cb; // Assume success for now
 
-    if (!ctx->bHex)
+    if (WriteFile(ctx->hFile, pbBuff, cb, (LPDWORD)pcb, NULL))
     {
-        if (WriteFile(ctx->hFile, pbBuff, cb, (LPDWORD)pcb, NULL))
-        {
-            return 0;
-        }
-        return 1; // Error
-    }
-    else
-    {
-        ctx->outBuffer.append((char*)pbBuff, cb);
-        
-        size_t pos = 0;
-        size_t nextPos;
-        while ((nextPos = ctx->outBuffer.find('\n', pos)) != std::string::npos)
-        {
-            std::string line = ctx->outBuffer.substr(pos, nextPos - pos + 1);
-            pos = nextPos + 1;
-            
-            // Parse line
-            // Format: XXXXXXXX  HH HH ...
-            std::vector<BYTE> bytes;
-            if (ParseHexLine(line, bytes))
-            {
-                DWORD written;
-                WriteFile(ctx->hFile, bytes.data(), (DWORD)bytes.size(), &written, NULL);
-            }
-        }
-        
-        ctx->outBuffer.erase(0, pos);
         return 0;
     }
+    return 1; // Error
 }
 
 BOOL DoFileSave();
@@ -823,8 +632,6 @@ BOOL LoadFromFile(LPCTSTR pszFile)
             SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
         }
         
-        doc.bHexMode = isBinary;
-        
         // Background Loading for Large Files (> 10MB)
         BOOL bBackgroundLoad = (fileSize > 10 * 1024 * 1024);
         
@@ -832,7 +639,6 @@ BOOL LoadFromFile(LPCTSTR pszFile)
 
         StreamContext ctx = {0};
         ctx.hFile = hFile;
-        ctx.bHex = doc.bHexMode;
         ctx.dwOffset = 0;
         ctx.pProgress = bBackgroundLoad ? NULL : &progress; // Don't use modal progress for bg load
         ctx.dwTotalSize = bBackgroundLoad ? min(64 * 1024, fileSize) : fileSize; // Load first 64KB
@@ -875,9 +681,8 @@ BOOL LoadFromFile(LPCTSTR pszFile)
             // Start Worker Thread
             std::wstring filename = pszFile;
             Encoding enc = doc.currentEncoding;
-            BOOL bHex = doc.bHexMode;
-            std::thread([filename, enc, bHex](){
-                LoadWorker(filename, enc, bHex, hMain);
+            std::thread([filename, enc](){
+                LoadWorker(filename, enc, hMain);
             }).detach();
             
             // Set ReadOnly while loading
@@ -908,6 +713,10 @@ BOOL LoadFromFile(LPCTSTR pszFile)
 
         UpdateTitle();
         UpdateStatusBar();
+        
+        // Notify plugins
+        g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Loaded");
+        
         return TRUE;
     }
     return FALSE;
@@ -978,6 +787,16 @@ BOOL DoFileSaveAs()
 
     if (GetSaveFileName(&ofn))
     {
+        // Check if plugin handles save
+        if (g_PluginManager.NotifySaveFile(ofn.lpstrFile, doc.hEditor))
+        {
+            StringCchCopy(doc.szFileName, MAX_PATH, ofn.lpstrFile);
+            doc.bIsDirty = FALSE;
+            UpdateTitle();
+            g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Saved");
+            return TRUE;
+        }
+
         HANDLE hFile = CreateFile(ofn.lpstrFile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile != INVALID_HANDLE_VALUE)
         {
@@ -1001,7 +820,6 @@ BOOL DoFileSaveAs()
 
             StreamContext ctx = {0};
             ctx.hFile = hFile;
-            ctx.bHex = doc.bHexMode;
             
             EDITSTREAM es = {0};
             es.dwCookie = (DWORD_PTR)&ctx;
@@ -1027,6 +845,10 @@ BOOL DoFileSaveAs()
             doc.bIsDirty = FALSE;
             UpdateTitle();
             AddRecentFile(doc.szFileName);
+            
+            // Notify plugins
+            g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Saved");
+            
             return TRUE;
         }
     }
@@ -1039,6 +861,15 @@ BOOL DoFileSave()
 
     if (doc.szFileName[0])
     {
+        // Check if plugin handles save
+        if (g_PluginManager.NotifySaveFile(doc.szFileName, doc.hEditor))
+        {
+            doc.bIsDirty = FALSE;
+            UpdateTitle();
+            g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Saved");
+            return TRUE;
+        }
+
         HANDLE hFile = CreateFile(doc.szFileName, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile != INVALID_HANDLE_VALUE)
         {
@@ -1062,7 +893,6 @@ BOOL DoFileSave()
 
             StreamContext ctx = {0};
             ctx.hFile = hFile;
-            ctx.bHex = doc.bHexMode;
             
             EDITSTREAM es = {0};
             es.dwCookie = (DWORD_PTR)&ctx;
@@ -1086,6 +916,10 @@ BOOL DoFileSave()
             GetFileLastWriteTime(doc.szFileName, &doc.ftLastWriteTime);
             doc.bIsDirty = FALSE;
             UpdateTitle();
+            
+            // Notify plugins
+            g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Saved");
+            
             return TRUE;
         }
         return FALSE;
@@ -1353,8 +1187,19 @@ INT_PTR CALLBACK ManagePluginsDlgProc(HWND hDlg, UINT message, WPARAM wParam, LP
             UpdateManagePluginsList(hDlg);
         }
         else if (LOWORD(wParam) == IDOK) {
+            bool bChanged = false;
+            const auto& plugins = g_PluginManager.GetPlugins();
+
             // Apply pending changes
             for (const auto& pair : g_PendingPluginStates) {
+                for (const auto& plugin : plugins) {
+                    if (plugin.filename == pair.first) {
+                        if (plugin.enabled != pair.second) {
+                            bChanged = true;
+                        }
+                        break;
+                    }
+                }
                 g_PluginManager.SetPluginEnabled(pair.first, pair.second);
             }
             
@@ -1366,6 +1211,11 @@ INT_PTR CALLBACK ManagePluginsDlgProc(HWND hDlg, UINT message, WPARAM wParam, LP
             g_PluginManager.SaveSettings(szPath);
             
             EndDialog(hDlg, IDOK);
+
+            if (bChanged) {
+                DoReload();
+            }
+
             return (INT_PTR)TRUE;
         }
         else if (LOWORD(wParam) == IDCANCEL) {
@@ -1628,6 +1478,20 @@ LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             }
         }
     }
+    else if (msg == WM_MOUSEWHEEL)
+    {
+        // Force snappy scrolling (3 lines per notch, no smooth animation)
+        short zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+        int lines = 3;
+        SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+        if (lines == WHEEL_PAGESCROLL) lines = 3; // Fallback
+        
+        int scrollLines = (zDelta / WHEEL_DELTA) * lines;
+        
+        // Use EM_LINESCROLL for snappy scrolling
+        SendMessage(hwnd, EM_LINESCROLL, 0, -scrollLines);
+        return 0; // Handled
+    }
     return CallWindowProc(wpOrigEditProc, hwnd, msg, wParam, lParam);
 }
 
@@ -1643,10 +1507,34 @@ void CreateNewDocument(LPCTSTR pszFile)
         int nStatusHeight = rcStatus.bottom - rcStatus.top;
         
         g_Document.hEditor = CreateWindowEx(0, MSFTEDIT_CLASS, _T(""),
-                                     WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL,
+                                     WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL | ES_DISABLENOSCROLL,
                                      0, 0, rcClient.right, rcClient.bottom - nStatusHeight,
                                      hMain, (HMENU)IDC_EDITOR, hInst, NULL);
         hEditor = g_Document.hEditor;
+
+        // Disable smooth scrolling
+        SendMessage(g_Document.hEditor, EM_SETOPTIONS, ECOOP_OR, ECO_AUTOVSCROLL);
+        // Actually, smooth scrolling is often a system setting or mouse driver feature.
+        // But for RichEdit, we can try to ensure it scrolls by lines.
+        // There isn't a direct "Disable Smooth Scroll" message for RichEdit 4.1 (MSFTEDIT_CLASS).
+        // However, removing WS_EX_COMPOSITED might help if it was there (it's not).
+        // Some sources suggest handling WM_MOUSEWHEEL manually, but that's complex.
+        // Let's try setting the scroll speed or similar if possible.
+        // Wait, the user said "scrolling should be very snappy".
+        // Maybe they mean the "smooth scroll" animation that some modern apps do?
+        // RichEdit usually doesn't do smooth animation unless configured.
+        // But let's check if we can force it.
+        
+        // One trick is to handle WM_MOUSEWHEEL and do line scrolling manually.
+        // But let's first check if there is a simpler way.
+        // SystemParametersInfo(SPI_GETWHEELSCROLLLINES, ...)
+        
+        // If the user means the "smooth scrolling" where the content glides, that's usually not default in standard Win32 RichEdit.
+        // Unless they are on a trackpad.
+        
+        // However, if they mean "ES_AUTOVSCROLL" causes it to scroll when typing? No.
+        
+        // Let's try to handle WM_MOUSEWHEEL in EditorWndProc to force line jumps.
         
         SendMessage(g_Document.hEditor, EM_EXLIMITTEXT, 0, -1);
         SendMessage(g_Document.hEditor, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE);
@@ -1664,6 +1552,8 @@ void CreateNewDocument(LPCTSTR pszFile)
 
         // Enable Drag & Drop for Editor
         DragAcceptFiles(g_Document.hEditor, TRUE);
+        
+        ApplyTheme();
     }
     else
     {
@@ -1672,7 +1562,6 @@ void CreateNewDocument(LPCTSTR pszFile)
 
     g_Document.bIsDirty = FALSE;
     g_Document.bLoading = FALSE;
-    g_Document.bHexMode = FALSE;
     g_Document.bPinned = FALSE;
     g_Document.currentEncoding = ENC_UTF8;
     g_Document.szFileName[0] = 0;
@@ -1723,7 +1612,7 @@ void UpdatePluginsMenu(HWND hwnd) {
     
     // Add Manage Plugins item first
     AppendMenu(hPluginsMenu, MF_STRING, ID_MANAGE_PLUGINS, _T("Manage Plugins..."));
-    AppendMenu(hPluginsMenu, MF_STRING, ID_PLUGIN_SEARCH, _T("Plugin Commands...\tCtrl+Shift+P"));
+    AppendMenu(hPluginsMenu, MF_STRING, ID_PLUGIN_SEARCH, _T("Search Commands...\tShift+Alt+S"));
     AppendMenu(hPluginsMenu, MF_SEPARATOR, 0, NULL);
     
     const auto& plugins = g_PluginManager.GetPlugins();
@@ -1736,12 +1625,20 @@ void UpdatePluginsMenu(HWND hwnd) {
 
             if (plugin.items.size() == 1) {
                 // Single item: Add directly to the menu using the plugin name
-                AppendMenu(hPluginsMenu, MF_STRING, plugin.items[0].commandId, plugin.name.c_str());
+                std::wstring text = plugin.name;
+                if (!plugin.items[0].shortcut.empty()) {
+                    text += L"\t" + plugin.items[0].shortcut;
+                }
+                AppendMenu(hPluginsMenu, MF_STRING, plugin.items[0].commandId, text.c_str());
             } else {
                 // Multiple items: Create a submenu
                 HMENU hSubMenu = CreatePopupMenu();
                 for (const auto& item : plugin.items) {
-                    AppendMenu(hSubMenu, MF_STRING, item.commandId, item.name.c_str());
+                    std::wstring text = item.name;
+                    if (!item.shortcut.empty()) {
+                        text += L"\t" + item.shortcut;
+                    }
+                    AppendMenu(hSubMenu, MF_STRING, item.commandId, text.c_str());
                 }
                 
                 // Add the plugin submenu to the main Plugins menu
@@ -1982,67 +1879,7 @@ void DoCancelSelection()
     }
 }
 
-void DoOpenFolder()
-{
-    Document& doc = g_Document;
 
-    if (doc.szFileName[0])
-    {
-        TCHAR szDir[MAX_PATH];
-        StringCchCopy(szDir, MAX_PATH, doc.szFileName);
-        PathRemoveFileSpec(szDir);
-        ShellExecute(NULL, _T("explore"), szDir, NULL, NULL, SW_SHOW);
-    }
-}
-
-void DoOpenCmd()
-{
-    Document& doc = g_Document;
-
-    if (doc.szFileName[0])
-    {
-        TCHAR szDir[MAX_PATH];
-        StringCchCopy(szDir, MAX_PATH, doc.szFileName);
-        PathRemoveFileSpec(szDir);
-        
-        TCHAR szCmdLine[MAX_PATH];
-        if (GetEnvironmentVariable(_T("ComSpec"), szCmdLine, MAX_PATH) == 0)
-        {
-            StringCchCopy(szCmdLine, MAX_PATH, _T("cmd.exe"));
-        }
-        
-        STARTUPINFO si = { sizeof(si) };
-        PROCESS_INFORMATION pi = { 0 };
-        
-        if (CreateProcess(NULL, szCmdLine, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, szDir, &si, &pi))
-        {
-            WaitForInputIdle(pi.hProcess, 2000);
-            Sleep(200); // Wait for window to be ready
-            
-            LPCTSTR pszFile = PathFindFileName(doc.szFileName);
-            size_t len = _tcslen(pszFile);
-            std::vector<INPUT> inputs;
-            inputs.reserve(len * 2);
-            
-            for (size_t i = 0; i < len; i++)
-            {
-                INPUT input = { 0 };
-                input.type = INPUT_KEYBOARD;
-                input.ki.wScan = (WORD)pszFile[i];
-                input.ki.dwFlags = KEYEVENTF_UNICODE;
-                inputs.push_back(input);
-                
-                input.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-                inputs.push_back(input);
-            }
-            
-            SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
-            
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-        }
-    }
-}
 
 void DoCopyLine()
 {
@@ -2189,15 +2026,7 @@ void DoMoveLineDown()
     SendMessage(hEditor, EM_EXSETSEL, 0, (LPARAM)&crNew);
 }
 
-void DoOpenDefault()
-{
-    Document& doc = g_Document;
 
-    if (doc.szFileName[0])
-    {
-        ShellExecute(NULL, _T("open"), doc.szFileName, NULL, NULL, SW_SHOW);
-    }
-}
 
 void DoUpperCase()
 {
@@ -2499,6 +2328,9 @@ void UpdatePluginSearchList(HWND hDlg) {
         std::wstring name = cmd.commandName;
         std::wstring plugin = cmd.pluginName;
         std::wstring full = plugin + L": " + name;
+        if (!cmd.shortcut.empty()) {
+            full += L" (" + cmd.shortcut + L")";
+        }
         std::wstring fullLower = full;
         std::transform(fullLower.begin(), fullLower.end(), fullLower.begin(), ::towlower);
         
@@ -2557,6 +2389,41 @@ void DoManagePlugins() {
     }
 }
 
+// Theme support
+int g_CurrentTheme = 0; // 0: Light, 1: Dark, 2: Solarized Dark
+
+void ApplyTheme()
+{
+    COLORREF bgColor, textColor;
+    
+    switch (g_CurrentTheme)
+    {
+    case 1: // Dark
+        bgColor = RGB(30, 30, 30);
+        textColor = RGB(220, 220, 220);
+        break;
+    case 2: // Solarized Dark
+        bgColor = RGB(0, 43, 54);
+        textColor = RGB(131, 148, 150);
+        break;
+    default: // Light
+        bgColor = RGB(255, 255, 255);
+        textColor = RGB(0, 0, 0);
+        break;
+    }
+
+    if (hEditor)
+    {
+        SendMessage(hEditor, EM_SETBKGNDCOLOR, 0, bgColor);
+        
+        CHARFORMAT2 cf = {0};
+        cf.cbSize = sizeof(cf);
+        cf.dwMask = CFM_COLOR;
+        cf.crTextColor = textColor;
+        SendMessage(hEditor, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (msg == uFindReplaceMsg)
@@ -2609,6 +2476,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     switch (msg)
     {
+    case WM_APP + 200: // WM_APP_SET_THEME
+        g_CurrentTheme = (int)wParam;
+        ApplyTheme();
+        return 0;
     case WM_CONTEXTMENU:
     {
         if ((HWND)wParam == hEditor)
@@ -2892,7 +2763,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 // Load the rest of the file in one go
                 StreamContext ctx = {0};
                 ctx.hFile = g_BgLoad.hFile;
-                ctx.bHex = g_BgLoad.bHex;
                 ctx.dwOffset = g_BgLoad.dwOffset;
                 ctx.pProgress = NULL; 
                 ctx.hProgressBar = hProgressBarStatus; // Use status bar for progress
@@ -3168,11 +3038,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (LOWORD(wParam) == IDC_EDITOR && HIWORD(wParam) == EN_CHANGE)
         {
             Document& doc = g_Document;
-            if (!doc.bLoading && !doc.bIsDirty)
+            if (!doc.bLoading)
             {
-                doc.bIsDirty = TRUE;
-                UpdateTitle();
-                g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Modified");
+                if (!doc.bIsDirty)
+                {
+                    doc.bIsDirty = TRUE;
+                    UpdateTitle();
+                    g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Modified");
+                }
+                // Notify plugins about text change (always, not just on first dirty)
+                g_PluginManager.NotifyTextModified(doc.hEditor);
             }
         }
 
@@ -3287,9 +3162,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_EDIT_DUPLICATESELECTION: DoDuplicateSelection(); break;
         case ID_EDIT_MOVELINEUP: DoMoveLineUp(); break;
         case ID_EDIT_MOVELINEDOWN: DoMoveLineDown(); break;
-        case ID_FILE_OPENFOLDER: DoOpenFolder(); break;
-        case ID_FILE_OPENCMD: DoOpenCmd(); break;
-        case ID_FILE_OPENDEFAULT: DoOpenDefault(); break;
         case ID_FILE_TOGGLEREADONLY: DoToggleReadOnly(); break;
         case ID_EDIT_SELECTLINE: DoSelectLine(); break;
         case ID_EDIT_CANCEL_SELECTION: DoCancelSelection(); break;
@@ -3514,6 +3386,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0))
     {
+        if (g_PluginManager.TranslateAccelerator(&msg)) continue;
+
         if (hFindReplaceDlg == NULL || !IsDialogMessage(hFindReplaceDlg, &msg))
         {
             if (!TranslateAccelerator(hwnd, hAccel, &msg))

@@ -1,0 +1,7 @@
+LIBRARY WhitespaceVisualizerPlugin
+EXPORTS
+    GetPluginName
+    GetPluginDescription
+    GetPluginVersion
+    GetPluginMenuItems
+    OnFileEvent

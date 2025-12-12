@@ -10,6 +10,9 @@ struct PluginItem {
     std::wstring name;
     PluginCallback callback;
     int commandId;
+    std::wstring shortcut;
+    UINT vk;
+    UINT mods;
 };
 
 struct PluginInfo {
@@ -29,15 +32,24 @@ struct PluginInfo {
     typedef const wchar_t* (*GetPluginStatusFunc)(const wchar_t*);
     typedef PluginMenuItem* (*GetPluginMenuItemsFunc)(int*);
     typedef void (*OnFileEventFunc)(const wchar_t*, HWND, const wchar_t*);
+    typedef bool (*OnSaveFileFunc)(const wchar_t*, HWND);
+    typedef void (*OnTextModifiedFunc)(HWND);
+    typedef void (*InitializeFunc)(const wchar_t*);
+    typedef void (*ShutdownFunc)();
     
     GetPluginStatusFunc GetPluginStatus;
     OnFileEventFunc OnFileEvent;
+    OnSaveFileFunc OnSaveFile;
+    OnTextModifiedFunc OnTextModified;
+    InitializeFunc Initialize;
+    ShutdownFunc Shutdown;
 };
 
 struct PluginCommand {
     std::wstring pluginName;
     std::wstring commandName;
     int commandId;
+    std::wstring shortcut;
 };
 
 class PluginManager {
@@ -56,6 +68,10 @@ public:
     void SetPluginEnabled(const std::wstring& filename, bool enabled);
     
     void NotifyFileEvent(const wchar_t* filePath, HWND hEditor, const wchar_t* eventType);
+    bool NotifySaveFile(const wchar_t* filePath, HWND hEditor);
+    void NotifyTextModified(HWND hEditor);
+    
+    bool TranslateAccelerator(MSG* pMsg);
 
 private:
     std::vector<PluginInfo> m_plugins;

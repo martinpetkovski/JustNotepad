@@ -48,11 +48,18 @@ add_subdirectory(plugins/DateTimePlugin)
 add_subdirectory(plugins/GuidPlugin)
 add_subdirectory(plugins/EmojiPlugin)
 add_subdirectory(plugins/ClangFormatPlugin)
+add_subdirectory(plugins/HexEditorPlugin)
+add_subdirectory(plugins/Neon)
+
 add_subdirectory(plugins/AdvancedSearchPlugin)
 add_subdirectory(plugins/WindowsShellPlugin)
+add_subdirectory(plugins/MacrosPlugin)
 add_subdirectory(plugins/GitPlugin)
 add_subdirectory(plugins/PerforcePlugin)
 add_subdirectory(plugins/CharacterMapPlugin)
+add_subdirectory(plugins/ThemeSwitcherPlugin)
+add_subdirectory(plugins/WhitespaceVisualizerPlugin)
+add_subdirectory(plugins/JsonViewerPlugin)
 
 
 

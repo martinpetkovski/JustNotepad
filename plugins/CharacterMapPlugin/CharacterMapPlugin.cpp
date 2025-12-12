@@ -127,6 +127,26 @@ HFONT g_hFont = NULL;
 int g_SelectedChar = -1;
 int g_CurrentRangeIndex = 0;
 WNDPROC g_OldListBoxProc = NULL;
+std::wstring g_SettingsPath;
+std::wstring g_LastFont = L"Segoe UI";
+
+extern "C" {
+    PLUGIN_API void Initialize(const wchar_t* settingsPath) {
+        g_SettingsPath = settingsPath;
+        g_CurrentRangeIndex = GetPrivateProfileInt(L"Settings", L"RangeIndex", 0, g_SettingsPath.c_str());
+        
+        WCHAR buf[LF_FACESIZE];
+        GetPrivateProfileString(L"Settings", L"Font", L"Segoe UI", buf, LF_FACESIZE, g_SettingsPath.c_str());
+        g_LastFont = buf;
+    }
+
+    PLUGIN_API void Shutdown() {
+        if (!g_SettingsPath.empty()) {
+            WritePrivateProfileString(L"Settings", L"RangeIndex", std::to_wstring(g_CurrentRangeIndex).c_str(), g_SettingsPath.c_str());
+            WritePrivateProfileString(L"Settings", L"Font", g_LastFont.c_str(), g_SettingsPath.c_str());
+        }
+    }
+}
 
 #define COLS 16
 #define CELL_SIZE 24
@@ -219,7 +239,7 @@ INT_PTR CALLBACK CharMapDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM l
         ReleaseDC(hDlg, hdc);
         
         // Select default font (Segoe UI or Arial)
-        if (SendMessage(hFontCombo, CB_SELECTSTRING, -1, (LPARAM)L"Segoe UI") == CB_ERR) {
+        if (SendMessage(hFontCombo, CB_SELECTSTRING, -1, (LPARAM)g_LastFont.c_str()) == CB_ERR) {
             SendMessage(hFontCombo, CB_SETCURSEL, 0, 0);
         }
         
@@ -228,7 +248,7 @@ INT_PTR CALLBACK CharMapDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM l
         for (int i = 0; i < sizeof(g_Ranges) / sizeof(g_Ranges[0]); ++i) {
             SendMessage(hRangeCombo, CB_ADDSTRING, 0, (LPARAM)g_Ranges[i].name);
         }
-        SendMessage(hRangeCombo, CB_SETCURSEL, 0, 0);
+        SendMessage(hRangeCombo, CB_SETCURSEL, g_CurrentRangeIndex, 0);
         
         // Subclass ListBox
         HWND hList = GetDlgItem(hDlg, IDC_CHAR_GRID);
@@ -245,6 +265,7 @@ INT_PTR CALLBACK CharMapDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM l
             if (idx != CB_ERR) {
                 wchar_t szFontName[LF_FACESIZE];
                 SendMessage(hFontCombo, CB_GETLBTEXT, idx, (LPARAM)szFontName);
+                g_LastFont = szFontName;
                 
                 if (g_hFont) DeleteObject(g_hFont);
                 g_hFont = CreateFont(20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 

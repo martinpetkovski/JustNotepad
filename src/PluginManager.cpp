@@ -5,6 +5,8 @@
 
 namespace fs = std::filesystem;
 
+static bool ParseShortcut(const std::wstring& shortcut, UINT& key, UINT& modifiers);
+
 PluginManager::PluginManager() {}
 
 PluginManager::~PluginManager() {
@@ -45,6 +47,10 @@ void PluginManager::LoadPlugins(const std::wstring& pluginsDir) {
                 auto getStatus = (PluginInfo::GetPluginStatusFunc)GetProcAddress(hModule, "GetPluginStatus");
                 auto getItems = (PluginInfo::GetPluginMenuItemsFunc)GetProcAddress(hModule, "GetPluginMenuItems");
                 auto onFileEvent = (PluginInfo::OnFileEventFunc)GetProcAddress(hModule, "OnFileEvent");
+                auto onSaveFile = (PluginInfo::OnSaveFileFunc)GetProcAddress(hModule, "OnSaveFile");
+                auto onTextModified = (PluginInfo::OnTextModifiedFunc)GetProcAddress(hModule, "OnTextModified");
+                auto initialize = (PluginInfo::InitializeFunc)GetProcAddress(hModule, "Initialize");
+                auto shutdown = (PluginInfo::ShutdownFunc)GetProcAddress(hModule, "Shutdown");
 
                 if (getName && getItems) {
                     info.name = getName();
@@ -52,6 +58,16 @@ void PluginManager::LoadPlugins(const std::wstring& pluginsDir) {
                     if (getVer) info.version = getVer();
                     info.GetPluginStatus = getStatus;
                     info.OnFileEvent = onFileEvent;
+                    info.OnSaveFile = onSaveFile;
+                    info.OnTextModified = onTextModified;
+                    info.Initialize = initialize;
+                    info.Shutdown = shutdown;
+
+                    if (info.enabled && info.Initialize) {
+                        std::wstring settingsPath = entry.path().parent_path().wstring() + L"\\settings\\" + info.filename + L".ini";
+                        fs::create_directories(fs::path(settingsPath).parent_path());
+                        info.Initialize(settingsPath.c_str());
+                    }
                     
                     int count = 0;
                     PluginMenuItem* items = getItems(&count);
@@ -61,6 +77,13 @@ void PluginManager::LoadPlugins(const std::wstring& pluginsDir) {
                             PluginItem item;
                             item.name = items[i].name;
                             item.callback = items[i].callback;
+                            if (items[i].shortcut) {
+                                item.shortcut = items[i].shortcut;
+                                ParseShortcut(item.shortcut, item.vk, item.mods);
+                            } else {
+                                item.vk = 0;
+                                item.mods = 0;
+                            }
                             
                             // Only assign ID and add callback if enabled
                             if (info.enabled) {
@@ -106,6 +129,9 @@ void PluginManager::LoadPlugins(const std::wstring& pluginsDir) {
 
 void PluginManager::UnloadPlugins() {
     for (auto& plugin : m_plugins) {
+        if (plugin.enabled && plugin.Shutdown) {
+            plugin.Shutdown();
+        }
         if (plugin.hModule) {
             FreeLibrary(plugin.hModule);
         }
@@ -204,6 +230,7 @@ std::vector<PluginCommand> PluginManager::GetAllCommands() const {
             cmd.pluginName = plugin.name;
             cmd.commandName = item.name;
             cmd.commandId = item.commandId;
+            cmd.shortcut = item.shortcut;
             commands.push_back(cmd);
         }
     }
@@ -225,5 +252,106 @@ void PluginManager::NotifyFileEvent(const wchar_t* filePath, HWND hEditor, const
             plugin.OnFileEvent(filePath, hEditor, eventType);
         }
     }
+}
+
+void PluginManager::NotifyTextModified(HWND hEditor) {
+    for (const auto& plugin : m_plugins) {
+        if (plugin.enabled && plugin.OnTextModified) {
+            plugin.OnTextModified(hEditor);
+        }
+    }
+}
+
+static bool ParseShortcut(const std::wstring& shortcut, UINT& key, UINT& modifiers) {
+    if (shortcut.empty()) return false;
+    
+    modifiers = 0;
+    key = 0;
+    
+    std::wstring s = shortcut;
+    std::transform(s.begin(), s.end(), s.begin(), ::towupper);
+    
+    size_t pos = 0;
+    while ((pos = s.find(L"+")) != std::wstring::npos) {
+        std::wstring mod = s.substr(0, pos);
+        if (mod == L"CTRL") modifiers |= MOD_CONTROL;
+        else if (mod == L"SHIFT") modifiers |= MOD_SHIFT;
+        else if (mod == L"ALT") modifiers |= MOD_ALT;
+        s.erase(0, pos + 1);
+    }
+    
+    // Last part is the key
+    if (s.length() == 1) {
+        key = s[0];
+    } else if (s.substr(0, 1) == L"F") {
+        int f = _wtoi(s.substr(1).c_str());
+        if (f >= 1 && f <= 12) key = VK_F1 + (f - 1);
+    } else if (s == L"DEL" || s == L"DELETE") {
+        key = VK_DELETE;
+    } else if (s == L"INS" || s == L"INSERT") {
+        key = VK_INSERT;
+    } else if (s == L"HOME") {
+        key = VK_HOME;
+    } else if (s == L"END") {
+        key = VK_END;
+    } else if (s == L"PGUP" || s == L"PAGEUP") {
+        key = VK_PRIOR;
+    } else if (s == L"PGDN" || s == L"PAGEDOWN") {
+        key = VK_NEXT;
+    }
+    
+    return key != 0;
+}
+
+bool PluginManager::TranslateAccelerator(MSG* pMsg) {
+    if (pMsg->message != WM_KEYDOWN && pMsg->message != WM_SYSKEYDOWN) return false;
+    
+    for (const auto& plugin : m_plugins) {
+        if (!plugin.enabled) continue;
+        for (const auto& item : plugin.items) {
+            if (item.vk == 0) continue;
+            
+            if (pMsg->wParam == item.vk) {
+                // Check modifiers
+                bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+                
+                bool reqCtrl = (item.mods & MOD_CONTROL) != 0;
+                bool reqShift = (item.mods & MOD_SHIFT) != 0;
+                bool reqAlt = (item.mods & MOD_ALT) != 0;
+                
+                if (ctrl == reqCtrl && shift == reqShift && alt == reqAlt) {
+                    if (item.callback) {
+                        // We need hEditor. Since we don't have it here, we can try to find it.
+                        // Or we can pass it to TranslateAccelerator.
+                        // For now, let's assume the active window or find it.
+                        // Actually, ExecutePluginCommand takes hEditor.
+                        // Let's assume the main window is the parent of the focused window or similar.
+                        // But wait, ExecutePluginCommand uses m_callbacks which is indexed by ID.
+                        // We can just call the callback directly if we have hEditor.
+                        
+                        // Better: Post a WM_COMMAND to the main window with the command ID.
+                        // This handles hEditor correctly in main.cpp
+                        HWND hMain = GetAncestor(pMsg->hwnd, GA_ROOT);
+                        SendMessage(hMain, WM_COMMAND, item.commandId, 0);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool PluginManager::NotifySaveFile(const wchar_t* filePath, HWND hEditor) {
+    for (const auto& plugin : m_plugins) {
+        if (plugin.enabled && plugin.OnSaveFile) {
+            if (plugin.OnSaveFile(filePath, hEditor)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 

@@ -465,14 +465,14 @@ extern "C" {
     }
 
     PluginMenuItem g_Items[] = {
-        { L"Status", GitStatus },
+        { L"Status", GitStatus, L"Ctrl+Shift+G" },
         { L"Add", GitAdd },
         { L"Diff", GitDiff },
         { L"Commit...", GitCommit },
         { L"Pull", GitPull },
         { L"Push", GitPush },
         { L"Discard Changes", GitDiscard },
-        { L"Blame", GitBlame },
+        { L"Blame", GitBlame, L"Ctrl+Shift+B" },
         { L"Log", GitLog }
     };
 

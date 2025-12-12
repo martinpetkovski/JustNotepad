@@ -1,0 +1,8 @@
+LIBRARY HexEditorPlugin
+EXPORTS
+    GetPluginName
+    GetPluginDescription
+    GetPluginVersion
+    GetPluginMenuItems
+    OnFileEvent
+    OnSaveFile

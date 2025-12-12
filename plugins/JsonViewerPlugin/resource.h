@@ -1,0 +1,14 @@
+#pragma once
+
+#define IDC_STATIC -1
+#define IDD_DATA_VIEWER 101
+#define IDC_SEARCH_TEXT 1001
+#define IDC_SEARCH_BTN  1002
+#define IDC_DATA_TREE   1003
+#define IDC_EDIT_NAME   1004
+#define IDC_EDIT_VALUE  1005
+#define IDC_COMBO_TYPE  1006
+#define IDC_BTN_UPDATE  1007
+#define IDC_BTN_ADD     1008
+#define IDC_BTN_DELETE  1009
+#define IDC_BTN_SAVE    1010

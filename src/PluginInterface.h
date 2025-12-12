@@ -12,6 +12,7 @@ typedef void (*PluginCallback)(HWND);
 struct PluginMenuItem {
     const wchar_t* name;
     PluginCallback callback;
+    const wchar_t* shortcut; // e.g. "Ctrl+Shift+M"
 };
 
 extern "C" {
@@ -34,5 +35,17 @@ extern "C" {
 
     // Optional: Called when a file is loaded or saved
     PLUGIN_API void OnFileEvent(const wchar_t* filePath, HWND hEditor, const wchar_t* eventType);
+
+    // Optional: Called before saving a file. Return true if the plugin handled the save.
+    PLUGIN_API bool OnSaveFile(const wchar_t* filePath, HWND hEditor);
+
+    // Optional: Called when text is modified in the editor
+    PLUGIN_API void OnTextModified(HWND hEditor);
+
+    // Optional: Called when the plugin is loaded
+    PLUGIN_API void Initialize(const wchar_t* settingsPath);
+
+    // Optional: Called when the plugin is unloaded
+    PLUGIN_API void Shutdown();
 }
 

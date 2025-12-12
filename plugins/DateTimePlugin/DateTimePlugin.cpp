@@ -8,7 +8,7 @@
 
 extern "C" {
     PLUGIN_API const wchar_t* GetPluginName() {
-        return L"Date & Time";
+        return L"Date and Time";
     }
     
     PLUGIN_API const wchar_t* GetPluginDescription() {
@@ -44,7 +44,7 @@ extern "C" {
         { L"Long Date", InsertLongDate },
         { L"Short Time (HH:MM)", InsertShortTime },
         { L"Long Time (HH:MM:SS)", InsertLongTime },
-        { L"Date & Time", InsertDateTime },
+        { L"Date & Time", InsertDateTime, L"F5" },
         { L"ISO 8601", InsertISO8601 },
         { L"RFC 2822", InsertRFC2822 }
     };

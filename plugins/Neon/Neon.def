@@ -1,0 +1,7 @@
+LIBRARY Neon
+EXPORTS
+    GetPluginName
+    GetPluginDescription
+    GetPluginVersion
+    GetPluginMenuItems
+    OnFileEvent

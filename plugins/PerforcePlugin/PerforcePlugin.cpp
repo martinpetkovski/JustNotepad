@@ -25,36 +25,30 @@ struct P4Settings {
     std::wstring password;
 } g_P4Settings;
 
+std::wstring g_SettingsPath;
+
 void LoadSettings() {
-    TCHAR szPath[MAX_PATH];
-    GetModuleFileName(g_hInst, szPath, MAX_PATH);
-    std::filesystem::path p(szPath);
-    p.replace_filename(_T("PerforcePlugin.ini"));
-    _tcscpy_s(szPath, p.c_str());
+    if (g_SettingsPath.empty()) return;
     
     TCHAR buf[256];
-    GetPrivateProfileString(_T("Perforce"), _T("Server"), _T(""), buf, 256, szPath);
+    GetPrivateProfileString(_T("Perforce"), _T("Server"), _T(""), buf, 256, g_SettingsPath.c_str());
     g_P4Settings.server = buf;
-    GetPrivateProfileString(_T("Perforce"), _T("User"), _T(""), buf, 256, szPath);
+    GetPrivateProfileString(_T("Perforce"), _T("User"), _T(""), buf, 256, g_SettingsPath.c_str());
     g_P4Settings.user = buf;
-    GetPrivateProfileString(_T("Perforce"), _T("Client"), _T(""), buf, 256, szPath);
+    GetPrivateProfileString(_T("Perforce"), _T("Client"), _T(""), buf, 256, g_SettingsPath.c_str());
     g_P4Settings.client = buf;
     // Password usually not saved in plain text, but for this demo...
-    GetPrivateProfileString(_T("Perforce"), _T("Password"), _T(""), buf, 256, szPath);
+    GetPrivateProfileString(_T("Perforce"), _T("Password"), _T(""), buf, 256, g_SettingsPath.c_str());
     g_P4Settings.password = buf;
 }
 
 void SaveSettings() {
-    TCHAR szPath[MAX_PATH];
-    GetModuleFileName(g_hInst, szPath, MAX_PATH);
-    std::filesystem::path p(szPath);
-    p.replace_filename(_T("PerforcePlugin.ini"));
-    _tcscpy_s(szPath, p.c_str());
+    if (g_SettingsPath.empty()) return;
     
-    WritePrivateProfileString(_T("Perforce"), _T("Server"), g_P4Settings.server.c_str(), szPath);
-    WritePrivateProfileString(_T("Perforce"), _T("User"), g_P4Settings.user.c_str(), szPath);
-    WritePrivateProfileString(_T("Perforce"), _T("Client"), g_P4Settings.client.c_str(), szPath);
-    WritePrivateProfileString(_T("Perforce"), _T("Password"), g_P4Settings.password.c_str(), szPath);
+    WritePrivateProfileString(_T("Perforce"), _T("Server"), g_P4Settings.server.c_str(), g_SettingsPath.c_str());
+    WritePrivateProfileString(_T("Perforce"), _T("User"), g_P4Settings.user.c_str(), g_SettingsPath.c_str());
+    WritePrivateProfileString(_T("Perforce"), _T("Client"), g_P4Settings.client.c_str(), g_SettingsPath.c_str());
+    WritePrivateProfileString(_T("Perforce"), _T("Password"), g_P4Settings.password.c_str(), g_SettingsPath.c_str());
 }
 
 // Helper to get file path from main window title
@@ -435,6 +429,15 @@ PluginMenuItem g_MenuItems[] = {
 
 extern "C" {
 
+    PLUGIN_API void Initialize(const wchar_t* settingsPath) {
+        g_SettingsPath = settingsPath;
+        LoadSettings();
+    }
+
+    PLUGIN_API void Shutdown() {
+        SaveSettings();
+    }
+
 PLUGIN_API const TCHAR* GetPluginName() {
     return _T("Perforce");
 }
@@ -446,21 +449,20 @@ PLUGIN_API const TCHAR* GetPluginDescription() {
 PLUGIN_API const TCHAR* GetPluginVersion() {
     return _T("1.0");
 }
+} // End extern "C"
 
-PLUGIN_API const wchar_t* GetPluginStatus(const wchar_t* filePath) {
-    if (!filePath || !filePath[0]) return NULL;
-    
-    if (g_P4LastFile == filePath && GetTickCount() - g_P4LastCheck < 2000) {
-        return g_P4StatusCache.empty() ? NULL : g_P4StatusCache.c_str();
-    }
-    
-    g_P4LastFile = filePath;
-    g_P4LastCheck = GetTickCount();
-    g_P4StatusCache = L"";
+#include <thread>
+#include <atomic>
+#include <mutex>
 
+std::atomic<bool> g_P4CheckInProgress(false);
+std::mutex g_P4CacheMutex;
+
+void CheckStatusWorker(std::wstring filePath) {
     std::wstring dir = std::filesystem::path(filePath).parent_path().wstring();
-    std::wstring output = RunPerforceCommand(L"fstat \"" + std::wstring(filePath) + L"\"", dir);
+    std::wstring output = RunPerforceCommand(L"fstat \"" + filePath + L"\"", dir);
     
+    std::wstring status = L"";
     if (output.find(L"clientFile") != std::wstring::npos) {
         // Parse action
         size_t actionPos = output.find(L"action ");
@@ -469,9 +471,36 @@ PLUGIN_API const wchar_t* GetPluginStatus(const wchar_t* filePath) {
             std::wstring action = output.substr(actionPos + 7, end - (actionPos + 7));
             // Trim
             while (!action.empty() && iswspace(action.back())) action.pop_back();
-            g_P4StatusCache = L"P4: " + action;
+            status = L"P4: " + action;
         } else {
-            g_P4StatusCache = L"P4: synced";
+            status = L"P4: synced";
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_P4CacheMutex);
+        g_P4StatusCache = status;
+        g_P4LastCheck = GetTickCount();
+    }
+    g_P4CheckInProgress = false;
+}
+
+extern "C" {
+PLUGIN_API const wchar_t* GetPluginStatus(const wchar_t* filePath) {
+    if (!filePath || !filePath[0]) return NULL;
+    
+    std::lock_guard<std::mutex> lock(g_P4CacheMutex);
+    
+    if (g_P4LastFile != filePath) {
+        g_P4LastFile = filePath;
+        g_P4StatusCache = L"";
+        g_P4LastCheck = 0; // Force update
+    }
+
+    if (GetTickCount() - g_P4LastCheck > 2000) {
+        if (!g_P4CheckInProgress) {
+            g_P4CheckInProgress = true;
+            std::thread(CheckStatusWorker, std::wstring(filePath)).detach();
         }
     }
     
@@ -491,7 +520,7 @@ PLUGIN_API PluginMenuItem* GetPluginMenuItems(int* count) {
         // We can't use EnumWindows easily in a DLL without a callback, but we can try FindWindow if we knew the class.
         // Instead, let's rely on the first menu action to hook, OR hook when we can.
         // Actually, we can just load settings here.
-        LoadSettings();
+        // LoadSettings();
         
         // Auto-login if password is saved
         if (!g_P4Settings.password.empty()) {
