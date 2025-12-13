@@ -240,22 +240,221 @@ TEST(TestSelectionHierarchyCR)
     ASSERT_EQ(r3.end, 14L);
 }
 
+TEST(TestSortLinesEdgeCases)
+{
+    // Empty
+    ASSERT_EQ(SortLines(S("")), TO_STRING(S("")));
+    
+    // Single line
+    ASSERT_EQ(SortLines(S("abc")), TO_STRING(S("abc")));
+    
+    // Already sorted
+    ASSERT_EQ(SortLines(S("a\r\nb\r\nc")), TO_STRING(S("a\r\nb\r\nc")));
+    
+    // Reverse sorted
+    ASSERT_EQ(SortLines(S("c\r\nb\r\na")), TO_STRING(S("a\r\nb\r\nc")));
+    
+    // Duplicates
+    ASSERT_EQ(SortLines(S("b\r\na\r\nb")), TO_STRING(S("a\r\nb\r\nb")));
+}
+
+TEST(TestIndentUnindentEdgeCases)
+{
+    // Empty
+    ASSERT_EQ(IndentLines(S("")), TO_STRING(S("")));
+    ASSERT_EQ(UnindentLines(S("")), TO_STRING(S("")));
+    
+    // Whitespace only lines
+    // Indent should add tab
+    ASSERT_EQ(IndentLines(S("  ")), TO_STRING(S("\t  ")));
+    // Unindent should remove indentation if present
+    ASSERT_EQ(UnindentLines(S("\t  ")), TO_STRING(S("  ")));
+    // Unindent on spaces
+    ASSERT_EQ(UnindentLines(S("      ")), TO_STRING(S("  "))); // 6 spaces -> 2 spaces (removes 4)
+}
+
+TEST(TestCaseConversionEdgeCases)
+{
+    // Empty
+    ASSERT_EQ(ToUpperCase(S("")), TO_STRING(S("")));
+    ASSERT_EQ(ToLowerCase(S("")), TO_STRING(S("")));
+    ASSERT_EQ(ToCapitalize(S("")), TO_STRING(S("")));
+    ASSERT_EQ(ToSentenceCase(S("")), TO_STRING(S("")));
+    
+    // Numbers and symbols
+    std::basic_string<TCHAR> mixed = S("123!@#");
+    ASSERT_EQ(ToUpperCase(mixed), mixed);
+    ASSERT_EQ(ToLowerCase(mixed), mixed);
+    
+    // Mixed case for Capitalize
+    ASSERT_EQ(ToCapitalize(S("hElLo wOrLd")), TO_STRING(S("Hello World")));
+    
+    // Sentence case with multiple sentences
+    ASSERT_EQ(ToSentenceCase(S("hello. world.")), TO_STRING(S("Hello. World.")));
+    ASSERT_EQ(ToSentenceCase(S("hello! world?")), TO_STRING(S("Hello! World?")));
+}
+
+TEST(TestFindEnclosingBracketsMore)
+{
+    std::basic_string<TCHAR> text = S("((inner)) [box] {brace} \"quote\" 'char'");
+    int len = (int)text.length();
+    
+    // Nested ((inner)) - select "inner"
+    // text: ( ( i n n e r ) )
+    // indices: 0 1 2 3 4 5 6 7 8
+    // Select "inner" -> 2-7
+    Range r1 = FindEnclosingBrackets(text.c_str(), len, 2, 7);
+    ASSERT_EQ(r1.start, 1L); // inner (
+    ASSERT_EQ(r1.end, 8L);   // inner ) + 1
+    
+    // Outer ((inner)) - select "(inner)" -> 1-8
+    Range r2 = FindEnclosingBrackets(text.c_str(), len, 1, 8);
+    ASSERT_EQ(r2.start, 0L); // outer (
+    ASSERT_EQ(r2.end, 9L);   // outer ) + 1
+    
+    // [box] - select "box"
+    // " [box] " starts at 10
+    // [ at 10, box at 11-14, ] at 14
+    Range r3 = FindEnclosingBrackets(text.c_str(), len, 11, 14);
+    ASSERT_EQ(r3.start, 10L);
+    ASSERT_EQ(r3.end, 15L);
+    
+    // {brace}
+    // " {brace} " starts at 16
+    // { at 16, brace at 17-22, } at 22
+    Range r4 = FindEnclosingBrackets(text.c_str(), len, 17, 22);
+    ASSERT_EQ(r4.start, 16L);
+    ASSERT_EQ(r4.end, 23L);
+    
+    // "quote"
+    // " "quote" " starts at 24
+    // " at 24, quote at 25-30, " at 30
+    Range r5 = FindEnclosingBrackets(text.c_str(), len, 25, 30);
+    ASSERT_EQ(r5.start, 24L);
+    ASSERT_EQ(r5.end, 31L);
+    
+    // 'char'
+    // " 'char'" starts at 32
+    // ' at 32, char at 33-37, ' at 37
+    Range r6 = FindEnclosingBrackets(text.c_str(), len, 33, 37);
+    ASSERT_EQ(r6.start, 32L);
+    ASSERT_EQ(r6.end, 38L);
+    
+    // No brackets
+    Range r7 = FindEnclosingBrackets(text.c_str(), len, 0, len);
+    ASSERT_EQ(r7.start, -1L);
+    ASSERT_EQ(r7.end, -1L);
+}
+
+TEST(TestSelectionHierarchyExtended)
+{
+    // Paragraphs
+    std::basic_string<TCHAR> text = S("Para1 Line1\r\nPara1 Line2\r\n\r\nPara2 Line1\r\nPara2 Line2");
+    // Para1: 0-24 (including \r\n\r\n ?)
+    // Para1 Line1\r\n (13)
+    // Para1 Line2\r\n (13) -> 26
+    // \r\n (2) -> 28
+    // Para2 Line1\r\n (13) -> 41
+    // Para2 Line2 (11) -> 52
+    
+    // Select inside Para1
+    Range rPara1 = GetSelectionRange(text.c_str(), (int)text.length(), 5, 5, SEL_PARAGRAPH);
+    ASSERT_EQ(rPara1.start, 0L);
+    ASSERT_EQ(rPara1.end, 26L); 
+    
+    // Select inside Para2
+    Range rPara2 = GetSelectionRange(text.c_str(), (int)text.length(), 30, 30, SEL_PARAGRAPH);
+    ASSERT_EQ(rPara2.start, 28L);
+    ASSERT_EQ(rPara2.end, (long)text.length());
+    
+    // Sections
+    std::basic_string<TCHAR> doc = S("# Section 1\r\nContent 1\r\n# Section 2\r\nContent 2");
+    
+    // Select inside Section 1
+    Range rSec1 = GetSelectionRange(doc.c_str(), (int)doc.length(), 15, 15, SEL_SECTION);
+    ASSERT_EQ(rSec1.start, 0L);
+    ASSERT_EQ(rSec1.end, 24L); // Start of Section 2
+    
+    // Select inside Section 2
+    Range rSec2 = GetSelectionRange(doc.c_str(), (int)doc.length(), 40, 40, SEL_SECTION);
+    ASSERT_EQ(rSec2.start, 24L);
+    ASSERT_EQ(rSec2.end, (long)doc.length());
+    
+    // Document
+    Range rDoc = GetSelectionRange(doc.c_str(), (int)doc.length(), 10, 20, SEL_DOCUMENT);
+    ASSERT_EQ(rDoc.start, 0L);
+    ASSERT_EQ(rDoc.end, (long)doc.length());
+}
+
+TEST(TestSubwordNavigationEdgeCases)
+{
+    // Empty
+    ASSERT_EQ(CalculateNextSubword(S(""), 0), 0);
+    ASSERT_EQ(CalculatePrevSubword(S(""), 0), 0);
+    
+    // Single char
+    ASSERT_EQ(CalculateNextSubword(S("a"), 1), 1);
+    ASSERT_EQ(CalculatePrevSubword(S("a"), 1), 0);
+    
+    // Underscores
+    std::basic_string<TCHAR> s = S("__init__");
+    // 0: _ -> 2 (start of init)
+    ASSERT_EQ(CalculateNextSubword(s.c_str(), (int)s.length()), 2);
+    
+    // From end
+    // 8: _ -> 6 (end of init)
+    ASSERT_EQ(CalculatePrevSubword(s.c_str(), (int)s.length()), 6);
+    
+    // Mixed types
+    std::basic_string<TCHAR> m = S("camelCase_snake");
+    
+    const TCHAR* ptr = m.c_str();
+    int len = (int)m.length();
+    int current = 0;
+    
+    // "camel"
+    int next = CalculateNextSubword(ptr + current, len - current);
+    current += next;
+    ASSERT_EQ(current, 5); // At 'C'
+    
+    // "Case"
+    next = CalculateNextSubword(ptr + current, len - current);
+    current += next;
+    ASSERT_EQ(current, 9); // At '_'
+    
+    // "_"
+    next = CalculateNextSubword(ptr + current, len - current);
+    current += next;
+    ASSERT_EQ(current, 10); // At 's'
+    
+    // "snake"
+    next = CalculateNextSubword(ptr + current, len - current);
+    current += next;
+    ASSERT_EQ(current, 15); // At end
+}
+
 int main()
 {
     RUN_TEST(TestSortLines);
+    RUN_TEST(TestSortLinesEdgeCases);
     RUN_TEST(TestIndentLines);
     RUN_TEST(TestIndentLinesVector);
+    RUN_TEST(TestIndentUnindentEdgeCases);
     RUN_TEST(TestUnindentLines);
     RUN_TEST(TestUpperCase);
     RUN_TEST(TestLowerCase);
     RUN_TEST(TestCapitalize);
+    RUN_TEST(TestCaseConversionEdgeCases);
     RUN_TEST(TestSentenceCase);
     RUN_TEST(TestSubwordNavigation);
+    RUN_TEST(TestSubwordNavigationEdgeCases);
     RUN_TEST(TestFindEnclosingBrackets);
+    RUN_TEST(TestFindEnclosingBracketsMore);
     RUN_TEST(TestSelectionHierarchy);
     RUN_TEST(TestSelectionHierarchyMultiLine);
     RUN_TEST(TestExpandSelectionToLine);
     RUN_TEST(TestSelectionHierarchyCR);
+    RUN_TEST(TestSelectionHierarchyExtended);
     
     std::cout << "All tests passed!" << std::endl;
     return 0;

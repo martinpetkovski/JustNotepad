@@ -43,6 +43,18 @@ endif()
 
 add_test(NAME UnitTests COMMAND UnitTests)
 
+add_executable(PluginTests
+    tests/PluginTests.cpp
+)
+
+if(MSVC)
+    target_link_libraries(PluginTests PRIVATE user32)
+else()
+    target_link_libraries(PluginTests PRIVATE user32)
+endif()
+
+add_test(NAME PluginTests COMMAND PluginTests)
+
 add_subdirectory(plugins/HelloPlugin)
 add_subdirectory(plugins/DateTimePlugin)
 add_subdirectory(plugins/GuidPlugin)
