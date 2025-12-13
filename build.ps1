@@ -14,15 +14,6 @@ $BuildDir = Join-Path $Root 'build'
 # Ensure no running instance blocks linking
 Get-Process "Just Notepad" -ErrorAction SilentlyContinue | Stop-Process -Force
 
-# Clean build folder
-if (Test-Path $BuildDir) {
-    Write-Host "Cleaning build directory..." -ForegroundColor Yellow
-    Remove-Item -Recurse -Force $BuildDir
-}
-
-# Create build folder
-if (-not (Test-Path $BuildDir)) { New-Item -ItemType Directory -Path $BuildDir | Out-Null }
-
 # Check for CMake
 if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
     $cmakePaths = @(
@@ -44,6 +35,11 @@ if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
     }
 }
 
+# Create build folder if it doesn't exist
+if (-not (Test-Path $BuildDir)) { 
+    New-Item -ItemType Directory -Path $BuildDir | Out-Null 
+}
+
 # Determine generator if not specified
 if (-not $Generator) {
     # Prefer Ninja if available, else Visual Studio
@@ -54,17 +50,23 @@ if (-not $Generator) {
 
 Write-Host "Using generator: $Generator; Configuration: $Configuration"
 
-# Configure
+# Configure and Build
 Push-Location $BuildDir
 try {
-    # Configure
-    cmake -G "$Generator" -DCMAKE_BUILD_TYPE=$Configuration "$Root"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "CMake configure failed (exit code $LASTEXITCODE)." -ForegroundColor Red
-        exit $LASTEXITCODE
+    # Only configure if CMakeCache.txt is missing
+    if (-not (Test-Path "CMakeCache.txt")) {
+        Write-Host "Configuring CMake..." -ForegroundColor Yellow
+        cmake -G "$Generator" -DCMAKE_BUILD_TYPE=$Configuration "$Root"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "CMake configure failed (exit code $LASTEXITCODE)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "Skipping configuration (CMakeCache.txt exists). Building changes only..." -ForegroundColor Yellow
     }
 
     # Build
+    Write-Host "Building Just Notepad and all plugins..." -ForegroundColor Cyan
     cmake --build . --config $Configuration
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Build failed (exit code $LASTEXITCODE). Not running the app." -ForegroundColor Red
@@ -80,6 +82,15 @@ try {
 
     if (-not (Test-Path $ExePath)) {
         throw "Executable not found: $ExePath"
+    }
+
+    # Verify plugins were built
+    $PluginsDir = Join-Path (Split-Path $ExePath) "plugins"
+    if (Test-Path $PluginsDir) {
+        $Plugins = Get-ChildItem $PluginsDir *.dll
+        Write-Host "Built $($Plugins.Count) plugins." -ForegroundColor Green
+    } else {
+        Write-Host "Warning: No plugins directory found at $PluginsDir" -ForegroundColor Yellow
     }
 
     if (-not $BuildOnly) {

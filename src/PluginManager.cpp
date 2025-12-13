@@ -2,6 +2,7 @@
 #include "resource.h"
 #include <filesystem>
 #include <algorithm>
+#include <richedit.h>
 
 namespace fs = std::filesystem;
 
@@ -51,6 +52,8 @@ void PluginManager::LoadPlugins(const std::wstring& pluginsDir) {
                 auto onTextModified = (PluginInfo::OnTextModifiedFunc)GetProcAddress(hModule, "OnTextModified");
                 auto initialize = (PluginInfo::InitializeFunc)GetProcAddress(hModule, "Initialize");
                 auto shutdown = (PluginInfo::ShutdownFunc)GetProcAddress(hModule, "Shutdown");
+                auto setHostFunctions = (PluginInfo::SetHostFunctionsFunc)GetProcAddress(hModule, "SetHostFunctions");
+                auto getMaxFileSize = (PluginInfo::GetMaxFileSizeFunc)GetProcAddress(hModule, "GetMaxFileSize");
 
                 if (getName && getItems) {
                     info.name = getName();
@@ -62,11 +65,18 @@ void PluginManager::LoadPlugins(const std::wstring& pluginsDir) {
                     info.OnTextModified = onTextModified;
                     info.Initialize = initialize;
                     info.Shutdown = shutdown;
+                    info.SetHostFunctions = setHostFunctions;
+                    info.GetMaxFileSize = getMaxFileSize;
 
-                    if (info.enabled && info.Initialize) {
-                        std::wstring settingsPath = entry.path().parent_path().wstring() + L"\\settings\\" + info.filename + L".ini";
-                        fs::create_directories(fs::path(settingsPath).parent_path());
-                        info.Initialize(settingsPath.c_str());
+                    if (info.enabled) {
+                        if (info.SetHostFunctions) {
+                            info.SetHostFunctions(&m_hostFunctions);
+                        }
+                        if (info.Initialize) {
+                            std::wstring settingsPath = entry.path().parent_path().wstring() + L"\\settings\\" + info.filename + L".ini";
+                            fs::create_directories(fs::path(settingsPath).parent_path());
+                            info.Initialize(settingsPath.c_str());
+                        }
                     }
                     
                     int count = 0;
@@ -247,16 +257,46 @@ void PluginManager::ExecutePluginCommand(int commandId, HWND hEditor) {
 }
 
 void PluginManager::NotifyFileEvent(const wchar_t* filePath, HWND hEditor, const wchar_t* eventType) {
+    long long fileSize = -1;
+    if (filePath && *filePath) {
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(filePath, GetFileExInfoStandard, &fad)) {
+            LARGE_INTEGER size;
+            size.HighPart = fad.nFileSizeHigh;
+            size.LowPart = fad.nFileSizeLow;
+            fileSize = size.QuadPart;
+        }
+    }
+
     for (const auto& plugin : m_plugins) {
         if (plugin.enabled && plugin.OnFileEvent) {
+            if (fileSize != -1 && plugin.GetMaxFileSize) {
+                long long max = plugin.GetMaxFileSize();
+                if (max > 0 && fileSize > max) continue;
+            }
             plugin.OnFileEvent(filePath, hEditor, eventType);
         }
     }
 }
 
 void PluginManager::NotifyTextModified(HWND hEditor) {
+    long long textSize = -1;
+    
     for (const auto& plugin : m_plugins) {
         if (plugin.enabled && plugin.OnTextModified) {
+            if (plugin.GetMaxFileSize) {
+                long long max = plugin.GetMaxFileSize();
+                if (max > 0) {
+                    if (textSize == -1) {
+                        // Calculate only if needed
+                        GETTEXTLENGTHEX gtl = { GTL_DEFAULT | GTL_PRECISE, 1200 }; 
+                        textSize = SendMessage(hEditor, EM_GETTEXTLENGTHEX, (WPARAM)&gtl, 0);
+                        // Approximate byte size for UTF-16
+                        textSize *= 2;
+                    }
+                    if (textSize > max) continue;
+                }
+            }
             plugin.OnTextModified(hEditor);
         }
     }
@@ -345,13 +385,31 @@ bool PluginManager::TranslateAccelerator(MSG* pMsg) {
 }
 
 bool PluginManager::NotifySaveFile(const wchar_t* filePath, HWND hEditor) {
+    long long textSize = -1;
+
     for (const auto& plugin : m_plugins) {
         if (plugin.enabled && plugin.OnSaveFile) {
+            if (plugin.GetMaxFileSize) {
+                long long max = plugin.GetMaxFileSize();
+                if (max > 0) {
+                    if (textSize == -1) {
+                        GETTEXTLENGTHEX gtl = { GTL_DEFAULT | GTL_PRECISE, 1200 }; 
+                        textSize = SendMessage(hEditor, EM_GETTEXTLENGTHEX, (WPARAM)&gtl, 0);
+                        textSize *= 2;
+                    }
+                    if (textSize > max) continue;
+                }
+            }
+
             if (plugin.OnSaveFile(filePath, hEditor)) {
                 return true;
             }
         }
     }
     return false;
+}
+
+void PluginManager::SetHostFunctions(HostFunctions functions) {
+    m_hostFunctions = functions;
 }
 

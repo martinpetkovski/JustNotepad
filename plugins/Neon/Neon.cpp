@@ -28,6 +28,7 @@ std::wstring g_CurrentFilePath;
 HINSTANCE g_hInst = NULL;
 bool g_bAutoHighlight = true;
 HWND g_hEditor = NULL;
+HostFunctions* g_HostFunctions = nullptr;
 
 // Debounce timer
 UINT_PTR g_TimerId = 0;
@@ -216,46 +217,63 @@ void EnsureWorkerWindow() {
     g_hWorkerWnd = CreateWindowEx(0, L"NeonWorkerWnd", L"NeonWorker", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, g_hInst, NULL);
 }
 
-void HighlightWorker(std::string editorText, HWND hEditor, std::wstring dllDir, int startVersion, std::wstring style, std::wstring font, std::wstring fontSize) {
+void HighlightWorker(std::string editorText, HWND hEditor, std::wstring dllDir, int startVersion, std::wstring style, std::wstring font, std::wstring fontSize, std::wstring sourceFilePath, std::wstring fileExtension) {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+    if (g_HostFunctions && g_HostFunctions->SetProgress) g_HostFunctions->SetProgress(10);
 
     // Check version before starting heavy work
     if (g_TextVersion.load() != startVersion) {
+        if (g_HostFunctions && g_HostFunctions->SetProgress) g_HostFunctions->SetProgress(-1);
         CoUninitialize();
         return;
     }
 
-    // 2. Save to temp file
-    WCHAR tempPath[MAX_PATH];
-    GetTempPathW(MAX_PATH, tempPath);
-    
-    // Create a unique temp file name, preserving extension if possible
-    std::wstring tempFileName = std::wstring(tempPath) + L"jnp_highlight_temp_" + std::to_wstring(GetCurrentThreadId());
-    if (!g_CurrentFilePath.empty()) {
-        LPCWSTR ext = PathFindExtensionW(g_CurrentFilePath.c_str());
-        if (ext) tempFileName += ext;
+    std::wstring inputFileName;
+    bool bUseTemp = false;
+
+    if (!editorText.empty()) {
+        // 2. Save to temp file
+        WCHAR tempPath[MAX_PATH];
+        GetTempPathW(MAX_PATH, tempPath);
+        
+        // Create a unique temp file name, preserving extension if possible
+        inputFileName = std::wstring(tempPath) + L"jnp_highlight_temp_" + std::to_wstring(GetCurrentThreadId());
+        if (!fileExtension.empty()) {
+            inputFileName += fileExtension;
+        } else {
+            inputFileName += L".txt";
+        }
+
+        // Write text to temp file
+        {
+            std::ofstream outFile(inputFileName, std::ios::binary);
+            outFile.write(editorText.c_str(), editorText.size());
+        }
+        bUseTemp = true;
+    } else if (!sourceFilePath.empty()) {
+        inputFileName = sourceFilePath;
     } else {
-        tempFileName += L".txt";
+        if (g_HostFunctions && g_HostFunctions->SetProgress) g_HostFunctions->SetProgress(-1);
+        CoUninitialize();
+        return;
     }
 
-    // Write text to temp file
-    {
-        std::ofstream outFile(tempFileName, std::ios::binary);
-        outFile.write(editorText.c_str(), editorText.size());
-    }
+    if (g_HostFunctions && g_HostFunctions->SetProgress) g_HostFunctions->SetProgress(30);
 
     // 3. Run highlight.exe
     std::wstring exePath = dllDir + L"\\highlight\\highlight.exe";
     
     // Check if exe exists
     if (!PathFileExistsW(exePath.c_str())) {
-        DeleteFileW(tempFileName.c_str());
+        if (bUseTemp) DeleteFileW(inputFileName.c_str());
+        if (g_HostFunctions && g_HostFunctions->SetProgress) g_HostFunctions->SetProgress(-1);
         CoUninitialize();
         return;
     }
 
     // Construct command line: highlight.exe -i <tempFile> --out-format=rtf --style=<style> --font=<font> --font-size=<size> --include-style
-    std::wstring cmdLine = L"\"" + exePath + L"\" -i \"" + tempFileName + L"\" --out-format=rtf --style=\"" + style + L"\" --font=\"" + font + L"\" --font-size=" + fontSize + L" --include-style";
+    std::wstring cmdLine = L"\"" + exePath + L"\" -i \"" + inputFileName + L"\" --out-format=rtf --style=\"" + style + L"\" --font=\"" + font + L"\" --font-size=" + fontSize + L" --include-style";
 
     SECURITY_ATTRIBUTES saAttr;
     saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
@@ -266,7 +284,8 @@ void HighlightWorker(std::string editorText, HWND hEditor, std::wstring dllDir, 
     HANDLE hChildStd_OUT_Wr = NULL;
 
     if (!CreatePipe(&hChildStd_OUT_Rd, &hChildStd_OUT_Wr, &saAttr, 0)) {
-        DeleteFileW(tempFileName.c_str());
+        if (bUseTemp) DeleteFileW(inputFileName.c_str());
+        if (g_HostFunctions && g_HostFunctions->SetProgress) g_HostFunctions->SetProgress(-1);
         CoUninitialize();
         return;
     }
@@ -284,16 +303,37 @@ void HighlightWorker(std::string editorText, HWND hEditor, std::wstring dllDir, 
     if (CreateProcessW(NULL, &cmdLine[0], NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
         CloseHandle(hChildStd_OUT_Wr); // Close write end in parent
 
+        if (g_HostFunctions && g_HostFunctions->SetProgress) g_HostFunctions->SetProgress(50);
+
         // Read output
         std::string rtfOutput;
         DWORD dwRead;
         CHAR chBuf[4096];
         BOOL bSuccess = FALSE;
+        
+        // Estimate total size (rough guess: 5x input size for RTF)
+        size_t estimatedSize = 0;
+        if (!editorText.empty()) estimatedSize = editorText.size() * 5;
+        else {
+            // Get file size
+            WIN32_FILE_ATTRIBUTE_DATA fad;
+            if (GetFileAttributesExW(inputFileName.c_str(), GetFileExInfoStandard, &fad)) {
+                estimatedSize = ((size_t)fad.nFileSizeLow) * 5;
+            }
+        }
+        if (estimatedSize == 0) estimatedSize = 1000;
 
         for (;;) {
             bSuccess = ReadFile(hChildStd_OUT_Rd, chBuf, 4096, &dwRead, NULL);
             if (!bSuccess || dwRead == 0) break;
             rtfOutput.append(chBuf, dwRead);
+            
+            // Update progress (50% to 90%)
+            if (g_HostFunctions && g_HostFunctions->SetProgress) {
+                int p = 50 + (int)((rtfOutput.size() * 40) / estimatedSize);
+                if (p > 89) p = 89;
+                g_HostFunctions->SetProgress(p);
+            }
         }
 
         WaitForSingleObject(pi.hProcess, INFINITE);
@@ -301,10 +341,12 @@ void HighlightWorker(std::string editorText, HWND hEditor, std::wstring dllDir, 
         CloseHandle(pi.hThread);
         CloseHandle(hChildStd_OUT_Rd);
 
+        if (g_HostFunctions && g_HostFunctions->SetProgress) g_HostFunctions->SetProgress(90);
+
         // Check version again before applying
         if (g_TextVersion.load() == startVersion && !rtfOutput.empty()) {
             std::string* pRtf = new std::string(rtfOutput);
-            SendMessage(g_hWorkerWnd, WM_APPLY_HIGHLIGHT, (WPARAM)startVersion, (LPARAM)pRtf);
+            PostMessage(g_hWorkerWnd, WM_APPLY_HIGHLIGHT, (WPARAM)startVersion, (LPARAM)pRtf);
         }
 
     } else {
@@ -312,27 +354,39 @@ void HighlightWorker(std::string editorText, HWND hEditor, std::wstring dllDir, 
         CloseHandle(hChildStd_OUT_Rd);
     }
 
+    if (g_HostFunctions && g_HostFunctions->SetProgress) g_HostFunctions->SetProgress(-1);
+
     CoUninitialize();
-    DeleteFileW(tempFileName.c_str());
+    if (bUseTemp) {
+        DeleteFileW(inputFileName.c_str());
+    }
 }
 
-void HighlightCode(HWND hEditor) {
-    // 1. Get text from editor (UI Thread)
+void HighlightCode(HWND hEditor, const wchar_t* filePath = nullptr) {
+    // 1. Get text from editor (UI Thread) if no file path provided
     std::string editorText;
-    EDITSTREAM es = { 0 };
-    es.dwCookie = (DWORD_PTR)&editorText;
-    es.pfnCallback = EditStreamOutCallback;
-    SendMessage(hEditor, EM_STREAMOUT, SF_TEXT, (LPARAM)&es);
+    if (!filePath) {
+        EDITSTREAM es = { 0 };
+        es.dwCookie = (DWORD_PTR)&editorText;
+        es.pfnCallback = EditStreamOutCallback;
+        SendMessage(hEditor, EM_STREAMOUT, SF_TEXT, (LPARAM)&es);
 
-    if (editorText.empty()) {
-        return;
+        if (editorText.empty()) {
+            return;
+        }
     }
 
     int currentVersion = g_TextVersion.load();
     std::wstring dllDir = GetDllDir();
 
+    std::wstring ext;
+    if (!g_CurrentFilePath.empty()) {
+        LPCWSTR pExt = PathFindExtensionW(g_CurrentFilePath.c_str());
+        if (pExt) ext = pExt;
+    }
+
     // Start worker thread
-    std::thread worker(HighlightWorker, editorText, hEditor, dllDir, currentVersion, g_Style, g_Font, g_FontSize);
+    std::thread worker(HighlightWorker, editorText, hEditor, dllDir, currentVersion, g_Style, g_Font, g_FontSize, filePath ? std::wstring(filePath) : std::wstring(), ext);
     worker.detach();
 }
 
@@ -496,7 +550,7 @@ extern "C" {
 
         if (wcscmp(eventType, L"Loaded") == 0 || wcscmp(eventType, L"Saved") == 0) {
             if (g_bAutoHighlight) {
-                HighlightCode(hEditor);
+                HighlightCode(hEditor, filePath);
             }
         }
     }
@@ -514,6 +568,14 @@ extern "C" {
             }
             g_TimerId = SetTimer(NULL, 0, TIMER_DELAY, TimerProc);
         }
+    }
+
+    PLUGIN_API void SetHostFunctions(HostFunctions* functions) {
+        g_HostFunctions = functions;
+    }
+
+    PLUGIN_API long long GetMaxFileSize() {
+        return 20 * 1024 * 1024; // 20 MB
     }
 }
 

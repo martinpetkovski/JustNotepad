@@ -9,6 +9,10 @@
 
 typedef void (*PluginCallback)(HWND);
 
+struct HostFunctions {
+    void (*SetProgress)(int percent);
+};
+
 struct PluginMenuItem {
     const wchar_t* name;
     PluginCallback callback;
@@ -47,5 +51,11 @@ extern "C" {
 
     // Optional: Called when the plugin is unloaded
     PLUGIN_API void Shutdown();
+
+    // Optional: Called by the host to provide callback functions
+    PLUGIN_API void SetHostFunctions(HostFunctions* functions);
+
+    // Optional: Get maximum supported file size in bytes. Return 0 for no limit.
+    PLUGIN_API long long GetMaxFileSize();
 }
 

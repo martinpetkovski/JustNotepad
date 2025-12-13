@@ -8,7 +8,7 @@
 // Global state
 static HWND g_hEditor = NULL;
 static WNDPROC g_OldEditorProc = NULL;
-static COLORREF g_WhitespaceColor = RGB(150, 150, 150);
+static COLORREF g_WhitespaceColor = RGB(204, 204, 204);
 static HPEN g_hPen = NULL;
 static HBRUSH g_hBrush = NULL;
 static bool g_bIsBinary = false;
@@ -38,70 +38,86 @@ LRESULT CALLBACK EditorSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM 
             RECT rcClient;
             GetClientRect(hwnd, &rcClient);
             
-            // Get visible text range
-            CHARRANGE crVisible;
-            SendMessage(hwnd, EM_GETRECT, 0, (LPARAM)&rcClient);
+            // Set up drawing
+            HPEN hOldPen = (HPEN)SelectObject(hdc, g_hPen);
+            HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, g_hBrush);
+            SetTextColor(hdc, g_WhitespaceColor);
+            SetBkMode(hdc, TRANSPARENT);
             
-            POINTL ptStart = {rcClient.left, rcClient.top};
-            POINTL ptEnd = {rcClient.right, rcClient.bottom};
-            int startChar = (int)SendMessage(hwnd, EM_CHARFROMPOS, 0, (LPARAM)&ptStart);
-            int endChar = (int)SendMessage(hwnd, EM_CHARFROMPOS, 0, (LPARAM)&ptEnd);
+            // Get font size for proper positioning
+            CHARFORMAT2 cf;
+            ZeroMemory(&cf, sizeof(cf));
+            cf.cbSize = sizeof(cf);
+            SendMessage(hwnd, EM_GETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
+            int dotOffset = cf.yHeight / 40;
             
-            if (startChar >= 0 && endChar >= startChar) {
-                // Get the text range
-                int rangeLen = endChar - startChar + 1;
-                if (rangeLen > 0 && rangeLen < 1000000) { // Safety check
-                    static std::vector<wchar_t> buffer;
+            // Iterate visible lines
+            int firstLine = (int)SendMessage(hwnd, EM_GETFIRSTVISIBLELINE, 0, 0);
+            int currentLine = firstLine;
+            
+            static std::vector<wchar_t> buffer;
+
+            while (true) {
+                int lineStartIndex = (int)SendMessage(hwnd, EM_LINEINDEX, currentLine, 0);
+                if (lineStartIndex == -1) break;
+
+                POINTL pt;
+                SendMessage(hwnd, EM_POSFROMCHAR, (WPARAM)&pt, lineStartIndex);
+                
+                if (pt.y > rcClient.bottom) break;
+
+                // Determine visible range on this line
+                POINTL ptLeft = { rcClient.left, pt.y };
+                POINTL ptRight = { rcClient.right, pt.y };
+                
+                int charStart = (int)SendMessage(hwnd, EM_CHARFROMPOS, 0, (LPARAM)&ptLeft);
+                int charEnd = (int)SendMessage(hwnd, EM_CHARFROMPOS, 0, (LPARAM)&ptRight);
+                
+                // Clamp to line bounds
+                int nextLineStart = (int)SendMessage(hwnd, EM_LINEINDEX, currentLine + 1, 0);
+                int lineEndIndex;
+                if (nextLineStart == -1) {
+                    GETTEXTLENGTHEX gtl = { GTL_DEFAULT, 1200 };
+                    lineEndIndex = (int)SendMessage(hwnd, EM_GETTEXTLENGTHEX, (WPARAM)&gtl, 0);
+                } else {
+                    lineEndIndex = nextLineStart - 1;
+                }
+
+                if (charStart < lineStartIndex) charStart = lineStartIndex;
+                if (charEnd > lineEndIndex) charEnd = lineEndIndex;
+
+                int rangeLen = charEnd - charStart + 1;
+                if (rangeLen > 0) {
                     if (buffer.size() < rangeLen + 1) buffer.resize(rangeLen + 1);
                     
                     TEXTRANGE tr;
-                    tr.chrg.cpMin = startChar;
-                    tr.chrg.cpMax = endChar;
+                    tr.chrg.cpMin = charStart;
+                    tr.chrg.cpMax = charEnd;
                     tr.lpstrText = buffer.data();
                     
                     int actualLen = (int)SendMessage(hwnd, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
                     
-                    if (actualLen > 0) {
-                        // Set up drawing
-                        HPEN hOldPen = (HPEN)SelectObject(hdc, g_hPen);
-                        HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, g_hBrush);
-                        SetTextColor(hdc, g_WhitespaceColor);
-                        SetBkMode(hdc, TRANSPARENT);
-                        
-                        // Get font size for proper positioning
-                        CHARFORMAT2 cf;
-                        ZeroMemory(&cf, sizeof(cf));
-                        cf.cbSize = sizeof(cf);
-                        SendMessage(hwnd, EM_GETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
-                        int dotOffset = cf.yHeight / 40;
-                        
-                        // Draw whitespace for each character
-                        for (int i = 0; i < actualLen; i++) {
-                            wchar_t ch = buffer[i];
-                            if (ch == L' ' || ch == L'\t') {
-                                // Get position efficiently
-                                POINTL pt;
-                                SendMessage(hwnd, EM_POSFROMCHAR, (WPARAM)&pt, startChar + i);
-                                
-                                if (ch == L' ') {
-                                    // Draw a small dot
-                                    int centerX = pt.x + 3;
-                                    int centerY = pt.y + dotOffset;
-                                    Ellipse(hdc, centerX - 1, centerY - 1, centerX + 2, centerY + 2);
-                                } else {
-                                    // Draw arrow
-                                    TextOutW(hdc, pt.x + 2, pt.y, L"→", 1);
-                                }
+                    for (int i = 0; i < actualLen; i++) {
+                        wchar_t ch = buffer[i];
+                        if (ch == L' ' || ch == L'\t') {
+                            POINTL ptChar;
+                            SendMessage(hwnd, EM_POSFROMCHAR, (WPARAM)&ptChar, charStart + i);
+                            
+                            if (ch == L' ') {
+                                int centerX = ptChar.x + 3;
+                                int centerY = ptChar.y + dotOffset;
+                                Ellipse(hdc, centerX - 1, centerY - 1, centerX + 2, centerY + 2);
+                            } else {
+                                TextOutW(hdc, ptChar.x + 2, ptChar.y, L"→", 1);
                             }
                         }
-                        
-                        // Clean up
-                        SelectObject(hdc, hOldPen);
-                        SelectObject(hdc, hOldBrush);
                     }
                 }
+                currentLine++;
             }
             
+            SelectObject(hdc, hOldPen);
+            SelectObject(hdc, hOldBrush);
             ReleaseDC(hwnd, hdc);
         }
         
@@ -153,9 +169,9 @@ std::wstring g_SettingsPath;
 extern "C" {
     PLUGIN_API void Initialize(const wchar_t* settingsPath) {
         g_SettingsPath = settingsPath;
-        int r = GetPrivateProfileInt(L"Settings", L"ColorR", 150, g_SettingsPath.c_str());
-        int g = GetPrivateProfileInt(L"Settings", L"ColorG", 150, g_SettingsPath.c_str());
-        int b = GetPrivateProfileInt(L"Settings", L"ColorB", 150, g_SettingsPath.c_str());
+        int r = GetPrivateProfileInt(L"Settings", L"ColorR", 204, g_SettingsPath.c_str());
+        int g = GetPrivateProfileInt(L"Settings", L"ColorG", 204, g_SettingsPath.c_str());
+        int b = GetPrivateProfileInt(L"Settings", L"ColorB", 204, g_SettingsPath.c_str());
         g_WhitespaceColor = RGB(r, g, b);
     }
 

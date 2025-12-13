@@ -124,6 +124,9 @@ struct Document {
     BOOL bPinned;
     FILETIME ftLastWriteTime;
     Encoding currentEncoding;
+    long loadSequence;
+    DWORD fileSize;
+    BOOL isBinary;
 };
 
 HWND hMain;
@@ -149,85 +152,10 @@ std::wstring g_StatusText[7]; // Cache for owner-draw status bar
 
 // Encoding currentEncoding = ENC_UTF8; // Moved to Document
 
-#define IDT_BACKGROUND_LOAD 999
+#define WM_UPDATE_PROGRESS (WM_USER + 200)
 HWND hProgressBarStatus = NULL;
 
-struct BackgroundLoadState {
-    BOOL bActive;
-    HANDLE hFile;
-    HANDLE hMap;
-    LPBYTE pData;
-    DWORD dwTotalSize;
-    DWORD dwCurrentPos;
-    Encoding encoding;
-    std::vector<char> inBuffer;
-    DWORD dwOffset;
-    DWORD dwOriginalEventMask;
-} g_BgLoad;
-
-class ProgressHelper {
-    HWND hProgressDlg;
-    HWND hProgressBar;
-    HWND hParent;
-    
-public:
-    ProgressHelper(HWND parent, const TCHAR* title, int maxRange) : hParent(parent) {
-        if (maxRange >= 5 * 1024 * 1024 && maxRange < 10 * 1024 * 1024) // Only show modal for 5MB <= size < 10MB
-        {
-            hProgressDlg = CreateWindowEx(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, _T("#32770"), title,
-                WS_POPUP | WS_CAPTION | WS_VISIBLE | DS_MODALFRAME, 
-                0, 0, 300, 80, parent, NULL, hInst, NULL);
-                
-            RECT rcParent, rcDlg;
-            GetWindowRect(parent, &rcParent);
-            GetWindowRect(hProgressDlg, &rcDlg);
-            int x = rcParent.left + (rcParent.right - rcParent.left - (rcDlg.right - rcDlg.left)) / 2;
-            int y = rcParent.top + (rcParent.bottom - rcParent.top - (rcDlg.bottom - rcDlg.top)) / 2;
-            SetWindowPos(hProgressDlg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-            
-            hProgressBar = CreateWindowEx(0, PROGRESS_CLASS, NULL, WS_CHILD | WS_VISIBLE,
-                10, 10, 265, 20, hProgressDlg, NULL, hInst, NULL);
-                
-            SendMessage(hProgressBar, PBM_SETRANGE32, 0, maxRange);
-            SendMessage(hProgressBar, PBM_SETSTEP, 1, 0);
-            
-            EnableWindow(parent, FALSE);
-            UpdateWindow(hProgressDlg);
-            
-            MSG msg;
-            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            }
-        }
-        else
-        {
-            hProgressDlg = NULL;
-            hProgressBar = NULL;
-        }
-    }
-    
-    ~ProgressHelper() {
-        if (hProgressDlg)
-        {
-            EnableWindow(hParent, TRUE);
-            DestroyWindow(hProgressDlg);
-            SetFocus(hParent);
-        }
-    }
-    
-    void Update(int pos) {
-        if (hProgressBar)
-        {
-            SendMessage(hProgressBar, PBM_SETPOS, pos, 0);
-            MSG msg;
-            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            }
-        }
-    }
-};
+// Removed g_BgLoad and ProgressHelper
 
 struct StreamContext {
     HANDLE hFile;
@@ -235,7 +163,6 @@ struct StreamContext {
     size_t inBufferPos;
     DWORD dwOffset;
     std::string outBuffer;
-    ProgressHelper* pProgress;
     HWND hProgressBar; // For background load
     DWORD dwTotalSize;
     DWORD dwReadSoFar;
@@ -269,6 +196,7 @@ struct LoadResult {
     std::vector<wchar_t> buffer;
     Encoding encoding;
     BOOL bSuccess;
+    long sequence;
 };
 
 void ParallelConvert(const BYTE* pData, size_t size, Encoding encoding, std::vector<wchar_t>& outBuffer, HWND hMain)
@@ -309,7 +237,8 @@ void ParallelConvert(const BYTE* pData, size_t size, Encoding encoding, std::vec
                 }
                 
                 size_t len = blockEnd - current;
-                UINT cp = (encoding == ENC_UTF8) ? CP_UTF8 : CP_ACP;
+                const EncodingInfo* info = GetEncodingInfo(encoding);
+                UINT cp = info->codePage;
                 
                 int needed = MultiByteToWideChar(cp, 0, (LPCSTR)(pData + current), (int)len, NULL, 0);
                 if (needed > 0) {
@@ -337,12 +266,13 @@ void ParallelConvert(const BYTE* pData, size_t size, Encoding encoding, std::vec
     outBuffer.push_back(0);
 }
 
-void LoadWorker(std::wstring filename, Encoding encoding, HWND hMain)
+void LoadWorker(std::wstring filename, Encoding encoding, HWND hMain, long sequence, BOOL isBinary)
 {
     HANDLE hFile = CreateFile(filename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return;
     
     DWORD size = GetFileSize(hFile, NULL);
+    
     HANDLE hMap = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!hMap) { CloseHandle(hFile); return; }
     
@@ -352,8 +282,14 @@ void LoadWorker(std::wstring filename, Encoding encoding, HWND hMain)
     LoadResult* res = new LoadResult();
     res->encoding = encoding;
     res->bSuccess = TRUE;
+    res->sequence = sequence;
     
-    if (encoding == ENC_UTF16LE) {
+    if (isBinary) {
+        std::wstring msg = L"This file is binary and cannot be displayed in the text editor.\r\nUse the Hex Editor plugin to view the content.";
+        res->buffer.assign(msg.begin(), msg.end());
+        res->buffer.push_back(0);
+    }
+    else if (encoding == ENC_UTF16LE) {
         size_t chars = size / 2;
         res->buffer.resize(chars + 1);
         
@@ -408,9 +344,6 @@ BOOL GetFileLastWriteTime(LPCTSTR pszFile, FILETIME* pft)
 
 void UpdateStreamProgress(StreamContext* ctx, DWORD bytesAdded) {
     ctx->dwReadSoFar += bytesAdded;
-    if (ctx->pProgress) {
-        ctx->pProgress->Update(ctx->dwReadSoFar);
-    }
     if (ctx->hProgressBar) {
         // Update every 256KB or if finished
         if ((ctx->dwReadSoFar & 0x3FFFF) < bytesAdded || ctx->dwReadSoFar >= ctx->dwTotalSize) {
@@ -517,35 +450,13 @@ void DoFileNew()
 BOOL LoadFromFile(LPCTSTR pszFile)
 {
     Document& doc = g_Document;
-
-    // Stop any active background load
-    if (g_BgLoad.bActive)
-    {
-        KillTimer(hMain, IDT_BACKGROUND_LOAD);
-        g_BgLoad.bActive = FALSE;
-        if (g_BgLoad.pData) UnmapViewOfFile(g_BgLoad.pData);
-        if (g_BgLoad.hMap) CloseHandle(g_BgLoad.hMap);
-        CloseHandle(g_BgLoad.hFile);
-        ShowWindow(hProgressBarStatus, SW_HIDE);
-        doc.bLoading = FALSE;
-        
-        // Restore Event Mask
-        SendMessage(doc.hEditor, EM_SETEVENTMASK, 0, g_BgLoad.dwOriginalEventMask);
-        
-        // Restore ReadOnly based on current file attribute
-        DWORD dwAttrs = GetFileAttributes(doc.szFileName);
-        BOOL bReadOnly = (dwAttrs != INVALID_FILE_ATTRIBUTES) && (dwAttrs & FILE_ATTRIBUTE_READONLY);
-        SendMessage(doc.hEditor, EM_SETREADONLY, bReadOnly, 0);
-        
-        // Re-enable ReadOnly menu item
-        HMENU hMenu = GetMenu(hMain);
-        EnableMenuItem(hMenu, ID_FILE_TOGGLEREADONLY, MF_ENABLED);
-    }
+    doc.loadSequence++;
 
     HANDLE hFile = CreateFile(pszFile, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile != INVALID_HANDLE_VALUE)
     {
         DWORD fileSize = GetFileSize(hFile, NULL);
+        doc.fileSize = fileSize;
         
         HANDLE hMap = NULL;
         LPBYTE pData = NULL;
@@ -593,6 +504,11 @@ BOOL LoadFromFile(LPCTSTR pszFile)
                         break;
                     }
                 }
+                
+                if (isBinary)
+                {
+                    doc.currentEncoding = ENC_ANSI;
+                }
             }
         }
         else if (fileSize > 0 && !pData)
@@ -627,21 +543,70 @@ BOOL LoadFromFile(LPCTSTR pszFile)
                             break;
                         }
                     }
+                    
+                    if (isBinary)
+                    {
+                        doc.currentEncoding = ENC_ANSI;
+                    }
                 }
             }
             SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
         }
         
-        // Background Loading for Large Files (> 10MB)
-        BOOL bBackgroundLoad = (fileSize > 10 * 1024 * 1024);
+        if (isBinary)
+        {
+            // Ensure word wrap is disabled for any future text
+            if (bWordWrap)
+            {
+                bWordWrap = FALSE;
+                SendMessage(doc.hEditor, EM_SETTARGETDEVICE, 0, 1);
+                HMENU hMenu = GetMenu(hMain);
+                CheckMenuItem(hMenu, ID_VIEW_WORDWRAP, MF_UNCHECKED);
+            }
+
+            // Do not load any text into the editor. Clear it.
+            SendMessage(doc.hEditor, WM_SETTEXT, 0, (LPARAM)L"");
+
+            // Clean up any mapping/handles before showing modal
+            if (pData) UnmapViewOfFile(pData);
+            if (hMap) CloseHandle(hMap);
+            CloseHandle(hFile);
+
+            // Update document state
+            StringCchCopy(doc.szFileName, MAX_PATH, pszFile);
+            GetFileLastWriteTime(doc.szFileName, &doc.ftLastWriteTime);
+            doc.bIsDirty = FALSE;
+            doc.bLoading = FALSE;
+            doc.isBinary = TRUE;
+
+            // Hide progress bar if visible
+            ShowWindow(hProgressBarStatus, SW_HIDE);
+
+            UpdateTitle();
+            UpdateStatusBar();
+
+            // Notify plugins – Hex Editor will open its modal window
+            g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Loaded");
+
+            return TRUE;
+        }
         
-        ProgressHelper progress(hMain, _T("Loading File..."), fileSize);
+        // Unified Loading Strategy (text files only)
+        // Always use background loading path for files > 4KB (approx 1 screen)
+        // For smaller files, load synchronously but use progress bar
+        
+        BOOL bBackgroundLoad = (fileSize > 4096);
+        
+        // Show Progress Bar
+        SendMessage(hProgressBarStatus, PBM_SETRANGE32, 0, fileSize);
+        SendMessage(hProgressBarStatus, PBM_SETPOS, 0, 0);
+        ShowWindow(hProgressBarStatus, SW_SHOW);
 
         StreamContext ctx = {0};
         ctx.hFile = hFile;
         ctx.dwOffset = 0;
-        ctx.pProgress = bBackgroundLoad ? NULL : &progress; // Don't use modal progress for bg load
-        ctx.dwTotalSize = bBackgroundLoad ? min(64 * 1024, fileSize) : fileSize; // Load first 64KB
+        ctx.hProgressBar = hProgressBarStatus;
+        ctx.dwTotalSize = bBackgroundLoad ? min(4096, fileSize) : fileSize; // Load first 4KB or all
         ctx.dwReadSoFar = 0;
         ctx.hMap = hMap;
         ctx.pData = pData;
@@ -673,16 +638,13 @@ BOOL LoadFromFile(LPCTSTR pszFile)
             if (hMap) CloseHandle(hMap);
             CloseHandle(hFile);
             
-            // Show Progress Bar
-            SendMessage(hProgressBarStatus, PBM_SETRANGE32, 0, fileSize);
-            SendMessage(hProgressBarStatus, PBM_SETPOS, 0, 0);
-            ShowWindow(hProgressBarStatus, SW_SHOW);
-            
             // Start Worker Thread
             std::wstring filename = pszFile;
             Encoding enc = doc.currentEncoding;
-            std::thread([filename, enc](){
-                LoadWorker(filename, enc, hMain);
+            long seq = doc.loadSequence;
+            BOOL bin = isBinary;
+            std::thread([filename, enc, seq, bin](){
+                LoadWorker(filename, enc, hMain, seq, bin);
             }).detach();
             
             // Set ReadOnly while loading
@@ -694,6 +656,8 @@ BOOL LoadFromFile(LPCTSTR pszFile)
             if (hMap) CloseHandle(hMap);
             CloseHandle(hFile);
             doc.bLoading = FALSE;
+            ShowWindow(hProgressBarStatus, SW_HIDE);
+            
             // Ensure event mask is set so we get EN_CHANGE notifications
             SendMessage(doc.hEditor, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE);
         }
@@ -868,6 +832,11 @@ BOOL DoFileSave()
             UpdateTitle();
             g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Saved");
             return TRUE;
+        }
+
+        if (doc.isBinary) {
+            MessageBox(hMain, _T("Cannot save binary files in text mode."), _T("Just Notepad"), MB_ICONWARNING);
+            return FALSE;
         }
 
         HANDLE hFile = CreateFile(doc.szFileName, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1691,9 +1660,9 @@ void UpdateStatusBar()
     const EncodingInfo* info = GetEncodingInfo(doc.currentEncoding);
     long nBytes = 0;
 
-    if (g_BgLoad.bActive)
+    if (doc.bLoading)
     {
-        nBytes = g_BgLoad.dwTotalSize;
+        nBytes = doc.fileSize;
     }
     else
     {
@@ -2456,7 +2425,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             int nCount = 0;
             
             int textLen = SendMessage(hEditor, WM_GETTEXTLENGTH, 0, 0);
-            ProgressHelper progress(hwnd, _T("Replacing..."), textLen);
+            
+            SendMessage(hProgressBarStatus, PBM_SETRANGE32, 0, textLen);
+            SendMessage(hProgressBarStatus, PBM_SETPOS, 0, 0);
+            ShowWindow(hProgressBarStatus, SW_SHOW);
             
             while (FindNextText(lpfr->Flags & ~FR_DOWN)) // Force search down
             {
@@ -2465,8 +2437,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 
                 CHARRANGE cr;
                 SendMessage(hEditor, EM_EXGETSEL, 0, (LPARAM)&cr);
-                progress.Update(cr.cpMax);
+                SendMessage(hProgressBarStatus, PBM_SETPOS, cr.cpMax, 0);
             }
+            ShowWindow(hProgressBarStatus, SW_HIDE);
             TCHAR szMsg[64];
             StringCchPrintf(szMsg, 64, _T("Replaced %d occurrences."), nCount);
             MessageBox(hwnd, szMsg, _T("Replace All"), MB_OK);
@@ -2646,7 +2619,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_LOAD_COMPLETE:
     {
         LoadResult* res = (LoadResult*)lParam;
-        if (res && res->bSuccess)
+        if (res && res->bSuccess && res->sequence == g_Document.loadSequence)
         {
             struct MemStreamContext {
                 LoadResult* res;
@@ -2754,90 +2727,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // Update status bar periodically to reflect plugin status changes
             UpdateStatusBar();
         }
-        else if (wParam == IDT_BACKGROUND_LOAD)
-        {
-            if (g_BgLoad.bActive)
-            {
-                KillTimer(hwnd, IDT_BACKGROUND_LOAD); // One shot - load the rest in one go
-
-                // Load the rest of the file in one go
-                StreamContext ctx = {0};
-                ctx.hFile = g_BgLoad.hFile;
-                ctx.dwOffset = g_BgLoad.dwOffset;
-                ctx.pProgress = NULL; 
-                ctx.hProgressBar = hProgressBarStatus; // Use status bar for progress
-                ctx.dwTotalSize = g_BgLoad.dwTotalSize;
-                ctx.dwReadSoFar = g_BgLoad.dwCurrentPos;
-                ctx.hMap = g_BgLoad.hMap;
-                ctx.pData = g_BgLoad.pData;
-                ctx.dwMapPos = g_BgLoad.dwCurrentPos;
-                ctx.inBuffer = g_BgLoad.inBuffer;
-                
-                EDITSTREAM es = {0};
-                es.dwCookie = (DWORD_PTR)&ctx;
-                es.pfnCallback = StreamInCallback;
-                
-                DWORD dwFormat = SF_TEXT;
-                if (g_BgLoad.encoding == ENC_UTF16LE || g_BgLoad.encoding == ENC_UTF16BE)
-                     dwFormat = SF_TEXT | SF_UNICODE;
-                else
-                {
-                    const EncodingInfo* info = GetEncodingInfo(g_BgLoad.encoding);
-                    dwFormat = SF_TEXT | (info->codePage << 16) | SF_USECODEPAGE;
-                }
-                
-                // Save current state
-                POINT ptScroll;
-                SendMessage(g_Document.hEditor, EM_GETSCROLLPOS, 0, (LPARAM)&ptScroll);
-                CHARRANGE cr;
-                SendMessage(g_Document.hEditor, EM_EXGETSEL, 0, (LPARAM)&cr);
-                
-                // Disable updates to prevent flickering and scrolling
-                SendMessage(g_Document.hEditor, WM_SETREDRAW, FALSE, 0);
-                
-                // Append to end
-                SendMessage(g_Document.hEditor, EM_SETSEL, -1, -1);
-                SendMessage(g_Document.hEditor, EM_STREAMIN, dwFormat | SFF_SELECTION, (LPARAM)&es);
-                
-                // Restore state
-                SendMessage(g_Document.hEditor, EM_EXSETSEL, 0, (LPARAM)&cr);
-                SendMessage(g_Document.hEditor, EM_SETSCROLLPOS, 0, (LPARAM)&ptScroll);
-                
-                SendMessage(g_Document.hEditor, WM_SETREDRAW, TRUE, 0);
-                RedrawWindow(g_Document.hEditor, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW); 
-                
-                // Done
-                g_BgLoad.bActive = FALSE;
-                
-                if (g_BgLoad.pData) UnmapViewOfFile(g_BgLoad.pData);
-                if (g_BgLoad.hMap) CloseHandle(g_BgLoad.hMap);
-                CloseHandle(g_BgLoad.hFile);
-                
+        break;
+    case WM_UPDATE_PROGRESS:
+    {
+        int percent = (int)wParam;
+        if (hProgressBarStatus) {
+            if (percent < 0) {
                 ShowWindow(hProgressBarStatus, SW_HIDE);
-                g_Document.bLoading = FALSE;
-                
-                // Restore Event Mask
-                SendMessage(g_Document.hEditor, EM_SETEVENTMASK, 0, g_BgLoad.dwOriginalEventMask);
-                
-                // Restore ReadOnly based on file attribute
-                DWORD dwAttrs = GetFileAttributes(g_Document.szFileName);
-                BOOL bReadOnly = (dwAttrs != INVALID_FILE_ATTRIBUTES) && (dwAttrs & FILE_ATTRIBUTE_READONLY);
-                SendMessage(g_Document.hEditor, EM_SETREADONLY, bReadOnly, 0);
-                
-                // Notify plugins
-                g_PluginManager.NotifyFileEvent(g_Document.szFileName, g_Document.hEditor, L"Loaded");
-                
-                UpdateStatusBar();
-
-                // Re-enable ReadOnly menu item
-                HMENU hMenu = GetMenu(hwnd);
-                EnableMenuItem(hMenu, ID_FILE_TOGGLEREADONLY, MF_ENABLED);
-                
-                // Restore timer for file changes
-                SetTimer(hwnd, 1, 2000, NULL);
+            } else {
+                // Ensure it's visible and positioned correctly (in case it was hidden during resize)
+                if (!IsWindowVisible(hProgressBarStatus)) {
+                    ShowWindow(hProgressBarStatus, SW_SHOW);
+                    // Trigger resize to ensure position
+                    SendMessage(hwnd, WM_SIZE, 0, 0);
+                }
+                SendMessage(hProgressBarStatus, PBM_SETPOS, percent, 0);
             }
         }
-        break;
+        return 0;
+    }
     case WM_SIZE:
     {
         RECT rcClient;
@@ -2851,6 +2759,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             RECT rcStatus;
             GetWindowRect(hStatus, &rcStatus);
             nStatusHeight = rcStatus.bottom - rcStatus.top;
+
+            // Position Progress Bar in the last part of status bar
+            if (hProgressBarStatus) {
+                RECT rcPart;
+                SendMessage(hStatus, SB_GETRECT, 6, (LPARAM)&rcPart);
+                // Add some padding
+                InflateRect(&rcPart, -2, -2);
+                SetWindowPos(hProgressBarStatus, NULL, rcPart.left, rcPart.top, rcPart.right - rcPart.left, rcPart.bottom - rcPart.top, SWP_NOZORDER);
+            }
         }
 
         if (g_Document.hEditor)
@@ -3313,6 +3230,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
+void SetStatusProgress(int percent) {
+    if (hMain) {
+        SendMessage(hMain, WM_UPDATE_PROGRESS, percent, 0);
+    }
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -3364,6 +3287,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     GetModuleFileName(NULL, szExePath, MAX_PATH);
     PathRemoveFileSpec(szExePath);
     PathAppend(szExePath, _T("plugins"));
+    
+    HostFunctions hostFuncs;
+    hostFuncs.SetProgress = SetStatusProgress;
+    g_PluginManager.SetHostFunctions(hostFuncs);
+    
     g_PluginManager.LoadPlugins(szExePath);
     UpdatePluginsMenu(hwnd);
 

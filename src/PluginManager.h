@@ -36,6 +36,8 @@ struct PluginInfo {
     typedef void (*OnTextModifiedFunc)(HWND);
     typedef void (*InitializeFunc)(const wchar_t*);
     typedef void (*ShutdownFunc)();
+    typedef void (*SetHostFunctionsFunc)(HostFunctions*);
+    typedef long long (*GetMaxFileSizeFunc)();
     
     GetPluginStatusFunc GetPluginStatus;
     OnFileEventFunc OnFileEvent;
@@ -43,6 +45,8 @@ struct PluginInfo {
     OnTextModifiedFunc OnTextModified;
     InitializeFunc Initialize;
     ShutdownFunc Shutdown;
+    SetHostFunctionsFunc SetHostFunctions;
+    GetMaxFileSizeFunc GetMaxFileSize;
 };
 
 struct PluginCommand {
@@ -73,9 +77,12 @@ public:
     
     bool TranslateAccelerator(MSG* pMsg);
 
+    void SetHostFunctions(HostFunctions functions);
+
 private:
     std::vector<PluginInfo> m_plugins;
     std::vector<PluginCallback> m_callbacks; // Map from (CommandID - Base) to Callback
     std::vector<std::wstring> m_enabledPlugins;
+    HostFunctions m_hostFunctions;
 };
 
