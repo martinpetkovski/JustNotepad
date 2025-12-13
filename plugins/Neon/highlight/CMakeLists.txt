@@ -27,16 +27,54 @@ set(GUI_QT_DIR src/gui-qt)
 set(INCLUDE_DIR src/include)
 
 # Include Boost
-find_package(Boost REQUIRED)
-
-# Lua detection
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(LUA lua5.4)
-if (NOT LUA_FOUND)
-    pkg_check_modules(LUA lua)
+find_package(Boost QUIET)
+if(NOT Boost_FOUND)
+    message(STATUS "Boost not found. Fetching Boost headers...")
+    include(FetchContent)
+    FetchContent_Declare(
+        boost
+        URL https://archives.boost.io/release/1.84.0/source/boost_1_84_0.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP ON
+    )
+    FetchContent_MakeAvailable(boost)
+    set(Boost_INCLUDE_DIRS ${boost_SOURCE_DIR})
+    set(Boost_LIBRARIES "") # Header only
 endif()
 
-find_package(Lua REQUIRED)
+# Lua detection
+if(NOT WIN32)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LUA lua5.4)
+    if (NOT LUA_FOUND)
+        pkg_check_modules(LUA lua)
+    endif()
+endif()
+
+find_package(Lua QUIET)
+if(NOT LUA_FOUND)
+    message(STATUS "Lua not found. Fetching Lua source...")
+    include(FetchContent)
+    FetchContent_Declare(
+        lua
+        URL https://www.lua.org/ftp/lua-5.4.6.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP ON
+    )
+    FetchContent_GetProperties(lua)
+    if(NOT lua_POPULATED)
+        FetchContent_Populate(lua)
+        
+        # Build Lua
+        file(GLOB LUA_SOURCES ${lua_SOURCE_DIR}/src/*.c)
+        # Exclude lua.c (interpreter) and luac.c (compiler)
+        list(REMOVE_ITEM LUA_SOURCES "${lua_SOURCE_DIR}/src/lua.c" "${lua_SOURCE_DIR}/src/luac.c")
+        
+        add_library(lua_static STATIC ${LUA_SOURCES})
+        target_include_directories(lua_static PUBLIC ${lua_SOURCE_DIR}/src)
+        
+        set(LUA_INCLUDE_DIRS ${lua_SOURCE_DIR}/src)
+        set(LUA_LIBRARIES lua_static)
+    endif()
+endif()
 
 # Include directories
 include_directories(${Boost_INCLUDE_DIRS} ${INCLUDE_DIR} ${LUA_INCLUDE_DIRS} )
@@ -122,7 +160,11 @@ add_library(highlight-lib STATIC ${CORE_OBJECTS})
 
 # CLI executable
 add_executable(highlight ${CLI_OBJECTS})
-target_link_libraries(highlight highlight-lib ${LUA_LIBRARIES} ${Boost_LIBRARIES} dl)
+if(WIN32)
+    target_link_libraries(highlight highlight-lib ${LUA_LIBRARIES} ${Boost_LIBRARIES})
+else()
+    target_link_libraries(highlight highlight-lib ${LUA_LIBRARIES} ${Boost_LIBRARIES} dl)
+endif()
 set_target_properties(highlight PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Include directories
