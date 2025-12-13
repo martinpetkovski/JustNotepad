@@ -76,6 +76,6 @@ public:
 private:
     std::vector<PluginInfo> m_plugins;
     std::vector<PluginCallback> m_callbacks; // Map from (CommandID - Base) to Callback
-    std::vector<std::wstring> m_disabledPlugins;
+    std::vector<std::wstring> m_enabledPlugins;
 };
 

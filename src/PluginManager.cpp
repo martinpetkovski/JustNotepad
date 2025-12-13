@@ -32,11 +32,11 @@ void PluginManager::LoadPlugins(const std::wstring& pluginsDir) {
                 info.path = entry.path().wstring();
                 info.filename = entry.path().filename().wstring();
                 
-                // Check if disabled
-                info.enabled = true;
-                for (const auto& disabled : m_disabledPlugins) {
-                    if (_wcsicmp(disabled.c_str(), info.filename.c_str()) == 0) {
-                        info.enabled = false;
+                // Check if enabled
+                info.enabled = false;
+                for (const auto& enabled : m_enabledPlugins) {
+                    if (_wcsicmp(enabled.c_str(), info.filename.c_str()) == 0) {
+                        info.enabled = true;
                         break;
                     }
                 }
@@ -141,14 +141,14 @@ void PluginManager::UnloadPlugins() {
 }
 
 void PluginManager::LoadSettings(const std::wstring& iniPath) {
-    m_disabledPlugins.clear();
+    m_enabledPlugins.clear();
     
-    // Read disabled plugins from [DisabledPlugins] section
+    // Read enabled plugins from [EnabledPlugins] section
     // Format: PluginFilename=1
     
     const int bufSize = 4096;
     std::vector<TCHAR> buffer(bufSize);
-    GetPrivateProfileSection(L"DisabledPlugins", buffer.data(), bufSize, iniPath.c_str());
+    GetPrivateProfileSection(L"EnabledPlugins", buffer.data(), bufSize, iniPath.c_str());
     
     TCHAR* p = buffer.data();
     while (*p) {
@@ -158,7 +158,7 @@ void PluginManager::LoadSettings(const std::wstring& iniPath) {
             std::wstring key = line.substr(0, eq);
             std::wstring val = line.substr(eq + 1);
             if (val == L"1") {
-                m_disabledPlugins.push_back(key);
+                m_enabledPlugins.push_back(key);
             }
         }
         p += line.length() + 1;
@@ -167,30 +167,30 @@ void PluginManager::LoadSettings(const std::wstring& iniPath) {
 
 void PluginManager::SaveSettings(const std::wstring& iniPath) {
     // Clear section first
-    WritePrivateProfileSection(L"DisabledPlugins", NULL, iniPath.c_str());
+    WritePrivateProfileSection(L"EnabledPlugins", NULL, iniPath.c_str());
     
-    for (const auto& name : m_disabledPlugins) {
-        WritePrivateProfileString(L"DisabledPlugins", name.c_str(), L"1", iniPath.c_str());
+    for (const auto& name : m_enabledPlugins) {
+        WritePrivateProfileString(L"EnabledPlugins", name.c_str(), L"1", iniPath.c_str());
     }
 }
 
 void PluginManager::SetPluginEnabled(const std::wstring& filename, bool enabled) {
-    if (enabled) {
-        // Remove from disabled list
-        auto it = std::remove_if(m_disabledPlugins.begin(), m_disabledPlugins.end(), 
+    if (!enabled) {
+        // Remove from enabled list
+        auto it = std::remove_if(m_enabledPlugins.begin(), m_enabledPlugins.end(), 
             [&](const std::wstring& s) { return _wcsicmp(s.c_str(), filename.c_str()) == 0; });
-        m_disabledPlugins.erase(it, m_disabledPlugins.end());
+        m_enabledPlugins.erase(it, m_enabledPlugins.end());
     } else {
-        // Add to disabled list if not present
+        // Add to enabled list if not present
         bool found = false;
-        for (const auto& s : m_disabledPlugins) {
+        for (const auto& s : m_enabledPlugins) {
             if (_wcsicmp(s.c_str(), filename.c_str()) == 0) {
                 found = true;
                 break;
             }
         }
         if (!found) {
-            m_disabledPlugins.push_back(filename);
+            m_enabledPlugins.push_back(filename);
         }
     }
 

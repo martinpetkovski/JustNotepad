@@ -14,15 +14,6 @@ $BuildDir = Join-Path $Root 'build'
 # Ensure no running instance blocks linking
 Get-Process "Just Notepad" -ErrorAction SilentlyContinue | Stop-Process -Force
 
-# Clean build folder
-if (Test-Path $BuildDir) {
-    Write-Host "Cleaning build directory..." -ForegroundColor Yellow
-    Remove-Item -Recurse -Force $BuildDir
-}
-
-# Create build folder
-if (-not (Test-Path $BuildDir)) { New-Item -ItemType Directory -Path $BuildDir | Out-Null }
-
 # Check for CMake
 if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
     $cmakePaths = @(
@@ -44,6 +35,11 @@ if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
     }
 }
 
+# Create build folder if it doesn't exist
+if (-not (Test-Path $BuildDir)) { 
+    New-Item -ItemType Directory -Path $BuildDir | Out-Null 
+}
+
 # Determine generator if not specified
 if (-not $Generator) {
     # Prefer Ninja if available, else Visual Studio
@@ -54,14 +50,19 @@ if (-not $Generator) {
 
 Write-Host "Using generator: $Generator; Configuration: $Configuration"
 
-# Configure
+# Configure and Build
 Push-Location $BuildDir
 try {
-    # Configure
-    cmake -G "$Generator" -DCMAKE_BUILD_TYPE=$Configuration "$Root"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "CMake configure failed (exit code $LASTEXITCODE)." -ForegroundColor Red
-        exit $LASTEXITCODE
+    # Only configure if CMakeCache.txt is missing
+    if (-not (Test-Path "CMakeCache.txt")) {
+        Write-Host "Configuring CMake..." -ForegroundColor Yellow
+        cmake -G "$Generator" -DCMAKE_BUILD_TYPE=$Configuration "$Root"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "CMake configure failed (exit code $LASTEXITCODE)." -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "Skipping configuration (CMakeCache.txt exists). Building changes only..." -ForegroundColor Yellow
     }
 
     # Build
