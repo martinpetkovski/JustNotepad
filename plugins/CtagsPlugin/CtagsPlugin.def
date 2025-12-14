@@ -1,0 +1,14 @@
+LIBRARY CtagsPlugin
+EXPORTS
+    GetPluginName
+    GetPluginDescription
+    GetPluginVersion
+    GetPluginStatus
+    GetPluginMenuItems
+    OnFileEvent
+    OnSaveFile
+    OnTextModified
+    Initialize
+    Shutdown
+    SetHostFunctions
+    GetMaxFileSize

@@ -3,6 +3,7 @@ project(JustNotepad LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Windows-specific definitions
 add_definitions(-DUNICODE -D_UNICODE)
@@ -56,6 +57,7 @@ endif()
 add_test(NAME PluginTests COMMAND PluginTests)
 
 add_subdirectory(plugins/HelloPlugin)
+add_subdirectory(plugins/CtagsPlugin)
 add_subdirectory(plugins/DateTimePlugin)
 add_subdirectory(plugins/GuidPlugin)
 add_subdirectory(plugins/EmojiPlugin)
@@ -72,6 +74,9 @@ add_subdirectory(plugins/CharacterMapPlugin)
 add_subdirectory(plugins/ThemeSwitcherPlugin)
 add_subdirectory(plugins/WhitespaceVisualizerPlugin)
 add_subdirectory(plugins/JsonViewerPlugin)
+add_subdirectory(plugins/CppToolsPlugin)
+
+
 
 
 

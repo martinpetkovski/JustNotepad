@@ -1,4 +1,4 @@
-﻿#include "PluginManager.h"
+﻿ï»¿Ã¯Â»Â¿ÃƒÂ¯Ã‚Â»Ã‚Â¿ÃƒÆ’Ã‚Â¯Ãƒâ€šÃ‚Â»Ãƒâ€šÃ‚Â¿#include "PluginManager.h"
 #include "resource.h"
 #include <filesystem>
 #include <algorithm>
@@ -18,7 +18,6 @@ void PluginManager::LoadPlugins(const std::wstring& pluginsDir) {
     UnloadPlugins();
 
     if (!fs::exists(pluginsDir)) {
-        MessageBoxW(NULL, (L"Plugins directory not found: " + pluginsDir).c_str(), L"Debug", MB_OK);
         return;
     }
 
@@ -42,9 +41,16 @@ void PluginManager::LoadPlugins(const std::wstring& pluginsDir) {
                     }
                 }
 
+                // Auto-enable CppToolsPlugin
+                if (!info.enabled && _wcsicmp(info.filename.c_str(), L"CppToolsPlugin.dll") == 0) {
+                    info.enabled = true;
+                    m_enabledPlugins.push_back(info.filename);
+                }
+
                 auto getName = (PluginInfo::GetPluginNameFunc)GetProcAddress(hModule, "GetPluginName");
                 auto getDesc = (PluginInfo::GetPluginDescriptionFunc)GetProcAddress(hModule, "GetPluginDescription");
                 auto getVer = (PluginInfo::GetPluginVersionFunc)GetProcAddress(hModule, "GetPluginVersion");
+                auto getLic = (PluginInfo::GetPluginLicenseFunc)GetProcAddress(hModule, "GetPluginLicense");
                 auto getStatus = (PluginInfo::GetPluginStatusFunc)GetProcAddress(hModule, "GetPluginStatus");
                 auto getItems = (PluginInfo::GetPluginMenuItemsFunc)GetProcAddress(hModule, "GetPluginMenuItems");
                 auto onFileEvent = (PluginInfo::OnFileEventFunc)GetProcAddress(hModule, "OnFileEvent");
@@ -54,11 +60,13 @@ void PluginManager::LoadPlugins(const std::wstring& pluginsDir) {
                 auto shutdown = (PluginInfo::ShutdownFunc)GetProcAddress(hModule, "Shutdown");
                 auto setHostFunctions = (PluginInfo::SetHostFunctionsFunc)GetProcAddress(hModule, "SetHostFunctions");
                 auto getMaxFileSize = (PluginInfo::GetMaxFileSizeFunc)GetProcAddress(hModule, "GetMaxFileSize");
+                
 
                 if (getName && getItems) {
                     info.name = getName();
                     if (getDesc) info.description = getDesc();
                     if (getVer) info.version = getVer();
+                    if (getLic) info.license = getLic();
                     info.GetPluginStatus = getStatus;
                     info.OnFileEvent = onFileEvent;
                     info.OnSaveFile = onSaveFile;
@@ -338,6 +346,8 @@ static bool ParseShortcut(const std::wstring& shortcut, UINT& key, UINT& modifie
         key = VK_PRIOR;
     } else if (s == L"PGDN" || s == L"PAGEDOWN") {
         key = VK_NEXT;
+    } else if (s == L"SPACE") {
+        key = VK_SPACE;
     }
     
     return key != 0;

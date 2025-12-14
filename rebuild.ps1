@@ -11,6 +11,14 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BuildDir = Join-Path $Root 'build'
 
+# Download Dependencies
+Write-Host "Checking for dependencies..." -ForegroundColor Cyan
+$dependencyScripts = Get-ChildItem -Path (Join-Path $Root "plugins") -Recurse -Filter "download_*.ps1"
+foreach ($script in $dependencyScripts) {
+    Write-Host "Running dependency script: $($script.Name)" -ForegroundColor Cyan
+    & $script.FullName
+}
+
 # Ensure no running instance blocks linking
 Get-Process "Just Notepad" -ErrorAction SilentlyContinue | Stop-Process -Force
 

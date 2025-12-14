@@ -130,6 +130,10 @@ LRESULT CALLBACK WorkerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             // Disable redraw to prevent flickering
             SendMessage(g_hEditor, WM_SETREDRAW, FALSE, 0);
 
+            // Disable events to prevent EN_CHANGE and other notifications
+            DWORD eventMask = SendMessage(g_hEditor, EM_GETEVENTMASK, 0, 0);
+            SendMessage(g_hEditor, EM_SETEVENTMASK, 0, eventMask & ~ENM_CHANGE);
+
             IRichEditOle* pOle = NULL;
             SendMessage(g_hEditor, EM_GETOLEINTERFACE, 0, (LPARAM)&pOle);
             ITextDocument* pDoc = NULL;
@@ -193,6 +197,9 @@ LRESULT CALLBACK WorkerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             SendMessage(g_hEditor, EM_EXSETSEL, 0, (LPARAM)&cr);
             SendMessage(g_hEditor, EM_SETSCROLLPOS, 0, (LPARAM)&pt);
             
+            // Restore event mask
+            SendMessage(g_hEditor, EM_SETEVENTMASK, 0, eventMask);
+
             SendMessage(g_hEditor, WM_SETREDRAW, TRUE, 0);
             InvalidateRect(g_hEditor, NULL, TRUE);
 
@@ -506,6 +513,14 @@ extern "C" {
     PLUGIN_API const wchar_t* GetPluginName() { return L"Neon"; }
     PLUGIN_API const wchar_t* GetPluginDescription() { return L"Highlights code using Andre Simon's Highlight tool."; }
     PLUGIN_API const wchar_t* GetPluginVersion() { return L"1.4"; }
+
+    PLUGIN_API const wchar_t* GetPluginLicense() {
+        return L"MIT License\n\n"
+               L"Copyright (c) 2025 Just Notepad Contributors\n\n"
+               L"Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\n\n"
+               L"The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\n\n"
+               L"THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO, THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.";
+    }
 
     PLUGIN_API const wchar_t* GetPluginStatus(const wchar_t* filePath) {
         return L"Neon: Active";

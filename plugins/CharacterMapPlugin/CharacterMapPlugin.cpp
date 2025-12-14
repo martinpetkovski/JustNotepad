@@ -385,6 +385,14 @@ extern "C" {
         return L"1.0";
     }
 
+    PLUGIN_API const wchar_t* GetPluginLicense() {
+        return L"MIT License\n\n"
+               L"Copyright (c) 2025 Just Notepad Contributors\n\n"
+               L"Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\n\n"
+               L"The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\n\n"
+               L"THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO, THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.";
+    }
+
     void OpenCharacterMap(HWND hEditorWnd) {
         INT_PTR result = DialogBox(g_hInst, MAKEINTRESOURCE(IDD_CHARMAP), hEditorWnd, CharMapDlgProc);
         if (result != -1) {

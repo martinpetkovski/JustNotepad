@@ -11,6 +11,9 @@ typedef void (*PluginCallback)(HWND);
 
 struct HostFunctions {
     void (*SetProgress)(int percent);
+    void (*SaveFile)();
+    void (*OpenFile)(const wchar_t* filePath);
+    void (*GetCurrentFilePath)(wchar_t* buffer, int length);
 };
 
 struct PluginMenuItem {
@@ -28,6 +31,9 @@ extern "C" {
     
     // Function to get the plugin version
     PLUGIN_API const wchar_t* GetPluginVersion();
+
+    // Function to get the plugin license
+    PLUGIN_API const wchar_t* GetPluginLicense();
 
     // Function to get the status string for a specific file (optional)
     // Returns NULL or empty string if the plugin has no status for this file

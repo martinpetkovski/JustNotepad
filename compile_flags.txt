@@ -1,0 +1,6 @@
+-xc++
+-std=c++17
+-DUNICODE
+-D_UNICODE
+-IC:\Projects\JustNotepad\src
+-IC:\Projects\JustNotepad\plugins

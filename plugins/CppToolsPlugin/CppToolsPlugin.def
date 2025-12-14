@@ -1,0 +1,8 @@
+LIBRARY CppToolsPlugin
+EXPORTS
+    GetPluginName
+    GetPluginDescription
+    GetPluginVersion
+    GetPluginLicense
+    GetPluginMenuItems
+    SetHostFunctions

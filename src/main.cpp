@@ -279,6 +279,16 @@ void LoadWorker(std::wstring filename, Encoding encoding, HWND hMain, long seque
     const BYTE* pData = (const BYTE*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
     if (!pData) { CloseHandle(hMap); CloseHandle(hFile); return; }
     
+    // Skip BOM
+    size_t offset = 0;
+    if (size >= 3 && pData[0] == 0xEF && pData[1] == 0xBB && pData[2] == 0xBF) {
+        if (encoding == ENC_UTF8) offset = 3;
+    } else if (size >= 2 && pData[0] == 0xFF && pData[1] == 0xFE) {
+        if (encoding == ENC_UTF16LE) offset = 2;
+    } else if (size >= 2 && pData[0] == 0xFE && pData[1] == 0xFF) {
+        if (encoding == ENC_UTF16BE) offset = 2;
+    }
+
     LoadResult* res = new LoadResult();
     res->encoding = encoding;
     res->bSuccess = TRUE;
@@ -290,23 +300,23 @@ void LoadWorker(std::wstring filename, Encoding encoding, HWND hMain, long seque
         res->buffer.push_back(0);
     }
     else if (encoding == ENC_UTF16LE) {
-        size_t chars = size / 2;
+        size_t chars = (size - offset) / 2;
         res->buffer.resize(chars + 1);
         
         // Chunked copy for progress
         size_t copied = 0;
         size_t step = 1024 * 1024; // 1MB
-        while(copied < size) {
-            size_t chunk = min(step, size - copied);
-            memcpy((BYTE*)res->buffer.data() + copied, pData + copied, chunk);
+        while(copied < (size - offset)) {
+            size_t chunk = min(step, (size - offset) - copied);
+            memcpy((BYTE*)res->buffer.data() + copied, pData + offset + copied, chunk);
             copied += chunk;
             PostMessage(hMain, WM_LOAD_PROGRESS, (WPARAM)copied, 0);
         }
         res->buffer[chars] = 0;
     } else if (encoding == ENC_UTF16BE) {
-        size_t chars = size / 2;
+        size_t chars = (size - offset) / 2;
         res->buffer.resize(chars + 1);
-        const WORD* src = (const WORD*)pData;
+        const WORD* src = (const WORD*)(pData + offset);
         
         size_t processed = 0;
         size_t step = 512 * 1024; // 512K chars
@@ -321,7 +331,7 @@ void LoadWorker(std::wstring filename, Encoding encoding, HWND hMain, long seque
         }
         res->buffer[chars] = 0;
     } else {
-        ParallelConvert(pData, size, encoding, res->buffer, hMain);
+        ParallelConvert(pData + offset, size - offset, encoding, res->buffer, hMain);
     }
     
     UnmapViewOfFile(pData);
@@ -473,6 +483,7 @@ BOOL LoadFromFile(LPCTSTR pszFile)
         // Check for binary and encoding
         BOOL isBinary = FALSE;
         doc.currentEncoding = ENC_ANSI; // Default fallback
+        int bomSize = 0;
 
         if (pData && fileSize > 0)
         {
@@ -480,14 +491,17 @@ BOOL LoadFromFile(LPCTSTR pszFile)
             if (fileSize >= 3 && pData[0] == 0xEF && pData[1] == 0xBB && pData[2] == 0xBF)
             {
                 doc.currentEncoding = ENC_UTF8;
+                bomSize = 3;
             }
             else if (fileSize >= 2 && pData[0] == 0xFF && pData[1] == 0xFE)
             {
                 doc.currentEncoding = ENC_UTF16LE;
+                bomSize = 2;
             }
             else if (fileSize >= 2 && pData[0] == 0xFE && pData[1] == 0xFF)
             {
                 doc.currentEncoding = ENC_UTF16BE;
+                bomSize = 2;
             }
             else
             {
@@ -522,14 +536,17 @@ BOOL LoadFromFile(LPCTSTR pszFile)
                 if (read >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF)
                 {
                     doc.currentEncoding = ENC_UTF8;
+                    bomSize = 3;
                 }
                 else if (read >= 2 && buf[0] == 0xFF && buf[1] == 0xFE)
                 {
                     doc.currentEncoding = ENC_UTF16LE;
+                    bomSize = 2;
                 }
                 else if (read >= 2 && buf[0] == 0xFE && buf[1] == 0xFF)
                 {
                     doc.currentEncoding = ENC_UTF16BE;
+                    bomSize = 2;
                 }
                 else
                 {
@@ -550,7 +567,7 @@ BOOL LoadFromFile(LPCTSTR pszFile)
                     }
                 }
             }
-            SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
+            SetFilePointer(hFile, bomSize, NULL, FILE_BEGIN);
         }
         
         if (isBinary)
@@ -615,7 +632,7 @@ BOOL LoadFromFile(LPCTSTR pszFile)
         ctx.dwReadSoFar = 0;
         ctx.hMap = hMap;
         ctx.pData = pData;
-        ctx.dwMapPos = 0;
+        ctx.dwMapPos = bomSize;
         
         doc.bLoading = TRUE;
         EDITSTREAM es = {0};
@@ -1136,6 +1153,7 @@ INT_PTR CALLBACK ManagePluginsDlgProc(HWND hDlg, UINT message, WPARAM wParam, LP
                             const auto& plugins = g_PluginManager.GetPlugins();
                             if (originalIdx >= 0 && originalIdx < (int)plugins.size()) {
                                 SetDlgItemText(hDlg, IDC_MANAGE_PLUGINS_DESC, plugins[originalIdx].description.c_str());
+                                SetDlgItemText(hDlg, IDC_MANAGE_PLUGINS_LICENSE, plugins[originalIdx].license.c_str());
                             }
                         }
                         
@@ -1267,6 +1285,9 @@ void SaveConfig()
 
     BOOL bStatusBar = IsWindowVisible(hStatus);
     WritePrivateProfileString(_T("Settings"), _T("StatusBar"), bStatusBar ? _T("1") : _T("0"), szConfigPath);
+
+    // Save Plugin Settings
+    g_PluginManager.SaveSettings(szConfigPath);
 
     // Recent Files
     for (int i = 0; i < 10; i++)
@@ -1452,29 +1473,54 @@ LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 
                 if ((cr.cpMin - lineStart) >= (long)currentIndent.length())
                 {
+                    // Check if cursor is at the end of the line (ignoring newline chars)
+                    long lineLen = SendMessage(hwnd, EM_LINELENGTH, cr.cpMin, 0);
+                    bool atEndOfLine = (cr.cpMin >= lineStart + lineLen);
+
                     std::basic_string<TCHAR> targetIndent;
-                    long targetLineIdx = lineIdx + 1;
                     
-                    if (targetLineIdx < lineCount)
-                    {
-                        *(WORD*)buffer = BUF_SIZE - 1;
-                        copied = (int)SendMessage(hwnd, EM_GETLINE, targetLineIdx, (LPARAM)buffer);
-                        if (copied > 0)
+                    if (atEndOfLine) {
+                        // Cursor is at the end: Search forward for a non-empty line
+                        long targetLineIdx = lineIdx + 1;
+                        while (targetLineIdx < lineCount)
                         {
-                            if (copied >= BUF_SIZE) copied = BUF_SIZE - 1;
-                            buffer[copied] = 0;
-                            for (int i = 0; i < copied; i++)
+                            *(WORD*)buffer = BUF_SIZE - 1;
+                            int copied = (int)SendMessage(hwnd, EM_GETLINE, targetLineIdx, (LPARAM)buffer);
+                            if (copied > 0)
                             {
-                                TCHAR c = buffer[i];
-                                if (c == ' ' || c == '\t')
-                                    targetIndent += c;
-                                else
-                                    break;
+                                if (copied >= BUF_SIZE) copied = BUF_SIZE - 1;
+                                buffer[copied] = 0;
+                                
+                                bool isEmpty = true;
+                                for (int i = 0; i < copied; i++) {
+                                    if (buffer[i] != ' ' && buffer[i] != '\t' && buffer[i] != '\r' && buffer[i] != '\n') {
+                                        isEmpty = false;
+                                        break;
+                                    }
+                                }
+                                
+                                if (!isEmpty) {
+                                    // Found a non-empty line, extract indentation
+                                    for (int i = 0; i < copied; i++)
+                                    {
+                                        TCHAR c = buffer[i];
+                                        if (c == ' ' || c == '\t')
+                                            targetIndent += c;
+                                        else
+                                            break;
+                                    }
+                                    break; // Stop searching
+                                }
                             }
+                            targetLineIdx++;
                         }
-                    }
-                    else
-                    {
+                        
+                        if (targetIndent.empty() && targetLineIdx >= lineCount)
+                        {
+                            targetIndent = currentIndent;
+                        }
+                    } else {
+                        // Cursor is in the middle: Use current line's indentation
                         targetIndent = currentIndent;
                     }
                     
@@ -3321,6 +3367,21 @@ void SetStatusProgress(int percent) {
     }
 }
 
+void Host_SaveFile() {
+    SendMessage(hMain, WM_COMMAND, ID_FILE_SAVE, 0);
+}
+
+void Host_OpenFile(const wchar_t* filePath) {
+    LoadFromFile(filePath);
+    AddRecentFile(filePath);
+}
+
+void Host_GetCurrentFilePath(wchar_t* buffer, int length) {
+    if (buffer && length > 0) {
+        StringCchCopyW(buffer, length, g_Document.szFileName);
+    }
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -3375,6 +3436,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     HostFunctions hostFuncs;
     hostFuncs.SetProgress = SetStatusProgress;
+    hostFuncs.SaveFile = Host_SaveFile;
+    hostFuncs.OpenFile = Host_OpenFile;
+    hostFuncs.GetCurrentFilePath = Host_GetCurrentFilePath;
     g_PluginManager.SetHostFunctions(hostFuncs);
     
     g_PluginManager.LoadPlugins(szExePath);

@@ -1,0 +1,1 @@
+#define IDI_PLUGIN_ICON 101
