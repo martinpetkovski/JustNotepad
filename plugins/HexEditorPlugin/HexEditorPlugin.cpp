@@ -140,6 +140,28 @@ static void PaintHex(HWND hWnd, HexViewState* st)
     EndPaint(hWnd, &ps);
 }
 
+static void EnsureCache(HWND hDlg, HexViewState* st)
+{
+    if (st->cacheSize && st->selOffset >= st->cacheStart && st->selOffset < (st->cacheStart + st->cacheSize)) {
+        return;
+    }
+    // Save if dirty
+    if (st->dirty && st->cacheSize) {
+        SetFilePointer(st->hFile, st->cacheStart, NULL, FILE_BEGIN);
+        DWORD written = 0; WriteFile(st->hFile, st->cache.data(), st->cacheSize, &written, NULL);
+        st->dirty = false;
+    }
+    // Load new window
+    DWORD windowStart = (st->selOffset / 4096) * 4096;
+    DWORD remain = (st->totalSize > windowStart) ? (st->totalSize - windowStart) : 0;
+    DWORD windowSize = (remain < 4096) ? remain : 4096;
+    st->cache.resize(windowSize);
+    st->cacheStart = windowStart; st->cacheSize = windowSize;
+    SetFilePointer(st->hFile, windowStart, NULL, FILE_BEGIN);
+    DWORD read = 0; ReadFile(st->hFile, st->cache.data(), windowSize, &read, NULL);
+    InvalidateRect(hDlg, NULL, TRUE);
+}
+
 static INT_PTR CALLBACK HexViewDlg(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     HexViewState* st = (HexViewState*)GetWindowLongPtr(hDlg, GWLP_USERDATA);
@@ -163,8 +185,13 @@ static INT_PTR CALLBACK HexViewDlg(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lP
         SetFocus(hDlg);
         return FALSE;
     }
+    case WM_GETDLGCODE: {
+        SetWindowLongPtr(hDlg, DWLP_MSGRESULT, DLGC_WANTALLKEYS | DLGC_WANTCHARS);
+        return TRUE;
+    }
     case WM_LBUTTONDOWN: {
         if (!st) break;
+        SetFocus(hDlg);
         POINTS pts = MAKEPOINTS(lParam);
         POINT pt{ pts.x, pts.y };
         // Map y to line
@@ -194,70 +221,64 @@ static INT_PTR CALLBACK HexViewDlg(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lP
                 // Determine nibble from click position within the two cells
                 int nibbleRel = rel - (idx * 3 + (idx >= 8 ? 1 : 0));
                 st->selNibble = (nibbleRel <= 0) ? 0 : 1;
-                // Ensure cache covers this selection (cache 4KB window around selection)
-                DWORD windowStart = (sel / 4096) * 4096;
-                DWORD remain = (st->totalSize > windowStart) ? (st->totalSize - windowStart) : 0;
-                DWORD windowSize = (remain < 4096) ? remain : 4096;
-                st->cache.resize(windowSize);
-                st->cacheStart = windowStart; st->cacheSize = windowSize;
-                SetFilePointer(st->hFile, windowStart, NULL, FILE_BEGIN);
-                DWORD read = 0; ReadFile(st->hFile, st->cache.data(), windowSize, &read, NULL);
-                InvalidateRect(hDlg, NULL, TRUE);
+                // Ensure cache covers this selection
+                EnsureCache(hDlg, st);
             }
         }
+        InvalidateRect(hDlg, NULL, TRUE);
         return TRUE;
     }
-    case WM_CHAR: {
-        if (!st || !st->hasSelection) break;
-        wchar_t ch = (wchar_t)wParam;
-        int val = -1;
-        if (ch >= L'0' && ch <= L'9') val = ch - L'0';
-        else if (ch >= L'a' && ch <= L'f') val = 10 + (ch - L'a');
-        else if (ch >= L'A' && ch <= L'F') val = 10 + (ch - L'A');
-        if (val >= 0) {
-            // Read current byte
-            // Read/modify from cache
-            BYTE b = 0; DWORD read = 1;
-            if (st->cacheSize && st->selOffset >= st->cacheStart && st->selOffset < (st->cacheStart + st->cacheSize)) {
-                DWORD cacheIndex = st->selOffset - st->cacheStart;
-                b = st->cache[cacheIndex];
-                if (st->selNibble == 0) { b = (BYTE)((b & 0x0F) | (val << 4)); st->selNibble = 1; }
-                else { b = (BYTE)((b & 0xF0) | val); st->selNibble = 0; /* advance to next byte */ if (st->selOffset + 1 < st->totalSize) st->selOffset++; }
-                st->cache[cacheIndex] = b;
-                st->dirty = true;
-                InvalidateRect(hDlg, NULL, TRUE);
-            }
-            return TRUE;
-        }
-        return FALSE;
-    }
+    // WM_CHAR removed as it is handled in WM_KEYDOWN
     case WM_KEYDOWN: {
         if (!st) break;
+
+        // Handle Hex Input
+        if (st->hasSelection) {
+            int val = -1;
+            if (wParam >= '0' && wParam <= '9') val = wParam - '0';
+            else if (wParam >= 'A' && wParam <= 'F') val = 10 + (wParam - 'A');
+            else if (wParam >= VK_NUMPAD0 && wParam <= VK_NUMPAD9) val = wParam - VK_NUMPAD0;
+            
+            if (val >= 0) {
+                EnsureCache(hDlg, st);
+                if (st->cacheSize && st->selOffset >= st->cacheStart && st->selOffset < (st->cacheStart + st->cacheSize)) {
+                    DWORD cacheIndex = st->selOffset - st->cacheStart;
+                    BYTE b = st->cache[cacheIndex];
+                    if (st->selNibble == 0) { b = (BYTE)((b & 0x0F) | (val << 4)); st->selNibble = 1; }
+                    else { b = (BYTE)((b & 0xF0) | val); st->selNibble = 0; /* advance to next byte */ if (st->selOffset + 1 < st->totalSize) st->selOffset++; }
+                    st->cache[cacheIndex] = b;
+                    st->dirty = true;
+                    InvalidateRect(hDlg, NULL, TRUE);
+                }
+                return TRUE;
+            }
+        }
+
         switch (wParam) {
             case VK_LEFT:
                 if (st->hasSelection && st->selNibble == 1) st->selNibble = 0;
                 else if (st->hasSelection && st->selOffset > 0) { st->selOffset--; st->selNibble = 1; }
-                InvalidateRect(hDlg, NULL, TRUE); return TRUE;
+                EnsureCache(hDlg, st); InvalidateRect(hDlg, NULL, TRUE); return TRUE;
             case VK_RIGHT:
                 if (st->hasSelection && st->selNibble == 0) st->selNibble = 1;
                 else if (st->hasSelection && st->selOffset + 1 < st->totalSize) { st->selOffset++; st->selNibble = 0; }
-                InvalidateRect(hDlg, NULL, TRUE); return TRUE;
+                EnsureCache(hDlg, st); InvalidateRect(hDlg, NULL, TRUE); return TRUE;
             case VK_UP:
                 if (st->hasSelection && st->selOffset >= kBytesPerLine) st->selOffset -= kBytesPerLine;
-                InvalidateRect(hDlg, NULL, TRUE); return TRUE;
+                EnsureCache(hDlg, st); InvalidateRect(hDlg, NULL, TRUE); return TRUE;
             case VK_DOWN:
                 if (st->hasSelection && st->selOffset + kBytesPerLine < st->totalSize) st->selOffset += kBytesPerLine;
-                InvalidateRect(hDlg, NULL, TRUE); return TRUE;
+                EnsureCache(hDlg, st); InvalidateRect(hDlg, NULL, TRUE); return TRUE;
             case VK_HOME:
                 if (st->hasSelection) st->selOffset = (st->selOffset / kBytesPerLine) * kBytesPerLine;
-                InvalidateRect(hDlg, NULL, TRUE); return TRUE;
+                EnsureCache(hDlg, st); InvalidateRect(hDlg, NULL, TRUE); return TRUE;
             case VK_END:
                 if (st->hasSelection) {
                     DWORD lineStart = (st->selOffset / kBytesPerLine) * kBytesPerLine;
                     DWORD lineEnd = min(lineStart + kBytesPerLine - 1, st->totalSize ? st->totalSize - 1 : 0);
                     st->selOffset = lineEnd;
                 }
-                InvalidateRect(hDlg, NULL, TRUE); return TRUE;
+                EnsureCache(hDlg, st); InvalidateRect(hDlg, NULL, TRUE); return TRUE;
         }
         break;
     }
@@ -350,29 +371,48 @@ static bool IsBinaryBuffer(const BYTE* buf, DWORD read)
     return false;
 }
 
+static std::wstring g_CurrentFile;
+
+static void OpenHexEditor(HWND hEditor) {
+    if (g_CurrentFile.empty()) {
+        MessageBox(hEditor, L"No file loaded.", L"Hex Editor", MB_ICONWARNING);
+        return;
+    }
+    HANDLE hFile = CreateFile(g_CurrentFile.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        MessageBox(hEditor, L"Could not open file.", L"Hex Editor", MB_ICONERROR);
+        return;
+    }
+    DWORD size = GetFileSize(hFile, NULL);
+    if (size == 0) { CloseHandle(hFile); return; }
+    
+    HexViewState* st = new HexViewState();
+    st->hFile = hFile; st->totalSize = size; st->topLine = 0; st->lineHeight = 18; st->charWidth = 8; st->hFont = NULL;
+    HWND hParent = GetAncestor(hEditor, GA_ROOT);
+    ShowHexWindow(hParent ? hParent : hEditor, st);
+}
+
+static PluginMenuItem g_MenuItems[] = {
+    { L"Open in Hex Editor", OpenHexEditor, L"Ctrl+Shift+H" }
+};
+
 extern "C" {
     PLUGIN_API const wchar_t* GetPluginName() { return L"Hex Editor"; }
     PLUGIN_API const wchar_t* GetPluginDescription() { return L"View files in a Hex format (read-only)."; }
     PLUGIN_API const wchar_t* GetPluginVersion() { return L"2.0"; }
-    PLUGIN_API PluginMenuItem* GetPluginMenuItems(int* count) { *count = 0; return NULL; }
+    PLUGIN_API PluginMenuItem* GetPluginMenuItems(int* count) { 
+        *count = 1; 
+        return g_MenuItems; 
+    }
 
     PLUGIN_API void OnFileEvent(const wchar_t* filePath, HWND hEditor, const wchar_t* eventType) {
-        if (_wcsicmp(eventType, L"Loaded") != 0) return;
-        HANDLE hFile = CreateFile(filePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile == INVALID_HANDLE_VALUE) return;
-        DWORD size = GetFileSize(hFile, NULL);
-        if (size == 0) { CloseHandle(hFile); return; }
-        BYTE buf[1024]; DWORD read = 0; ReadFile(hFile, buf, sizeof(buf), &read, NULL);
-        bool isBinary = IsBinaryBuffer(buf, read);
-        if (isBinary) {
-            SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
-            HexViewState* st = new HexViewState();
-            st->hFile = hFile; st->totalSize = size; st->topLine = 0; st->lineHeight = 18; st->charWidth = 8; st->hFont = NULL;
-            HWND hParent = GetAncestor(hEditor, GA_ROOT);
-            ShowHexWindow(hParent ? hParent : hEditor, st);
-            return; // dialog owns handle
+        if (_wcsicmp(eventType, L"Loaded") == 0) {
+            g_CurrentFile = filePath;
+        } else if (_wcsicmp(eventType, L"New") == 0) {
+            g_CurrentFile.clear();
+        } else if (_wcsicmp(eventType, L"Saved") == 0) {
+            g_CurrentFile = filePath;
         }
-        CloseHandle(hFile);
     }
 
     PLUGIN_API bool OnSaveFile(const wchar_t* filePath, HWND hEditor) { return false; }

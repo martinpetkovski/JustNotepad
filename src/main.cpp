@@ -564,8 +564,9 @@ BOOL LoadFromFile(LPCTSTR pszFile)
                 CheckMenuItem(hMenu, ID_VIEW_WORDWRAP, MF_UNCHECKED);
             }
 
-            // Do not load any text into the editor. Clear it.
+            // Disable editor and clear text
             SendMessage(doc.hEditor, WM_SETTEXT, 0, (LPARAM)L"");
+            EnableWindow(doc.hEditor, FALSE);
 
             // Clean up any mapping/handles before showing modal
             if (pData) UnmapViewOfFile(pData);
@@ -585,12 +586,16 @@ BOOL LoadFromFile(LPCTSTR pszFile)
             UpdateTitle();
             UpdateStatusBar();
 
-            // Notify plugins – Hex Editor will open its modal window
+            // Notify plugins
             g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Loaded");
 
             return TRUE;
         }
         
+        // Re-enable editor if it was disabled (e.g. previous file was binary)
+        EnableWindow(doc.hEditor, TRUE);
+        doc.isBinary = FALSE;
+
         // Unified Loading Strategy (text files only)
         // Always use background loading path for files > 4KB (approx 1 screen)
         // For smaller files, load synchronously but use progress bar
@@ -733,6 +738,11 @@ void DoReload()
 BOOL DoFileSaveAs()
 {
     Document& doc = g_Document;
+
+    if (doc.isBinary) {
+        MessageBox(hMain, _T("Cannot save binary files in text mode."), _T("Just Notepad"), MB_ICONWARNING);
+        return FALSE;
+    }
 
     OPENFILENAME ofn = {0};
     TCHAR szFile[MAX_PATH] = {0};
@@ -1408,6 +1418,73 @@ LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     }
     else if (msg == WM_KEYDOWN)
     {
+        if (wParam == VK_RETURN)
+        {
+            if ((GetKeyState(VK_CONTROL) & 0x8000) == 0 && (GetKeyState(VK_SHIFT) & 0x8000) == 0)
+            {
+                CHARRANGE cr;
+                SendMessage(hwnd, EM_EXGETSEL, 0, (LPARAM)&cr);
+                
+                long lineIdx = SendMessage(hwnd, EM_EXLINEFROMCHAR, 0, cr.cpMin);
+                long lineStart = SendMessage(hwnd, EM_LINEINDEX, lineIdx, 0);
+                long lineCount = SendMessage(hwnd, EM_GETLINECOUNT, 0, 0);
+                
+                const int BUF_SIZE = 1024;
+                TCHAR buffer[BUF_SIZE];
+                *(WORD*)buffer = BUF_SIZE - 1;
+                
+                // Get current line indentation to check cursor position
+                int copied = (int)SendMessage(hwnd, EM_GETLINE, lineIdx, (LPARAM)buffer);
+                std::basic_string<TCHAR> currentIndent;
+                if (copied > 0)
+                {
+                    if (copied >= BUF_SIZE) copied = BUF_SIZE - 1;
+                    buffer[copied] = 0;
+                    for (int i = 0; i < copied; i++)
+                    {
+                        TCHAR c = buffer[i];
+                        if (c == ' ' || c == '\t')
+                            currentIndent += c;
+                        else
+                            break;
+                    }
+                }
+
+                if ((cr.cpMin - lineStart) >= (long)currentIndent.length())
+                {
+                    std::basic_string<TCHAR> targetIndent;
+                    long targetLineIdx = lineIdx + 1;
+                    
+                    if (targetLineIdx < lineCount)
+                    {
+                        *(WORD*)buffer = BUF_SIZE - 1;
+                        copied = (int)SendMessage(hwnd, EM_GETLINE, targetLineIdx, (LPARAM)buffer);
+                        if (copied > 0)
+                        {
+                            if (copied >= BUF_SIZE) copied = BUF_SIZE - 1;
+                            buffer[copied] = 0;
+                            for (int i = 0; i < copied; i++)
+                            {
+                                TCHAR c = buffer[i];
+                                if (c == ' ' || c == '\t')
+                                    targetIndent += c;
+                                else
+                                    break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        targetIndent = currentIndent;
+                    }
+                    
+                    std::basic_string<TCHAR> replacement = _T("\r") + targetIndent;
+                    SendMessage(hwnd, EM_REPLACESEL, TRUE, (LPARAM)replacement.c_str());
+                    return 0;
+                }
+            }
+        }
+
         if (wParam == VK_TAB)
         {
             if (GetKeyState(VK_SHIFT) & 0x8000)
@@ -1532,14 +1609,22 @@ void CreateNewDocument(LPCTSTR pszFile)
     g_Document.bIsDirty = FALSE;
     g_Document.bLoading = FALSE;
     g_Document.bPinned = FALSE;
+    g_Document.isBinary = FALSE;
     g_Document.currentEncoding = ENC_UTF8;
     g_Document.szFileName[0] = 0;
     g_Document.ftLastWriteTime = {0};
+    
+    EnableWindow(g_Document.hEditor, TRUE);
+    SendMessage(g_Document.hEditor, EM_SETREADONLY, FALSE, 0);
 
     if (pszFile)
     {
         StringCchCopy(g_Document.szFileName, MAX_PATH, pszFile);
         LoadFromFile(pszFile);
+    }
+    else
+    {
+        g_PluginManager.NotifyFileEvent(L"", g_Document.hEditor, L"New");
     }
     
     UpdateTitle();
