@@ -54,7 +54,7 @@ struct UpdateParams {
 };
 
 void Log(const std::wstring& msg) {
-    OutputDebugStringW((L"[CtagsPlugin] " + msg + L"\n").c_str());
+    OutputDebugStringW((L"[GenericAutocompletePlugin] " + msg + L"\n").c_str());
 }
 
 void FindCtags() {
@@ -459,7 +459,7 @@ PluginMenuItem g_items[] = {
 
 extern "C" {
 
-PLUGIN_API const wchar_t* GetPluginName() { return L"Generic Autocomplete (Ctags)"; }
+PLUGIN_API const wchar_t* GetPluginName() { return L"Generic Autocomplete"; }
 PLUGIN_API const wchar_t* GetPluginDescription() { return L"Provides autocomplete suggestions using Universal Ctags."; }
 PLUGIN_API const wchar_t* GetPluginVersion() { return L"1.0"; }
 

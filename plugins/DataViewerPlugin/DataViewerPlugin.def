@@ -1,7 +1,7 @@
-LIBRARY Neon
+LIBRARY DataViewerPlugin
 EXPORTS
     GetPluginName
     GetPluginDescription
     GetPluginVersion
+    GetPluginStatus
     GetPluginMenuItems
-    OnFileEvent

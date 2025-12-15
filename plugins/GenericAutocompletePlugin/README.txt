@@ -6,7 +6,7 @@ This plugin provides autocomplete suggestions using Universal Ctags.
 Setup:
 1. Download Universal Ctags from https://github.com/universal-ctags/ctags-win32/releases
 2. Extract the zip file.
-3. Place `ctags.exe` in `plugins/CtagsPlugin/ctags/` folder (create the folder if it doesn't exist).
+3. Place `ctags.exe` in `plugins/GenericAutocompletePlugin/ctags/` folder (create the folder if it doesn't exist).
    OR ensure `ctags.exe` is in your system PATH.
 
 Usage:

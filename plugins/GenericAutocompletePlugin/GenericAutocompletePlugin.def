@@ -1,4 +1,4 @@
-LIBRARY CtagsPlugin
+LIBRARY GenericAutocompletePlugin
 EXPORTS
     GetPluginName
     GetPluginDescription

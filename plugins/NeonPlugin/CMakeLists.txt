@@ -1,8 +1,8 @@
-add_library(Neon SHARED Neon.cpp Neon.rc Neon.def)
-target_compile_definitions(Neon PRIVATE JUSTNOTEPAD_PLUGIN_EXPORTS)
-target_link_libraries(Neon PRIVATE shlwapi comctl32)
+add_library(NeonPlugin SHARED NeonPlugin.cpp NeonPlugin.rc NeonPlugin.def)
+target_compile_definitions(NeonPlugin PRIVATE JUSTNOTEPAD_PLUGIN_EXPORTS)
+target_link_libraries(NeonPlugin PRIVATE shlwapi comctl32)
 
-set_target_properties(Neon PROPERTIES
+set_target_properties(NeonPlugin PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins"
 )
 
@@ -23,9 +23,9 @@ endif()
 
 file(GLOB HIGHLIGHT_DLLS "${HIGHLIGHT_ROOT}/*.dll")
 
-add_custom_command(TARGET Neon POST_BUILD
+add_custom_command(TARGET NeonPlugin POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:JustNotepad>/plugins
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:Neon> $<TARGET_FILE_DIR:JustNotepad>/plugins/
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:NeonPlugin> $<TARGET_FILE_DIR:JustNotepad>/plugins/
     
     # Copy downloaded highlight executable and data
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:JustNotepad>/plugins/highlight
@@ -37,7 +37,7 @@ add_custom_command(TARGET Neon POST_BUILD
 )
 
 foreach(DLL ${HIGHLIGHT_DLLS})
-    add_custom_command(TARGET Neon POST_BUILD
+    add_custom_command(TARGET NeonPlugin POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy "${DLL}" $<TARGET_FILE_DIR:JustNotepad>/plugins/highlight/
     )
 endforeach()

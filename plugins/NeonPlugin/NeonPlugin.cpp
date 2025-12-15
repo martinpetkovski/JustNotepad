@@ -352,8 +352,27 @@ void HighlightWorker(std::string editorText, HWND hEditor, std::wstring dllDir, 
 
         // Check version again before applying
         if (g_TextVersion.load() == startVersion && !rtfOutput.empty()) {
-            std::string* pRtf = new std::string(rtfOutput);
-            PostMessage(g_hWorkerWnd, WM_APPLY_HIGHLIGHT, (WPARAM)startVersion, (LPARAM)pRtf);
+            // Strip BOM or garbage before RTF header
+            size_t rtfStart = rtfOutput.find('{');
+            if (rtfStart != std::string::npos) {
+                if (rtfStart > 0) {
+                    rtfOutput = rtfOutput.substr(rtfStart);
+                }
+            }
+
+            // Remove any raw UTF-8 BOM sequences that might have slipped in
+            // The BOM is 0xEF, 0xBB, 0xBF
+            const std::string bom = "\xEF\xBB\xBF";
+            size_t pos = rtfOutput.find(bom);
+            while (pos != std::string::npos) {
+                rtfOutput.erase(pos, bom.length());
+                pos = rtfOutput.find(bom, pos);
+            }
+
+            if (!rtfOutput.empty()) {
+                std::string* pRtf = new std::string(rtfOutput);
+                PostMessage(g_hWorkerWnd, WM_APPLY_HIGHLIGHT, (WPARAM)startVersion, (LPARAM)pRtf);
+            }
         }
 
     } else {

@@ -1,4 +1,4 @@
-﻿ï»¿Ã¯Â»Â¿ÃƒÂ¯Ã‚Â»Ã‚Â¿ÃƒÆ’Ã‚Â¯Ãƒâ€šÃ‚Â»Ãƒâ€šÃ‚Â¿#include "PluginManager.h"
+﻿#include "PluginManager.h"
 #include "resource.h"
 #include <filesystem>
 #include <algorithm>
@@ -388,9 +388,9 @@ bool PluginManager::TranslateAccelerator(MSG* pMsg) {
                         return true;
                     }
                 }
+                }
             }
         }
-    }
     return false;
 }
 
@@ -422,4 +422,5 @@ bool PluginManager::NotifySaveFile(const wchar_t* filePath, HWND hEditor) {
 void PluginManager::SetHostFunctions(HostFunctions functions) {
     m_hostFunctions = functions;
 }
+
 
