@@ -1,5 +1,6 @@
 #include <windows.h>
 #include "resource.h"
+#include "Version.h"
 
 IDI_ICON ICON "just_notepad.ico"
 
@@ -159,7 +160,7 @@ CAPTION "About Just Notepad"
 FONT 8, "MS Shell Dlg", 400, 0, 0x1
 BEGIN
     ICON            IDI_ICON,-1,14,14,21,20
-    LTEXT           "Just Notepad v 0.1",-1,45,14,100,8
+    LTEXT           APP_VERSION_STRING,-1,45,14,100,8
     LTEXT           "Created by Martin Petkovski",-1,45,26,120,8
     LTEXT           "This software is Freeware.",-1,45,38,120,8
     CONTROL         "<a href=""https://www.najjak.com/justnotepad"">Official Website</a>",-1,"SysLink",WS_TABSTOP,45,50,120,10

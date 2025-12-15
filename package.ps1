@@ -6,30 +6,8 @@ $ErrorActionPreference = 'Stop'
 
 Write-Host "Starting Package Creation..." -ForegroundColor Green
 
-# 1. Build everything (including plugins)
-Write-Host "Step 1: Building project..." -ForegroundColor Cyan
-.\build.ps1 -Configuration Release -BuildOnly
-if ($LASTEXITCODE -ne 0) { 
-    Write-Error "Build failed with exit code $LASTEXITCODE"
-    exit 1 
-}
-
-# 2. Run tests
-Write-Host "Step 2: Running tests..." -ForegroundColor Cyan
-Push-Location build
-try {
-    ctest -C Release --output-on-failure
-    if ($LASTEXITCODE -ne 0) { 
-        Write-Error "Tests failed with exit code $LASTEXITCODE"
-        exit 1 
-    }
-}
-finally {
-    Pop-Location
-}
-
-# 3. Create release version
-Write-Host "Step 3: Creating release version..." -ForegroundColor Cyan
+# 1. Calculate release version (Moved to start)
+Write-Host "Step 1: Calculating release version..." -ForegroundColor Cyan
 $Date = Get-Date
 $BaseVersion = "{0}.{1:yy}{1:MM}{1:dd}" -f $MajorVersion, $Date
 
@@ -53,8 +31,36 @@ $TagName = "v$Version"
 Write-Host "Version: $Version"
 Write-Host "Tag: $TagName"
 
-# Create Release Artifacts
-Write-Host "Creating release artifacts..." -ForegroundColor Cyan
+# Update Version.h
+$VersionHeaderPath = Join-Path $PSScriptRoot "src\Version.h"
+$VersionContent = "#pragma once`r`n#define APP_VERSION_STRING `"Just Notepad v $Version`""
+Set-Content -Path $VersionHeaderPath -Value $VersionContent
+Write-Host "Updated Version.h with version $Version"
+
+# 2. Build everything (including plugins)
+Write-Host "Step 2: Building project..." -ForegroundColor Cyan
+.\build.ps1 -Configuration Release -BuildOnly
+if ($LASTEXITCODE -ne 0) { 
+    Write-Error "Build failed with exit code $LASTEXITCODE"
+    exit 1 
+}
+
+# 3. Run tests
+Write-Host "Step 3: Running tests..." -ForegroundColor Cyan
+Push-Location build
+try {
+    ctest -C Release --output-on-failure
+    if ($LASTEXITCODE -ne 0) { 
+        Write-Error "Tests failed with exit code $LASTEXITCODE"
+        exit 1 
+    }
+}
+finally {
+    Pop-Location
+}
+
+# 4. Create Release Artifacts
+Write-Host "Step 4: Creating release artifacts..." -ForegroundColor Cyan
 
 # Ensure releases folder exists
 $ReleasesRoot = "releases"
