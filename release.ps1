@@ -4,6 +4,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Clean and Rebuild
+Write-Host "Cleaning..." -ForegroundColor Cyan
+.\clean.ps1
+
+Write-Host "Rebuilding..." -ForegroundColor Cyan
+.\rebuild.ps1 -Configuration Release
+
 # Call the package script
 $ReleaseInfo = .\package.ps1 -MajorVersion $MajorVersion
 

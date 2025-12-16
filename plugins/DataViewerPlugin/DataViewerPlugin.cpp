@@ -32,6 +32,16 @@ struct DataNode : std::enable_shared_from_this<DataNode> {
     void AddChild(std::shared_ptr<DataNode> child) {
         children.push_back(child);
     }
+
+    std::shared_ptr<DataNode> DeepCopy() {
+        auto newNode = std::make_shared<DataNode>(name + L"_copy", value, type);
+        for (auto& child : children) {
+            auto newChild = child->DeepCopy();
+            newChild->parent = newNode;
+            newNode->AddChild(newChild);
+        }
+        return newNode;
+    }
 };
 
 std::shared_ptr<DataNode> g_RootNode;
@@ -305,6 +315,39 @@ void PopulateTree(HWND hTree, HTREEITEM hParent, std::shared_ptr<DataNode> node)
     }
 }
 
+void RefreshTreeParent(HWND hTree, HTREEITEM hParentItem, std::shared_ptr<DataNode> parentNode, DataNode* nodeToSelect) {
+    // Delete children of hParentItem
+    HTREEITEM hChild = TreeView_GetChild(hTree, hParentItem);
+    while (hChild) {
+        HTREEITEM hNext = TreeView_GetNextSibling(hTree, hChild);
+        TreeView_DeleteItem(hTree, hChild);
+        hChild = hNext;
+    }
+    
+    // Re-populate
+    for (auto& child : parentNode->children) {
+        PopulateTree(hTree, hParentItem, child);
+    }
+    
+    TreeView_Expand(hTree, hParentItem, TVE_EXPAND);
+    
+    // Restore selection
+    if (nodeToSelect) {
+        hChild = TreeView_GetChild(hTree, hParentItem);
+        while (hChild) {
+            TVITEM tvi = {0};
+            tvi.hItem = hChild;
+            tvi.mask = TVIF_PARAM;
+            TreeView_GetItem(hTree, &tvi);
+            if ((DataNode*)tvi.lParam == nodeToSelect) {
+                TreeView_SelectItem(hTree, hChild);
+                break;
+            }
+            hChild = TreeView_GetNextSibling(hTree, hChild);
+        }
+    }
+}
+
 void UpdateRightPanel(HWND hDlg, DataNode* node) {
     if (!node) return;
     
@@ -414,6 +457,64 @@ INT_PTR CALLBACK DataViewerDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARA
                     // Clear right panel
                     SetDlgItemText(hDlg, IDC_EDIT_NAME, L"");
                     SetDlgItemText(hDlg, IDC_EDIT_VALUE, L"");
+                }
+            }
+        }
+        if (LOWORD(wParam) == IDC_BTN_MOVE_UP) {
+            if (g_SelectedNode && !g_SelectedNode->parent.expired()) {
+                auto parent = g_SelectedNode->parent.lock();
+                auto it = std::find_if(parent->children.begin(), parent->children.end(), 
+                    [](const std::shared_ptr<DataNode>& n) { return n.get() == g_SelectedNode; });
+                
+                if (it != parent->children.end() && it != parent->children.begin()) {
+                    std::iter_swap(it, it - 1);
+                    
+                    HWND hTree = GetDlgItem(hDlg, IDC_DATA_TREE);
+                    HTREEITEM hItem = TreeView_GetSelection(hTree);
+                    HTREEITEM hParentItem = TreeView_GetParent(hTree, hItem);
+                    if (hParentItem) {
+                        RefreshTreeParent(hTree, hParentItem, parent, g_SelectedNode);
+                    }
+                }
+            }
+        }
+        if (LOWORD(wParam) == IDC_BTN_MOVE_DOWN) {
+            if (g_SelectedNode && !g_SelectedNode->parent.expired()) {
+                auto parent = g_SelectedNode->parent.lock();
+                auto it = std::find_if(parent->children.begin(), parent->children.end(), 
+                    [](const std::shared_ptr<DataNode>& n) { return n.get() == g_SelectedNode; });
+                
+                if (it != parent->children.end() && it + 1 != parent->children.end()) {
+                    std::iter_swap(it, it + 1);
+                    
+                    HWND hTree = GetDlgItem(hDlg, IDC_DATA_TREE);
+                    HTREEITEM hItem = TreeView_GetSelection(hTree);
+                    HTREEITEM hParentItem = TreeView_GetParent(hTree, hItem);
+                    if (hParentItem) {
+                        RefreshTreeParent(hTree, hParentItem, parent, g_SelectedNode);
+                    }
+                }
+            }
+        }
+        if (LOWORD(wParam) == IDC_BTN_DUPLICATE) {
+            if (g_SelectedNode && !g_SelectedNode->parent.expired()) {
+                auto parent = g_SelectedNode->parent.lock();
+                auto it = std::find_if(parent->children.begin(), parent->children.end(), 
+                    [](const std::shared_ptr<DataNode>& n) { return n.get() == g_SelectedNode; });
+                
+                if (it != parent->children.end()) {
+                    auto newNode = g_SelectedNode->DeepCopy();
+                    newNode->parent = parent;
+                    parent->children.insert(it + 1, newNode);
+                    
+                    HWND hTree = GetDlgItem(hDlg, IDC_DATA_TREE);
+                    HTREEITEM hItem = TreeView_GetSelection(hTree);
+                    HTREEITEM hParentItem = TreeView_GetParent(hTree, hItem);
+                    if (hParentItem) {
+                        RefreshTreeParent(hTree, hParentItem, parent, newNode.get());
+                        g_SelectedNode = newNode.get();
+                        UpdateRightPanel(hDlg, g_SelectedNode);
+                    }
                 }
             }
         }

@@ -2613,14 +2613,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 
                 ModifyMenu(hSubMenu, ID_EDIT_UPPERCASE, MF_BYCOMMAND | MF_STRING, ID_EDIT_UPPERCASE, _T("Uppercase Line\tCtrl+Shift+U"));
                 ModifyMenu(hSubMenu, ID_EDIT_LOWERCASE, MF_BYCOMMAND | MF_STRING, ID_EDIT_LOWERCASE, _T("Lowercase Line\tCtrl+U"));
-                ModifyMenu(hSubMenu, ID_EDIT_CAPITALIZE, MF_BYCOMMAND | MF_STRING, ID_EDIT_CAPITALIZE, _T("Capitalize Line"));
-                ModifyMenu(hSubMenu, ID_EDIT_SENTENCECASE, MF_BYCOMMAND | MF_STRING, ID_EDIT_SENTENCECASE, _T("Sentence Case Line"));
+                ModifyMenu(hSubMenu, ID_EDIT_CAPITALIZE, MF_BYCOMMAND | MF_STRING, ID_EDIT_CAPITALIZE, _T("Capitalize Line\tCtrl+Alt+C"));
+                ModifyMenu(hSubMenu, ID_EDIT_SENTENCECASE, MF_BYCOMMAND | MF_STRING, ID_EDIT_SENTENCECASE, _T("Sentence Case Line\tCtrl+Alt+S"));
                 
-                ModifyMenu(hSubMenu, ID_EDIT_INDENT, MF_BYCOMMAND | MF_STRING, ID_EDIT_INDENT, _T("Indent Line"));
-                ModifyMenu(hSubMenu, ID_EDIT_UNINDENT, MF_BYCOMMAND | MF_STRING, ID_EDIT_UNINDENT, _T("Unindent Line"));
+                ModifyMenu(hSubMenu, ID_EDIT_INDENT, MF_BYCOMMAND | MF_STRING, ID_EDIT_INDENT, _T("Indent Line\tCtrl+Alt+I"));
+                ModifyMenu(hSubMenu, ID_EDIT_UNINDENT, MF_BYCOMMAND | MF_STRING, ID_EDIT_UNINDENT, _T("Unindent Line\tCtrl+Alt+Shift+I"));
                 
                 // ModifyMenu(hSubMenu, ID_EDIT_JOINLINES, MF_BYCOMMAND | MF_STRING, ID_EDIT_JOINLINES, _T("Join Lines")); // removed
-                ModifyMenu(hSubMenu, ID_EDIT_SORTLINES, MF_BYCOMMAND | MF_STRING, ID_EDIT_SORTLINES, _T("Sort Lines"));
+                ModifyMenu(hSubMenu, ID_EDIT_SORTLINES, MF_BYCOMMAND | MF_STRING, ID_EDIT_SORTLINES, _T("Sort Lines\tCtrl+Alt+O"));
             }
             else
             {
@@ -2632,14 +2632,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 
                 ModifyMenu(hSubMenu, ID_EDIT_UPPERCASE, MF_BYCOMMAND | MF_STRING, ID_EDIT_UPPERCASE, _T("Uppercase Selection\tCtrl+Shift+U"));
                 ModifyMenu(hSubMenu, ID_EDIT_LOWERCASE, MF_BYCOMMAND | MF_STRING, ID_EDIT_LOWERCASE, _T("Lowercase Selection\tCtrl+U"));
-                ModifyMenu(hSubMenu, ID_EDIT_CAPITALIZE, MF_BYCOMMAND | MF_STRING, ID_EDIT_CAPITALIZE, _T("Capitalize Selection"));
-                ModifyMenu(hSubMenu, ID_EDIT_SENTENCECASE, MF_BYCOMMAND | MF_STRING, ID_EDIT_SENTENCECASE, _T("Sentence Case Selection"));
+                ModifyMenu(hSubMenu, ID_EDIT_CAPITALIZE, MF_BYCOMMAND | MF_STRING, ID_EDIT_CAPITALIZE, _T("Capitalize Selection\tCtrl+Alt+C"));
+                ModifyMenu(hSubMenu, ID_EDIT_SENTENCECASE, MF_BYCOMMAND | MF_STRING, ID_EDIT_SENTENCECASE, _T("Sentence Case Selection\tCtrl+Alt+S"));
                 
-                ModifyMenu(hSubMenu, ID_EDIT_INDENT, MF_BYCOMMAND | MF_STRING, ID_EDIT_INDENT, _T("Indent Selection"));
-                ModifyMenu(hSubMenu, ID_EDIT_UNINDENT, MF_BYCOMMAND | MF_STRING, ID_EDIT_UNINDENT, _T("Unindent Selection"));
+                ModifyMenu(hSubMenu, ID_EDIT_INDENT, MF_BYCOMMAND | MF_STRING, ID_EDIT_INDENT, _T("Indent Selection\tCtrl+Alt+I"));
+                ModifyMenu(hSubMenu, ID_EDIT_UNINDENT, MF_BYCOMMAND | MF_STRING, ID_EDIT_UNINDENT, _T("Unindent Selection\tCtrl+Alt+Shift+I"));
                 
                 // ModifyMenu(hSubMenu, ID_EDIT_JOINLINES, MF_BYCOMMAND | MF_STRING, ID_EDIT_JOINLINES, _T("Join Selected Lines")); // removed
-                ModifyMenu(hSubMenu, ID_EDIT_SORTLINES, MF_BYCOMMAND | MF_STRING, ID_EDIT_SORTLINES, _T("Sort Selected Lines"));
+                ModifyMenu(hSubMenu, ID_EDIT_SORTLINES, MF_BYCOMMAND | MF_STRING, ID_EDIT_SORTLINES, _T("Sort Selected Lines\tCtrl+Alt+O"));
             }
             
             // Remove redundant items from the bottom if they exist

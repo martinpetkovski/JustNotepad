@@ -1,0 +1,7 @@
+LIBRARY MarkdownToolsPlugin
+EXPORTS
+    GetPluginName
+    GetPluginDescription
+    GetPluginVersion
+    GetPluginLicense
+    GetPluginMenuItems

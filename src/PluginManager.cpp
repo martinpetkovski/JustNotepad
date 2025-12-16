@@ -41,12 +41,6 @@ void PluginManager::LoadPlugins(const std::wstring& pluginsDir) {
                     }
                 }
 
-                // Auto-enable CppToolsPlugin
-                if (!info.enabled && _wcsicmp(info.filename.c_str(), L"CppToolsPlugin.dll") == 0) {
-                    info.enabled = true;
-                    m_enabledPlugins.push_back(info.filename);
-                }
-
                 auto getName = (PluginInfo::GetPluginNameFunc)GetProcAddress(hModule, "GetPluginName");
                 auto getDesc = (PluginInfo::GetPluginDescriptionFunc)GetProcAddress(hModule, "GetPluginDescription");
                 auto getVer = (PluginInfo::GetPluginVersionFunc)GetProcAddress(hModule, "GetPluginVersion");

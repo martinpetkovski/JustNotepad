@@ -12,3 +12,6 @@
 #define IDC_BTN_ADD     1008
 #define IDC_BTN_DELETE  1009
 #define IDC_BTN_SAVE    1010
+#define IDC_BTN_MOVE_UP   1011
+#define IDC_BTN_MOVE_DOWN 1012
+#define IDC_BTN_DUPLICATE 1013

@@ -67,7 +67,7 @@ add_subdirectory(plugins/NeonPlugin)
 
 add_subdirectory(plugins/AdvancedSearchPlugin)
 add_subdirectory(plugins/WindowsShellPlugin)
-add_subdirectory(plugins/MacrosPlugin)
+add_subdirectory(plugins/PowerShellScripts)
 add_subdirectory(plugins/GitPlugin)
 add_subdirectory(plugins/PerforcePlugin)
 add_subdirectory(plugins/CharacterMapPlugin)
@@ -75,6 +75,7 @@ add_subdirectory(plugins/ThemeSwitcherPlugin)
 add_subdirectory(plugins/WhitespaceVisualizerPlugin)
 add_subdirectory(plugins/DataViewerPlugin)
 add_subdirectory(plugins/CppToolsPlugin)
+add_subdirectory(plugins/MarkdownToolsPlugin)
 
 
 

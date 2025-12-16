@@ -34,7 +34,8 @@ Here's an extensive list of all the plugins and what I use them for:
 - **GuidPlugin**: Generate unique GUIDs.
 - **HelloPlugin**: A simple example plugin to get you started.
 - **HexEditorPlugin**: View and edit files in hexadecimal format.
-- **MacrosPlugin**: Record and playback keyboard macros.
+- **PowerShellScripts**: Run Powershell scripts based on context.
+- **MarkdownToolsPlugin**: Markdown viewing and editing tools.
 - **NeonPlugin**: Syntax highlighting support.
 - **PerforcePlugin**: Perforce version control integration.
 - **ThemeSwitcherPlugin**: Switch between different UI themes.

@@ -33,9 +33,32 @@ Write-Host "Tag: $TagName"
 
 # Update Version.h
 $VersionHeaderPath = Join-Path $PSScriptRoot "src\Version.h"
-$VersionContent = "#pragma once`r`n#define APP_VERSION_STRING `"Just Notepad v $Version`""
+$VersionParts = $Version.Split('.')
+$Major = $VersionParts[0]
+$DatePart = $VersionParts[1]
+$Daily = $VersionParts[2]
+
+# Split date part (yyMMdd) into Year (yy) and MonthDay (MMdd) to fit 16-bit integers
+$Year = $DatePart.Substring(0, 2)
+$MonthDay = $DatePart.Substring(2)
+
+$VersionContent = @"
+#pragma once
+#define APP_VERSION_STRING "$Version"
+#define APP_VERSION_MAJOR $Major
+#define APP_VERSION_MINOR $Year
+#define APP_VERSION_PATCH $MonthDay
+#define APP_VERSION_BUILD $Daily
+
+#define APP_COMPANY_NAME "Martin Petkovski"
+#define APP_FILE_DESCRIPTION "Just a notepad."
+#define APP_INTERNAL_NAME "JustNotepad"
+#define APP_LEGAL_COPYRIGHT "Copyright (C) 2025-2026 Martin Petkovski"
+#define APP_ORIGINAL_FILENAME "JustNotepad.exe"
+#define APP_PRODUCT_NAME "Just Notepad"
+"@
 Set-Content -Path $VersionHeaderPath -Value $VersionContent
-Write-Host "Updated Version.h with version $Version"
+Write-Host "Updated Version.h with version $Version and detailed info"
 
 # 2. Build everything (including plugins)
 Write-Host "Step 2: Building project..." -ForegroundColor Cyan
