@@ -11,6 +11,41 @@ Write-Host "Cleaning..." -ForegroundColor Cyan
 Write-Host "Rebuilding..." -ForegroundColor Cyan
 .\rebuild.ps1 -Configuration Release
 
+# Update docs/index.html with README.md content
+Write-Host "Updating docs/index.html with README.md content..." -ForegroundColor Cyan
+$ReadmeContent = Get-Content -Path "README.md" -Raw
+# Escape backticks for JS template literal ( ` -> \` )
+$ReadmeContentEscaped = $ReadmeContent.Replace("`", "\`")
+# Escape ${ for JS template literal ( ${ -> \${ )
+$ReadmeContentEscaped = $ReadmeContentEscaped.Replace("${", "\${")
+
+$HtmlPath = "docs/index.html"
+$HtmlContent = Get-Content -Path $HtmlPath -Raw
+
+$StartMarker = "const markdown = `"
+$EndMarker = "`;"
+$StartIndex = $HtmlContent.IndexOf($StartMarker)
+
+if ($StartIndex -ge 0) {
+    $EndIndex = $HtmlContent.IndexOf($EndMarker, $StartIndex + $StartMarker.Length)
+    if ($EndIndex -gt $StartIndex) {
+        $NewHtmlContent = $HtmlContent.Substring(0, $StartIndex + $StartMarker.Length) + 
+                          $ReadmeContentEscaped + 
+                          $HtmlContent.Substring($EndIndex)
+        Set-Content -Path $HtmlPath -Value $NewHtmlContent -Encoding UTF8
+        Write-Host "Updated docs/index.html"
+    }
+} else {
+    Write-Warning "Could not find markdown content placeholder in docs/index.html"
+}
+
+# Commit changes if any
+if ((git status --porcelain docs/index.html).Length -gt 0) {
+    Write-Host "Committing updated docs/index.html..."
+    git add docs/index.html
+    git commit -m "Update docs/index.html from README.md"
+}
+
 # Call the package script
 $ReleaseInfo = .\package.ps1 -MajorVersion $MajorVersion
 
