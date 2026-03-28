@@ -1,9 +1,9 @@
 #pragma once
-#define APP_VERSION_STRING "1.251216.4"
+#define APP_VERSION_STRING "1.260328.1"
 #define APP_VERSION_MAJOR 1
-#define APP_VERSION_MINOR 25
-#define APP_VERSION_PATCH 1216
-#define APP_VERSION_BUILD 4
+#define APP_VERSION_MINOR 26
+#define APP_VERSION_PATCH 0328
+#define APP_VERSION_BUILD 1
 
 #define APP_COMPANY_NAME "Martin Petkovski"
 #define APP_FILE_DESCRIPTION "Just a notepad."

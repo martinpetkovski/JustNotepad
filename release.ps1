@@ -15,15 +15,16 @@ Write-Host "Rebuilding..." -ForegroundColor Cyan
 Write-Host "Updating docs/index.html with README.md content..." -ForegroundColor Cyan
 $ReadmeContent = Get-Content -Path "README.md" -Raw
 # Escape backticks for JS template literal ( ` -> \` )
-$ReadmeContentEscaped = $ReadmeContent.Replace("`", "\`")
+$bt = [string][char]0x60
+$ReadmeContentEscaped = $ReadmeContent.Replace($bt, ('\' + $bt))
 # Escape ${ for JS template literal ( ${ -> \${ )
-$ReadmeContentEscaped = $ReadmeContentEscaped.Replace("${", "\${")
+$ReadmeContentEscaped = $ReadmeContentEscaped.Replace('${', '\${')
 
 $HtmlPath = "docs/index.html"
 $HtmlContent = Get-Content -Path $HtmlPath -Raw
 
-$StartMarker = "const markdown = `"
-$EndMarker = "`;"
+$StartMarker = 'const markdown = ' + [char]0x60
+$EndMarker = [char]0x60 + ';'
 $StartIndex = $HtmlContent.IndexOf($StartMarker)
 
 if ($StartIndex -ge 0) {
