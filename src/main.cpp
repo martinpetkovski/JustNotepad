@@ -37,6 +37,7 @@
 
 #define IDC_EDITOR 1001
 #define IDC_STATUSBAR 1002
+#define IDC_TABCTRL 1003
 
 enum Encoding {
     ENC_ANSI = 0,
@@ -115,35 +116,6 @@ const EncodingInfo* GetEncodingInfoByCmd(int cmdId) {
     return NULL;
 }
 
-
-struct Document {
-    HWND hEditor;
-    TCHAR szFileName[MAX_PATH];
-    BOOL bIsDirty;
-    BOOL bLoading;
-    BOOL bPinned;
-    FILETIME ftLastWriteTime;
-    Encoding currentEncoding;
-    long loadSequence;
-    DWORD fileSize;
-    BOOL isBinary;
-};
-
-HWND hMain;
-HWND hEditor;
-HWND hStatus;
-HINSTANCE hInst;
-HWND hFindReplaceDlg = NULL;
-UINT uFindReplaceMsg = 0;
-FINDREPLACE fr;
-TCHAR szFindWhat[256];
-TCHAR szReplaceWith[256];
-BOOL bWordWrap = FALSE;
-std::vector<CHARRANGE> vecSelectionStack;
-std::vector<SelectionLevel> vecSelectionLevelStack;
-
-Document g_Document;
-
 // Virtual file for large file support (instant display + smooth scrolling)
 #define VIRTUAL_THRESHOLD_TEXT   (5 * 1024 * 1024)   // 5MB
 #define VIRTUAL_THRESHOLD_BINARY (1 * 1024 * 1024)   // 1MB (expands ~5x as hex)
@@ -184,7 +156,49 @@ struct VirtualFile {
     }
 };
 
-VirtualFile g_VirtualFile;
+struct Document {
+    HWND hEditor;
+    TCHAR szFileName[MAX_PATH];
+    BOOL bIsDirty;
+    BOOL bLoading;
+    BOOL bPinned;
+    FILETIME ftLastWriteTime;
+    Encoding currentEncoding;
+    long loadSequence;
+    DWORD fileSize;
+    BOOL isBinary;
+    VirtualFile vf;
+};
+
+HWND hMain;
+HWND hEditor;
+HWND hTabCtrl;
+HFONT hTabFont = NULL;
+HWND hStatus;
+HINSTANCE hInst;
+HWND hFindReplaceDlg = NULL;
+UINT uFindReplaceMsg = 0;
+FINDREPLACE fr;
+TCHAR szFindWhat[256];
+TCHAR szReplaceWith[256];
+BOOL bWordWrap = FALSE;
+std::vector<CHARRANGE> vecSelectionStack;
+std::vector<SelectionLevel> vecSelectionLevelStack;
+
+std::vector<Document> g_Documents;
+int g_iActiveDocument = 0;
+static UINT g_nextEditorMenuId = 2000;
+
+inline Document& GetActiveDoc() {
+    return g_Documents[(size_t)g_iActiveDocument];
+}
+
+Document* DocFromEditor(HWND hEd) {
+    for (auto& d : g_Documents) {
+        if (d.hEditor == hEd) return &d; // don't beat me up
+    }
+    return nullptr;
+}
 
 PluginManager g_PluginManager;
 
@@ -231,6 +245,11 @@ void DoIndent();
 void DoUnindent();
 
 void CreateNewDocument(LPCTSTR pszFile);
+void SwitchToTab(int index);
+void LayoutEditorAndTabs();
+void GetEditorAreaRect(RECT* prcOut);
+void BuildTabLabelText(const Document* doc, TCHAR* buf, size_t cch);
+void UpdateTabTitleForIndex(int index);
 
 #define WM_LOAD_COMPLETE (WM_USER + 102)
 #define WM_LOAD_PROGRESS (WM_USER + 103)
@@ -240,6 +259,7 @@ struct LoadResult {
     Encoding encoding;
     BOOL bSuccess;
     long sequence;
+    HWND hEditor;
 };
 
 void ParallelConvert(const BYTE* pData, size_t size, Encoding encoding, std::vector<wchar_t>& outBuffer, HWND hMain)
@@ -565,7 +585,7 @@ BOOL VirtualFileOpen(VirtualFile& vf, LPCTSTR pszFile, Encoding encoding, BOOL i
     return TRUE;
 }
 
-void LoadWorker(std::wstring filename, Encoding encoding, HWND hMain, long sequence, BOOL isBinary)
+void LoadWorker(std::wstring filename, Encoding encoding, HWND hMain, long sequence, BOOL isBinary, HWND hEditorTarget)
 {
     HANDLE hFile = CreateFile(filename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return;
@@ -592,6 +612,7 @@ void LoadWorker(std::wstring filename, Encoding encoding, HWND hMain, long seque
     res->encoding = encoding;
     res->bSuccess = TRUE;
     res->sequence = sequence;
+    res->hEditor = hEditorTarget;
     
     if (isBinary) {
         FormatHexDump(pData, size, res->buffer, hMain);
@@ -709,7 +730,7 @@ BOOL DoFileSaveAs();
 
 BOOL CheckSaveChanges()
 {
-    Document& doc = g_Document;
+    Document& doc = GetActiveDoc();
 
     if (!doc.bIsDirty) return TRUE;
 
@@ -743,7 +764,13 @@ BOOL CheckSaveChanges()
 
 BOOL CheckAllSaveChanges()
 {
-    return CheckSaveChanges();
+    for (size_t i = 0; i < g_Documents.size(); ++i)
+    {
+        if (!g_Documents[i].bIsDirty) continue;
+        SwitchToTab((int)i);
+        if (!CheckSaveChanges()) return FALSE;
+    }
+    return TRUE;
 }
 
 void DoFileNew()
@@ -756,7 +783,7 @@ void DoFileNew()
 
 BOOL LoadFromFile(LPCTSTR pszFile)
 {
-    Document& doc = g_Document;
+    Document& doc = GetActiveDoc();
     doc.loadSequence++;
 
     HANDLE hFile = CreateFile(pszFile, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -891,7 +918,7 @@ BOOL LoadFromFile(LPCTSTR pszFile)
             if (fileSize <= VIRTUAL_THRESHOLD_BINARY)
             {
                 // Small binary: generate hex dump synchronously into RichEdit
-                g_VirtualFile.Close();
+                GetActiveDoc().vf.Close();
 
                 HANDLE hf = CreateFile(pszFile, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
                 if (hf == INVALID_HANDLE_VALUE) return FALSE;
@@ -915,11 +942,11 @@ BOOL LoadFromFile(LPCTSTR pszFile)
             else
             {
                 // Large binary: virtual hex mode — instant display, smooth scroll
-                if (!VirtualFileOpen(g_VirtualFile, pszFile, doc.currentEncoding, TRUE, 0, fileSize))
+                if (!VirtualFileOpen(GetActiveDoc().vf, pszFile, doc.currentEncoding, TRUE, 0, fileSize))
                     return FALSE;
 
-                VirtualFileComputeVisibleLines(g_VirtualFile, doc.hEditor);
-                VirtualFileRenderWindow(g_VirtualFile, doc.hEditor);
+                VirtualFileComputeVisibleLines(GetActiveDoc().vf, doc.hEditor);
+                VirtualFileRenderWindow(GetActiveDoc().vf, doc.hEditor);
                 SendMessage(doc.hEditor, EM_SETREADONLY, TRUE, 0);
             }
 
@@ -947,7 +974,7 @@ BOOL LoadFromFile(LPCTSTR pszFile)
             CloseHandle(hFile);
             pData = NULL; hMap = NULL; hFile = INVALID_HANDLE_VALUE;
 
-            if (!VirtualFileOpen(g_VirtualFile, pszFile, doc.currentEncoding, FALSE, bomSize, fileSize))
+            if (!VirtualFileOpen(GetActiveDoc().vf, pszFile, doc.currentEncoding, FALSE, bomSize, fileSize))
                 return FALSE;
 
             // Disable word wrap for virtual mode
@@ -959,8 +986,8 @@ BOOL LoadFromFile(LPCTSTR pszFile)
                 CheckMenuItem(hMenu2, ID_VIEW_WORDWRAP, MF_UNCHECKED);
             }
 
-            VirtualFileComputeVisibleLines(g_VirtualFile, doc.hEditor);
-            VirtualFileRenderWindow(g_VirtualFile, doc.hEditor);
+            VirtualFileComputeVisibleLines(GetActiveDoc().vf, doc.hEditor);
+            VirtualFileRenderWindow(GetActiveDoc().vf, doc.hEditor);
             SendMessage(doc.hEditor, EM_SETREADONLY, TRUE, 0);
 
             StringCchCopy(doc.szFileName, MAX_PATH, pszFile);
@@ -980,7 +1007,7 @@ BOOL LoadFromFile(LPCTSTR pszFile)
         }
 
         // ---- Normal mode for small/medium text files ----
-        g_VirtualFile.Close(); // close any previous virtual file
+        GetActiveDoc().vf.Close(); // close any previous virtual file
 
         // Unified Loading Strategy (text files only)
         // Always use background loading path for files > 4KB (approx 1 screen)
@@ -1034,8 +1061,9 @@ BOOL LoadFromFile(LPCTSTR pszFile)
             Encoding enc = doc.currentEncoding;
             long seq = doc.loadSequence;
             BOOL bin = isBinary;
-            std::thread([filename, enc, seq, bin](){
-                LoadWorker(filename, enc, hMain, seq, bin);
+            HWND hEdTarget = doc.hEditor;
+            std::thread([filename, enc, seq, bin, hEdTarget](){
+                LoadWorker(filename, enc, hMain, seq, bin, hEdTarget);
             }).detach();
             
             // Set ReadOnly while loading
@@ -1107,7 +1135,7 @@ void DoFileOpen()
 
 void DoReload()
 {
-    Document& doc = g_Document;
+    Document& doc = GetActiveDoc();
 
     if (!doc.szFileName[0]) return;
 
@@ -1118,13 +1146,13 @@ void DoReload()
             return;
         }
     }
-    g_VirtualFile.Close();
+    GetActiveDoc().vf.Close();
     LoadFromFile(doc.szFileName);
 }
 
 BOOL DoFileSaveAs()
 {
-    Document& doc = g_Document;
+    Document& doc = GetActiveDoc();
 
     if (doc.isBinary) {
         MessageBox(hMain, _T("Cannot save binary files in text mode."), _T("Just Notepad"), MB_ICONWARNING);
@@ -1218,7 +1246,7 @@ BOOL DoFileSaveAs()
 
 BOOL DoFileSave()
 {
-    Document& doc = g_Document;
+    Document& doc = GetActiveDoc();
 
     if (doc.szFileName[0])
     {
@@ -1745,14 +1773,14 @@ INT_PTR CALLBACK GoToDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
             int nLine = GetDlgItemInt(hDlg, IDC_GOTO_LINE, &bTranslated, FALSE);
             if (bTranslated && nLine > 0)
             {
-                if (g_VirtualFile.active)
+                if (GetActiveDoc().vf.active)
                 {
                     // Virtual mode: scroll to the target line
                     size_t targetLine = (size_t)(nLine - 1);
-                    if (targetLine >= g_VirtualFile.totalLines)
-                        targetLine = g_VirtualFile.totalLines > 0 ? g_VirtualFile.totalLines - 1 : 0;
-                    g_VirtualFile.viewTopLine = targetLine;
-                    VirtualFileRenderWindow(g_VirtualFile, hEditor);
+                    if (targetLine >= GetActiveDoc().vf.totalLines)
+                        targetLine = GetActiveDoc().vf.totalLines > 0 ? GetActiveDoc().vf.totalLines - 1 : 0;
+                    GetActiveDoc().vf.viewTopLine = targetLine;
+                    VirtualFileRenderWindow(GetActiveDoc().vf, hEditor);
                     UpdateStatusBar();
                 }
                 else
@@ -1786,7 +1814,7 @@ void DoGoTo()
 void ToggleWordWrap()
 {
     // Word wrap not supported in virtual mode (breaks line-based virtualization)
-    if (g_VirtualFile.active) return;
+    if (GetActiveDoc().vf.active) return;
     
     bWordWrap = !bWordWrap;
     if (bWordWrap)
@@ -1807,6 +1835,10 @@ WNDPROC wpOrigEditProc;
 
 LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    Document* pDoc = DocFromEditor(hwnd);
+    if (!pDoc) return CallWindowProc(wpOrigEditProc, hwnd, msg, wParam, lParam);
+    VirtualFile& vf = pDoc->vf;
+
     if (msg == WM_DROPFILES)
     {
         HDROP hDrop = (HDROP)wParam;
@@ -1965,19 +1997,19 @@ LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 
         int scrollLines = (zDelta / WHEEL_DELTA) * lines;
 
-        if (g_VirtualFile.active)
+        if (vf.active)
         {
             // Virtual mode: scroll the virtual window
-            if (scrollLines > 0 && g_VirtualFile.viewTopLine < (size_t)scrollLines)
-                g_VirtualFile.viewTopLine = 0;
+            if (scrollLines > 0 && vf.viewTopLine < (size_t)scrollLines)
+                vf.viewTopLine = 0;
             else
-                g_VirtualFile.viewTopLine -= scrollLines;
+                vf.viewTopLine -= scrollLines;
 
-            if (g_VirtualFile.totalLines > (size_t)g_VirtualFile.visibleLines &&
-                g_VirtualFile.viewTopLine > g_VirtualFile.totalLines - g_VirtualFile.visibleLines)
-                g_VirtualFile.viewTopLine = g_VirtualFile.totalLines - g_VirtualFile.visibleLines;
+            if (vf.totalLines > (size_t)vf.visibleLines &&
+                vf.viewTopLine > vf.totalLines - vf.visibleLines)
+                vf.viewTopLine = vf.totalLines - vf.visibleLines;
 
-            VirtualFileRenderWindow(g_VirtualFile, hwnd);
+            VirtualFileRenderWindow(vf, hwnd);
             return 0;
         }
 
@@ -1985,7 +2017,7 @@ LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         SendMessage(hwnd, EM_LINESCROLL, 0, -scrollLines);
         return 0;
     }
-    else if (msg == WM_VSCROLL && g_VirtualFile.active)
+    else if (msg == WM_VSCROLL && vf.active)
     {
         SCROLLINFO si = {};
         si.cbSize = sizeof(si);
@@ -1993,188 +2025,251 @@ LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         GetScrollInfo(hwnd, SB_VERT, &si);
 
         size_t maxTop = 0;
-        if (g_VirtualFile.totalLines > (size_t)g_VirtualFile.visibleLines)
-            maxTop = g_VirtualFile.totalLines - g_VirtualFile.visibleLines;
+        if (vf.totalLines > (size_t)vf.visibleLines)
+            maxTop = vf.totalLines - vf.visibleLines;
 
         switch (LOWORD(wParam))
         {
         case SB_LINEUP:
-            if (g_VirtualFile.viewTopLine > 0) g_VirtualFile.viewTopLine--;
+            if (vf.viewTopLine > 0) vf.viewTopLine--;
             break;
         case SB_LINEDOWN:
-            if (g_VirtualFile.viewTopLine < maxTop) g_VirtualFile.viewTopLine++;
+            if (vf.viewTopLine < maxTop) vf.viewTopLine++;
             break;
         case SB_PAGEUP:
-            if (g_VirtualFile.viewTopLine > (size_t)si.nPage)
-                g_VirtualFile.viewTopLine -= si.nPage;
+            if (vf.viewTopLine > (size_t)si.nPage)
+                vf.viewTopLine -= si.nPage;
             else
-                g_VirtualFile.viewTopLine = 0;
+                vf.viewTopLine = 0;
             break;
         case SB_PAGEDOWN:
-            g_VirtualFile.viewTopLine = min(g_VirtualFile.viewTopLine + si.nPage, maxTop);
+            vf.viewTopLine = min(vf.viewTopLine + si.nPage, maxTop);
             break;
         case SB_THUMBTRACK:
         case SB_THUMBPOSITION:
-            g_VirtualFile.viewTopLine = (size_t)si.nTrackPos;
+            vf.viewTopLine = (size_t)si.nTrackPos;
             break;
         case SB_TOP:
-            g_VirtualFile.viewTopLine = 0;
+            vf.viewTopLine = 0;
             break;
         case SB_BOTTOM:
-            g_VirtualFile.viewTopLine = maxTop;
+            vf.viewTopLine = maxTop;
             break;
         }
 
-        if (g_VirtualFile.viewTopLine > maxTop) g_VirtualFile.viewTopLine = maxTop;
-        VirtualFileRenderWindow(g_VirtualFile, hwnd);
+        if (vf.viewTopLine > maxTop) vf.viewTopLine = maxTop;
+        VirtualFileRenderWindow(vf, hwnd);
         return 0;
     }
-    else if (msg == WM_KEYDOWN && g_VirtualFile.active)
+    else if (msg == WM_KEYDOWN && vf.active)
     {
         size_t maxTop = 0;
-        if (g_VirtualFile.totalLines > (size_t)g_VirtualFile.visibleLines)
-            maxTop = g_VirtualFile.totalLines - g_VirtualFile.visibleLines;
+        if (vf.totalLines > (size_t)vf.visibleLines)
+            maxTop = vf.totalLines - vf.visibleLines;
 
         BOOL handled = FALSE;
         if (wParam == VK_PRIOR) // Page Up
         {
-            if (g_VirtualFile.viewTopLine > (size_t)g_VirtualFile.visibleLines)
-                g_VirtualFile.viewTopLine -= g_VirtualFile.visibleLines;
+            if (vf.viewTopLine > (size_t)vf.visibleLines)
+                vf.viewTopLine -= vf.visibleLines;
             else
-                g_VirtualFile.viewTopLine = 0;
+                vf.viewTopLine = 0;
             handled = TRUE;
         }
         else if (wParam == VK_NEXT) // Page Down
         {
-            g_VirtualFile.viewTopLine = min(g_VirtualFile.viewTopLine + g_VirtualFile.visibleLines, maxTop);
+            vf.viewTopLine = min(vf.viewTopLine + vf.visibleLines, maxTop);
             handled = TRUE;
         }
         else if (wParam == VK_HOME && (GetKeyState(VK_CONTROL) & 0x8000))
         {
-            g_VirtualFile.viewTopLine = 0;
+            vf.viewTopLine = 0;
             handled = TRUE;
         }
         else if (wParam == VK_END && (GetKeyState(VK_CONTROL) & 0x8000))
         {
-            g_VirtualFile.viewTopLine = maxTop;
+            vf.viewTopLine = maxTop;
             handled = TRUE;
         }
         else if (wParam == VK_UP)
         {
-            if (g_VirtualFile.viewTopLine > 0) g_VirtualFile.viewTopLine--;
+            if (vf.viewTopLine > 0) vf.viewTopLine--;
             handled = TRUE;
         }
         else if (wParam == VK_DOWN)
         {
-            if (g_VirtualFile.viewTopLine < maxTop) g_VirtualFile.viewTopLine++;
+            if (vf.viewTopLine < maxTop) vf.viewTopLine++;
             handled = TRUE;
         }
 
         if (handled)
         {
-            VirtualFileRenderWindow(g_VirtualFile, hwnd);
+            VirtualFileRenderWindow(vf, hwnd);
             return 0;
         }
     }
     return CallWindowProc(wpOrigEditProc, hwnd, msg, wParam, lParam);
 }
 
-void CreateNewDocument(LPCTSTR pszFile)
+void GetEditorAreaRect(RECT* prcOut)
 {
-    if (g_Document.hEditor == NULL)
+    RECT rcClient;
+    GetClientRect(hMain, &rcClient);
+    int nStatusHeight = 0;
+    if (hStatus && IsWindowVisible(hStatus))
     {
-        // Create Editor
-        RECT rcClient;
-        GetClientRect(hMain, &rcClient);
         RECT rcStatus;
         GetWindowRect(hStatus, &rcStatus);
-        int nStatusHeight = rcStatus.bottom - rcStatus.top;
-        
-        g_Document.hEditor = CreateWindowEx(0, MSFTEDIT_CLASS, _T(""),
-                                     WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL | ES_DISABLENOSCROLL,
-                                     0, 0, rcClient.right, rcClient.bottom - nStatusHeight,
-                                     hMain, (HMENU)IDC_EDITOR, hInst, NULL);
-        hEditor = g_Document.hEditor;
-
-        // Disable smooth scrolling
-        SendMessage(g_Document.hEditor, EM_SETOPTIONS, ECOOP_OR, ECO_AUTOVSCROLL);
-        // Actually, smooth scrolling is often a system setting or mouse driver feature.
-        // But for RichEdit, we can try to ensure it scrolls by lines.
-        // There isn't a direct "Disable Smooth Scroll" message for RichEdit 4.1 (MSFTEDIT_CLASS).
-        // However, removing WS_EX_COMPOSITED might help if it was there (it's not).
-        // Some sources suggest handling WM_MOUSEWHEEL manually, but that's complex.
-        // Let's try setting the scroll speed or similar if possible.
-        // Wait, the user said "scrolling should be very snappy".
-        // Maybe they mean the "smooth scroll" animation that some modern apps do?
-        // RichEdit usually doesn't do smooth animation unless configured.
-        // But let's check if we can force it.
-        
-        // One trick is to handle WM_MOUSEWHEEL and do line scrolling manually.
-        // But let's first check if there is a simpler way.
-        // SystemParametersInfo(SPI_GETWHEELSCROLLLINES, ...)
-        
-        // If the user means the "smooth scrolling" where the content glides, that's usually not default in standard Win32 RichEdit.
-        // Unless they are on a trackpad.
-        
-        // However, if they mean "ES_AUTOVSCROLL" causes it to scroll when typing? No.
-        
-        // Let's try to handle WM_MOUSEWHEEL in EditorWndProc to force line jumps.
-        
-        SendMessage(g_Document.hEditor, EM_EXLIMITTEXT, 0, -1);
-        SendMessage(g_Document.hEditor, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE);
-        
-        HFONT hFont = CreateFont(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 
-                                     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, 
-                                     DEFAULT_PITCH | FF_SWISS, _T("Consolas"));
-        SendMessage(g_Document.hEditor, WM_SETFONT, (WPARAM)hFont, TRUE);
-
-        // Subclass Editor
-        wpOrigEditProc = (WNDPROC)SetWindowLongPtr(g_Document.hEditor, GWLP_WNDPROC, (LONG_PTR)EditorWndProc);
-        
-        // Disable OLE Drag & Drop to allow WM_DROPFILES
-        RevokeDragDrop(g_Document.hEditor);
-
-        // Enable Drag & Drop for Editor
-        DragAcceptFiles(g_Document.hEditor, TRUE);
-        
-        ApplyTheme();
+        nStatusHeight = rcStatus.bottom - rcStatus.top;
     }
-    else
+    RECT rc = {0, 0, rcClient.right, rcClient.bottom - nStatusHeight};
+    if (hTabCtrl && IsWindow(hTabCtrl))
     {
-        SetWindowText(g_Document.hEditor, _T(""));
+        MoveWindow(hTabCtrl, 0, 0, rc.right, rc.bottom, TRUE);
+        if (TabCtrl_GetItemCount(hTabCtrl) > 0)
+            TabCtrl_AdjustRect(hTabCtrl, FALSE, &rc);
+        else
+        {
+            int nStrip = 28;
+            if (rc.bottom > nStrip)
+                rc.top += nStrip;
+        }
     }
+    *prcOut = rc;
+}
 
-    g_Document.bIsDirty = FALSE;
-    g_Document.bLoading = FALSE;
-    g_Document.bPinned = FALSE;
-    g_Document.isBinary = FALSE;
-    g_Document.currentEncoding = ENC_UTF8;
-    g_Document.szFileName[0] = 0;
-    g_Document.ftLastWriteTime = {0};
-    
+void LayoutEditorAndTabs()
+{
+    if (!hMain || g_Documents.empty()) return;
+    RECT rc;
+    GetEditorAreaRect(&rc);
+    for (auto& d : g_Documents)
+    {
+        if (d.hEditor)
+            MoveWindow(d.hEditor, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, TRUE);
+    }
+}
+
+void BuildTabLabelText(const Document* doc, TCHAR* buf, size_t cch)
+{
+    if (doc->szFileName[0])
+        StringCchPrintf(buf, cch, _T("%s%s%s"), PathFindFileName(doc->szFileName), doc->isBinary ? _T(" [HEX]") : _T(""), doc->bIsDirty ? _T("*") : _T(""));
+    else
+        StringCchPrintf(buf, cch, _T("Untitled%s"), doc->bIsDirty ? _T("*") : _T(""));
+}
+
+void UpdateTabTitleForIndex(int index)
+{
+    if (!hTabCtrl || index < 0 || index >= (int)g_Documents.size()) return;
+    TCITEM tci = {0};
+    tci.mask = TCIF_TEXT;
+    TCHAR szTab[256];
+    BuildTabLabelText(&g_Documents[(size_t)index], szTab, 256);
+    tci.pszText = szTab;
+    TabCtrl_SetItem(hTabCtrl, index, &tci);
+}
+
+void SwitchToTab(int index)
+{
+    if (index < 0 || index >= (int)g_Documents.size()) return;
+    g_iActiveDocument = index;
+    hEditor = GetActiveDoc().hEditor;
+    if (hTabCtrl && TabCtrl_GetCurSel(hTabCtrl) != index)
+        TabCtrl_SetCurSel(hTabCtrl, index);
+    for (size_t i = 0; i < g_Documents.size(); ++i)
+    {
+        if (g_Documents[i].hEditor)
+            ShowWindow(g_Documents[i].hEditor, (int)i == index ? SW_SHOW : SW_HIDE);
+    }
+    LayoutEditorAndTabs();
+    if (hEditor)
+        SetFocus(hEditor);
+    UpdateTitle();
+    UpdateStatusBar();
+}
+
+void CreateNewDocument(LPCTSTR pszFile)
+{
+    RECT rc;
+    GetEditorAreaRect(&rc);
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+
+    g_Documents.emplace_back();
+    Document& doc = g_Documents.back();
+    HWND hEd = CreateWindowEx(0, MSFTEDIT_CLASS, _T(""),
+        WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL | ES_DISABLENOSCROLL,
+        rc.left, rc.top, w, h,
+        hMain, (HMENU)(UINT_PTR)(g_nextEditorMenuId++), hInst, NULL);
+    doc.hEditor = hEd;
+
+    SendMessage(hEd, EM_SETOPTIONS, ECOOP_OR, ECO_AUTOVSCROLL);
+    SendMessage(hEd, EM_EXLIMITTEXT, 0, -1);
+    SendMessage(hEd, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE);
+
+    static HFONT hEditFont = NULL;
+    if (!hEditFont)
+    {
+        hEditFont = CreateFont(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+            DEFAULT_PITCH | FF_SWISS, _T("Consolas"));
+    }
+    SendMessage(hEd, WM_SETFONT, (WPARAM)hEditFont, TRUE);
+
+    if (g_Documents.size() == 1)
+        // Subclass Editor
+        wpOrigEditProc = (WNDPROC)SetWindowLongPtr(hEd, GWLP_WNDPROC, (LONG_PTR)EditorWndProc);
+    else
+        SetWindowLongPtr(hEd, GWLP_WNDPROC, (LONG_PTR)EditorWndProc);
+
+    // Disable OLE Drag & Drop to allow WM_DROPFILES
+    RevokeDragDrop(hEd);
+
+    // Enable Drag & Drop for Editor
+    DragAcceptFiles(hEd, TRUE);
+
+    int newIndex = (int)g_Documents.size() - 1;
+    TCITEM tci = {0};
+    tci.mask = TCIF_TEXT;
+    TCHAR szTab[256];
+    BuildTabLabelText(&doc, szTab, 256);
+    tci.pszText = szTab;
+    TabCtrl_InsertItem(hTabCtrl, newIndex, &tci);
+
+    SwitchToTab(newIndex);
+    ApplyTheme();
+
+    doc.bIsDirty = FALSE;
+    doc.bLoading = FALSE;
+    doc.bPinned = FALSE;
+    doc.isBinary = FALSE;
+    doc.currentEncoding = ENC_UTF8;
+    doc.szFileName[0] = 0;
+    doc.ftLastWriteTime = {0};
     // Close any active virtual file
-    g_VirtualFile.Close();
-    
-    EnableWindow(g_Document.hEditor, TRUE);
-    SendMessage(g_Document.hEditor, EM_SETREADONLY, FALSE, 0);
+    doc.vf.Close();
+
+    EnableWindow(hEd, TRUE);
+    SendMessage(hEd, EM_SETREADONLY, FALSE, 0);
+    SetWindowText(hEd, _T(""));
 
     if (pszFile)
     {
-        StringCchCopy(g_Document.szFileName, MAX_PATH, pszFile);
+        StringCchCopy(doc.szFileName, MAX_PATH, pszFile);
         LoadFromFile(pszFile);
     }
     else
     {
-        g_PluginManager.NotifyFileEvent(L"", g_Document.hEditor, L"New");
+        g_PluginManager.NotifyFileEvent(L"", hEd, L"New");
     }
-    
+
     UpdateTitle();
     UpdateStatusBar();
 }
 
 void UpdateTitle()
 {
-    Document& doc = g_Document;
+    Document& doc = GetActiveDoc();
     
     // Set the full path as a window property for plugins to access
     // We cast the pointer to HANDLE. Since plugins run in the same process, they can read this memory.
@@ -2186,6 +2281,7 @@ void UpdateTitle()
     else
         StringCchPrintf(szTitle, MAX_PATH + 32, _T("Untitled%s - Just Notepad"), doc.bIsDirty ? _T("*") : _T(""));
     SetWindowText(hMain, szTitle);
+    UpdateTabTitleForIndex(g_iActiveDocument);
 }
 
 void UpdatePluginsMenu(HWND hwnd) {
@@ -2270,7 +2366,7 @@ void UpdateStatusBar()
 {
     if (!hStatus) return;
     
-    Document& doc = g_Document;
+    Document& doc = GetActiveDoc();
 
     CHARRANGE cr;
     SendMessage(hEditor, EM_EXGETSEL, 0, (LPARAM)&cr);
@@ -2279,8 +2375,8 @@ void UpdateStatusBar()
     long nCol = cr.cpMin - SendMessage(hEditor, EM_LINEINDEX, nLine, 0);
     
     // In virtual mode, offset line number by viewTopLine
-    if (g_VirtualFile.active)
-        nLine += (long)g_VirtualFile.viewTopLine;
+    if (GetActiveDoc().vf.active)
+        nLine += (long)GetActiveDoc().vf.viewTopLine;
     
     // Get text length
     GETTEXTLENGTHEX gtl = { GTL_DEFAULT, 1200 }; // 1200 is CP_UNICODE
@@ -2290,9 +2386,9 @@ void UpdateStatusBar()
     const EncodingInfo* info = GetEncodingInfo(doc.currentEncoding);
     long nBytes = 0;
 
-    if (g_VirtualFile.active)
+    if (GetActiveDoc().vf.active)
     {
-        nBytes = g_VirtualFile.fileSize;
+        nBytes = GetActiveDoc().vf.fileSize;
     }
     else if (doc.isBinary)
     {
@@ -2321,10 +2417,10 @@ void UpdateStatusBar()
     g_StatusText[0] = szStatus;
     SendMessage(hStatus, SB_SETTEXT, 0 | SBT_OWNERDRAW, 0);
 
-    if (doc.isBinary || g_VirtualFile.active)
+    if (doc.isBinary || GetActiveDoc().vf.active)
     {
-        if (g_VirtualFile.active)
-            StringCchPrintf(szStatus, 256, _T("Lines: %zu"), g_VirtualFile.totalLines);
+        if (GetActiveDoc().vf.active)
+            StringCchPrintf(szStatus, 256, _T("Lines: %zu"), GetActiveDoc().vf.totalLines);
         else
             StringCchPrintf(szStatus, 256, _T("Bytes: %d"), doc.fileSize);
     }
@@ -2354,7 +2450,7 @@ void UpdateStatusBar()
     const auto& plugins = g_PluginManager.GetPlugins();
     for (const auto& p : plugins) {
         if (p.enabled && p.GetPluginStatus) {
-            const wchar_t* status = p.GetPluginStatus(g_Document.szFileName);
+            const wchar_t* status = p.GetPluginStatus(GetActiveDoc().szFileName);
             if (status && status[0]) {
                 if (!pluginStatus.empty()) pluginStatus += L" | ";
                 pluginStatus += status;
@@ -2900,7 +2996,7 @@ void DoUnindent()
 
 void DoToggleReadOnly()
 {
-    Document& doc = g_Document;
+    Document& doc = GetActiveDoc();
 
     if (!doc.szFileName[0]) return;
     
@@ -2996,7 +3092,7 @@ void DoPluginSearch() {
     g_PluginSearch.allCommands = g_PluginManager.GetAllCommands();
     INT_PTR result = DialogBox(hInst, MAKEINTRESOURCE(IDD_PLUGIN_SEARCH), hMain, PluginSearchDlgProc);
     if (result > 0) {
-        g_PluginManager.ExecutePluginCommand((int)result, g_Document.hEditor);
+        g_PluginManager.ExecutePluginCommand((int)result, GetActiveDoc().hEditor);
     }
 }
 
@@ -3029,15 +3125,16 @@ void ApplyTheme()
         break;
     }
 
-    if (hEditor)
+    for (auto& d : g_Documents)
     {
-        SendMessage(hEditor, EM_SETBKGNDCOLOR, 0, bgColor);
-        
+        if (!d.hEditor) continue;
+        SendMessage(d.hEditor, EM_SETBKGNDCOLOR, 0, bgColor);
+
         CHARFORMAT2 cf = {0};
         cf.cbSize = sizeof(cf);
         cf.dwMask = CFM_COLOR;
         cf.crTextColor = textColor;
-        SendMessage(hEditor, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+        SendMessage(d.hEditor, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
     }
 }
 
@@ -3103,8 +3200,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
     case WM_CONTEXTMENU:
     {
-        if ((HWND)wParam == hEditor)
+        HWND hFrom = (HWND)wParam;
+        if (DocFromEditor(hFrom))
         {
+            for (size_t i = 0; i < g_Documents.size(); ++i)
+            {
+                if (g_Documents[i].hEditor == hFrom)
+                {
+                    SwitchToTab((int)i);
+                    break;
+                }
+            }
             HMENU hMenu = LoadMenu(hInst, MAKEINTRESOURCE(IDR_CONTEXTMENU));
             HMENU hSubMenu = GetSubMenu(hMenu, 0);
             
@@ -3238,6 +3344,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         hProgressBarStatus = CreateWindowEx(0, PROGRESS_CLASS, NULL, WS_CHILD,
             0, 0, 0, 0, hStatus, NULL, hInst, NULL);
 
+        // Tab Control
+        hTabCtrl = CreateWindowEx(0, WC_TABCONTROL, _T(""), WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_TABCTRL, hInst, NULL);
+
+        {
+            HDC hdc = GetDC(hwnd);
+            int nHeight = -MulDiv(10, GetDeviceCaps(hdc, LOGPIXELSY), 72);
+            ReleaseDC(hwnd, hdc);
+            hTabFont = CreateFont(nHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, _T("Segoe UI"));
+            if (hTabFont)
+                SendMessage(hTabCtrl, WM_SETFONT, (WPARAM)hTabFont, TRUE);
+        }
+
         // Create Initial Document
         CreateNewDocument(NULL);
 
@@ -3267,7 +3388,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_LOAD_COMPLETE:
     {
         LoadResult* res = (LoadResult*)lParam;
-        if (res && res->bSuccess && res->sequence == g_Document.loadSequence)
+        Document* pDoc = res ? DocFromEditor(res->hEditor) : nullptr;
+        if (res && res->bSuccess && pDoc && res->sequence == pDoc->loadSequence)
         {
             struct MemStreamContext {
                 LoadResult* res;
@@ -3293,28 +3415,41 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 return 0;
             };
             
-            SendMessage(g_Document.hEditor, WM_SETREDRAW, FALSE, 0);
+            SendMessage(pDoc->hEditor, WM_SETREDRAW, FALSE, 0);
             
             // Replace all content
-            SendMessage(g_Document.hEditor, EM_SETSEL, 0, -1);
-            SendMessage(g_Document.hEditor, EM_STREAMIN, SF_TEXT | SF_UNICODE, (LPARAM)&es);
+            SendMessage(pDoc->hEditor, EM_SETSEL, 0, -1);
+            SendMessage(pDoc->hEditor, EM_STREAMIN, SF_TEXT | SF_UNICODE, (LPARAM)&es);
             
-            SendMessage(g_Document.hEditor, WM_SETREDRAW, TRUE, 0);
-            InvalidateRect(g_Document.hEditor, NULL, TRUE);
+            SendMessage(pDoc->hEditor, WM_SETREDRAW, TRUE, 0);
+            InvalidateRect(pDoc->hEditor, NULL, TRUE);
             
-            DWORD dwAttrs = GetFileAttributes(g_Document.szFileName);
+            DWORD dwAttrs = GetFileAttributes(pDoc->szFileName);
             BOOL bReadOnly = (dwAttrs != INVALID_FILE_ATTRIBUTES) && (dwAttrs & FILE_ATTRIBUTE_READONLY);
-            SendMessage(g_Document.hEditor, EM_SETREADONLY, bReadOnly, 0);
+            SendMessage(pDoc->hEditor, EM_SETREADONLY, bReadOnly, 0);
             
             // Notify plugins
-            g_PluginManager.NotifyFileEvent(g_Document.szFileName, g_Document.hEditor, L"Loaded");
+            g_PluginManager.NotifyFileEvent(pDoc->szFileName, pDoc->hEditor, L"Loaded");
 
             ShowWindow(hProgressBarStatus, SW_HIDE);
-            g_Document.bLoading = FALSE;
+            pDoc->bLoading = FALSE;
             
             // Ensure event mask is set
-            SendMessage(g_Document.hEditor, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE);
+            SendMessage(pDoc->hEditor, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE);
             
+            if (pDoc == &GetActiveDoc())
+                UpdateTitle();
+            else
+            {
+                for (size_t i = 0; i < g_Documents.size(); ++i)
+                {
+                    if (&g_Documents[i] == pDoc)
+                    {
+                        UpdateTabTitleForIndex((int)i);
+                        break;
+                    }
+                }
+            }
             UpdateStatusBar();
         }
         
@@ -3324,7 +3459,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_TIMER:
         if (wParam == 1)
         {
-            Document& doc = g_Document;
+            Document& doc = GetActiveDoc();
             if (doc.szFileName[0])
             {
                 FILETIME ftCurrent;
@@ -3360,12 +3495,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     // Use EM_GETREADONLY for RichEdit
                     // But we can also check the menu state or just force sync
                     // Let's check the style
-                    DWORD dwStyle = GetWindowLong(g_Document.hEditor, GWL_STYLE);
+                    DWORD dwStyle = GetWindowLong(GetActiveDoc().hEditor, GWL_STYLE);
                     BOOL bEditorReadOnly = (dwStyle & ES_READONLY) != 0;
                     
                     if (bFileReadOnly != bEditorReadOnly)
                     {
-                        SendMessage(g_Document.hEditor, EM_SETREADONLY, bFileReadOnly, 0);
+                        SendMessage(GetActiveDoc().hEditor, EM_SETREADONLY, bFileReadOnly, 0);
                         HMENU hMenu = GetMenu(hwnd);
                         CheckMenuItem(hMenu, ID_FILE_TOGGLEREADONLY, bFileReadOnly ? MF_CHECKED : MF_UNCHECKED);
                     }
@@ -3418,16 +3553,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
         }
 
-        if (g_Document.hEditor)
+        LayoutEditorAndTabs();
+        if (!g_Documents.empty() && GetActiveDoc().hEditor && GetActiveDoc().vf.active)
         {
-            MoveWindow(g_Document.hEditor, 0, 0, rcClient.right, rcClient.bottom - nStatusHeight, TRUE);
-            
-            // Re-render virtual window on resize
-            if (g_VirtualFile.active)
-            {
-                VirtualFileComputeVisibleLines(g_VirtualFile, g_Document.hEditor);
-                VirtualFileRenderWindow(g_VirtualFile, g_Document.hEditor);
-            }
+            VirtualFileComputeVisibleLines(GetActiveDoc().vf, GetActiveDoc().hEditor);
+            VirtualFileRenderWindow(GetActiveDoc().vf, GetActiveDoc().hEditor);
         }
 
         // Resize Progress Bar
@@ -3473,8 +3603,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_NOTIFY:
     {
         NMHDR *pnm = (NMHDR *)lParam;
+
+        // tab control selection change
+        if (pnm->hwndFrom == hTabCtrl && pnm->code == TCN_SELCHANGE)
+        {
+            int sel = TabCtrl_GetCurSel(hTabCtrl);
+            if (sel >= 0 && sel != g_iActiveDocument)
+                SwitchToTab(sel);
+            return 0;
+        }
         
-        if (pnm->hwndFrom == g_Document.hEditor && pnm->code == EN_SELCHANGE)
+        if (pnm->hwndFrom == GetActiveDoc().hEditor && pnm->code == EN_SELCHANGE)
         {
             UpdateStatusBar();
         }
@@ -3537,7 +3676,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 for (const auto& info : g_Encodings)
                 {
                     UINT uFlags = MF_STRING;
-                    if (g_Document.currentEncoding == info.id)
+                    if (GetActiveDoc().currentEncoding == info.id)
                     {
                         uFlags |= MF_CHECKED;
                     }
@@ -3590,16 +3729,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 
         
-        Document& doc = g_Document;
+        Document& doc = GetActiveDoc();
         for (const auto& info : g_Encodings)
         {
              CheckMenuItem(hMenu, info.cmdId, (doc.currentEncoding == info.id) ? MF_CHECKED : MF_UNCHECKED);
         }
 
         // Read Only
-        long style = GetWindowLong(g_Document.hEditor, GWL_STYLE);
+        long style = GetWindowLong(GetActiveDoc().hEditor, GWL_STYLE);
         CheckMenuItem(hMenu, ID_FILE_TOGGLEREADONLY, (style & ES_READONLY) ? MF_CHECKED : MF_UNCHECKED);
-        EnableMenuItem(hMenu, ID_FILE_TOGGLEREADONLY, g_Document.bLoading ? MF_GRAYED : MF_ENABLED);
+        EnableMenuItem(hMenu, ID_FILE_TOGGLEREADONLY, GetActiveDoc().bLoading ? MF_GRAYED : MF_ENABLED);
         
         // View Menu Items
         CheckMenuItem(hMenu, ID_VIEW_STATUSBAR, IsWindowVisible(hStatus) ? MF_CHECKED : MF_UNCHECKED);
@@ -3609,7 +3748,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         if (LOWORD(wParam) == IDC_EDITOR && HIWORD(wParam) == EN_CHANGE)
         {
-            Document& doc = g_Document;
+            Document& doc = GetActiveDoc();
             if (!doc.bLoading)
             {
                 if (!doc.bIsDirty)
@@ -3671,8 +3810,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 const EncodingInfo* info = GetEncodingInfoByCmd(LOWORD(wParam));
                 if (info)
                 {
-                    g_Document.currentEncoding = info->id; 
-                    g_Document.bIsDirty = TRUE;
+                    GetActiveDoc().currentEncoding = info->id; 
+                    GetActiveDoc().bIsDirty = TRUE;
                     UpdateStatusBar(); 
                     UpdateTitle(); 
                 }
@@ -3783,16 +3922,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
 
         case ID_TAB_COPY_PATH:
-            if (g_Document.szFileName[0])
+            if (GetActiveDoc().szFileName[0])
             {
                 if (OpenClipboard(hwnd))
                 {
                     EmptyClipboard();
-                    size_t len = (_tcslen(g_Document.szFileName) + 1) * sizeof(TCHAR);
+                    size_t len = (_tcslen(GetActiveDoc().szFileName) + 1) * sizeof(TCHAR);
                     HGLOBAL hGlob = GlobalAlloc(GMEM_MOVEABLE, len);
                     if (hGlob)
                     {
-                        memcpy(GlobalLock(hGlob), g_Document.szFileName, len);
+                        memcpy(GlobalLock(hGlob), GetActiveDoc().szFileName, len);
                         GlobalUnlock(hGlob);
                         SetClipboardData(CF_UNICODETEXT, hGlob);
                     }
@@ -3801,13 +3940,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             break;
         case ID_TAB_COPY_RELATIVE_PATH:
-            if (g_Document.szFileName[0])
+            if (GetActiveDoc().szFileName[0])
             {
                 TCHAR szPath[MAX_PATH];
                 TCHAR szCurrentDir[MAX_PATH];
                 GetCurrentDirectory(MAX_PATH, szCurrentDir);
                 
-                if (PathRelativePathTo(szPath, szCurrentDir, FILE_ATTRIBUTE_DIRECTORY, g_Document.szFileName, FILE_ATTRIBUTE_NORMAL))
+                if (PathRelativePathTo(szPath, szCurrentDir, FILE_ATTRIBUTE_DIRECTORY, GetActiveDoc().szFileName, FILE_ATTRIBUTE_NORMAL))
                 {
                     if (OpenClipboard(hwnd))
                     {
@@ -3826,20 +3965,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             break;
         case ID_TAB_REVEAL_IN_EXPLORER:
-            if (g_Document.szFileName[0])
+            if (GetActiveDoc().szFileName[0])
             {
                 TCHAR szParam[MAX_PATH + 10];
-                StringCchPrintf(szParam, MAX_PATH + 10, _T("/select,\"%s\""), g_Document.szFileName);
+                StringCchPrintf(szParam, MAX_PATH + 10, _T("/select,\"%s\""), GetActiveDoc().szFileName);
                 ShellExecute(NULL, _T("open"), _T("explorer.exe"), szParam, NULL, SW_SHOW);
             }
             break;
         case ID_TAB_OPEN_NEW_WINDOW:
-            if (g_Document.szFileName[0])
+            if (GetActiveDoc().szFileName[0])
             {
                 TCHAR szExe[MAX_PATH];
                 GetModuleFileName(NULL, szExe, MAX_PATH);
                 TCHAR szParam[MAX_PATH + 2];
-                StringCchPrintf(szParam, MAX_PATH + 2, _T("\"%s\""), g_Document.szFileName);
+                StringCchPrintf(szParam, MAX_PATH + 2, _T("\"%s\""), GetActiveDoc().szFileName);
                 ShellExecute(NULL, _T("open"), szExe, szParam, NULL, SW_SHOW);
             }
             break;
@@ -3847,7 +3986,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         
         // Handle Plugins
         if (LOWORD(wParam) >= ID_PLUGIN_FIRST && LOWORD(wParam) <= ID_PLUGIN_LAST) {
-            g_PluginManager.ExecutePluginCommand(LOWORD(wParam), g_Document.hEditor);
+            g_PluginManager.ExecutePluginCommand(LOWORD(wParam), GetActiveDoc().hEditor);
         }
 
         // Handle Recent Files
@@ -3856,10 +3995,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             int index = LOWORD(wParam) - ID_FILE_RECENT_FIRST;
             if (index >= 0 && index < recentFiles.size())
             {
-                if (CheckSaveChanges())
-                {
-                    LoadFromFile(recentFiles[index].c_str());
-                }
+                // no more need to check save changes, just open the file in a new tab
+                OpenFile(recentFiles[index].c_str());
             }
         }
         else if (LOWORD(wParam) == ID_FILE_RECENT_LAST) // Clear
@@ -3877,7 +4014,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         return 0;
     case WM_DESTROY:
-        g_VirtualFile.Close();
+        for (auto& d : g_Documents)
+            d.vf.Close();
+        if (hTabFont)
+        {
+            DeleteObject(hTabFont); // no leaks :)
+            hTabFont = NULL;
+        }
         PostQuitMessage(0);
         break;
     default:
@@ -3897,13 +4040,16 @@ void Host_SaveFile() {
 }
 
 void Host_OpenFile(const wchar_t* filePath) {
-    LoadFromFile(filePath);
-    AddRecentFile(filePath);
+    if (CheckSaveChanges())
+    {
+        CreateNewDocument(filePath);
+        AddRecentFile(filePath);
+    }
 }
 
 void Host_GetCurrentFilePath(wchar_t* buffer, int length) {
     if (buffer && length > 0) {
-        StringCchCopyW(buffer, length, g_Document.szFileName);
+        StringCchCopyW(buffer, length, GetActiveDoc().szFileName);
     }
 }
 
@@ -3915,7 +4061,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
-    icex.dwICC = ICC_BAR_CLASSES | ICC_LINK_CLASS;
+    icex.dwICC = ICC_BAR_CLASSES | ICC_LINK_CLASS | ICC_TAB_CLASSES;
     InitCommonControlsEx(&icex);
 
     WNDCLASSEX wc = {0};
