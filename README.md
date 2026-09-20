@@ -44,18 +44,22 @@ Here's an extensive list of all the plugins and what I use them for:
 
 # Building
 
-To build the project, you can use the provided PowerShell scripts:
+Requires Visual Studio 2022 (or the standalone Build Tools) with the C++ workload, plus CMake. Ninja is used automatically when it is on PATH.
 
-- `build.ps1`: Compiles the project (Debug or Release).
-- `package.ps1`: Builds, runs tests, and packages the application for release.
-- `rebuild.ps1`: Cleans the build directory, downloads dependencies, and rebuilds everything.
-- `release.ps1`: Automates the release process (packaging and pushing to GitHub).
+- `build.ps1`: Configures if needed and builds, then launches the app. `-BuildOnly` skips launching, `-Reconfigure` forces a fresh CMake configure, `-Configuration Debug|Release`, `-Generator "..."`.
+- `rebuild.ps1`: Fetches plugin dependencies, wipes `build/`, then builds from scratch.
+- `clean.ps1`: Removes `build/`.
+- `package.ps1`: Stamps `src/Version.h`, builds, runs tests and produces `releases/JustNotepad-v<version>.zip` plus a git tag.
+- `release.ps1`: Full release — syncs `docs/index.html` from this README, packages, pushes the branch and tag, and creates the GitHub release with the zip attached.
+- `common.ps1`: Shared helpers for the scripts above (CMake/MSVC discovery, generator handling). Not run directly.
 
-To build the project, run:
+The scripts locate CMake and, when using Ninja, import the MSVC environment themselves, so a plain PowerShell window is enough:
 
 ```powershell
 .\build.ps1
 ```
+
+The zip attached to a GitHub release is what the in-app updater (Help -> Check for Updates) downloads, so `release.ps1` needs the GitHub CLI (`gh`) installed to publish it.
 
 # License
 

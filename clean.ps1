@@ -1,16 +1,22 @@
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'common.ps1')
 
-# Resolve paths
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$BuildDir = Join-Path $Root 'build'
+$BuildDir = Join-Path $PSScriptRoot 'build'
 
-# Ensure no running instance blocks deletion
-Get-Process "Just Notepad" -ErrorAction SilentlyContinue | Stop-Process -Force
+Stop-JustNotepad
 
-# Clean build folder
 if (Test-Path $BuildDir) {
     Write-Host "Cleaning build directory..." -ForegroundColor Yellow
-    Remove-Item -Recurse -Force $BuildDir
+    # Retry: the linker or an antivirus scanner can still hold a handle briefly.
+    for ($i = 1; $i -le 5; $i++) {
+        try {
+            Remove-Item -Recurse -Force $BuildDir -ErrorAction Stop
+            break
+        } catch {
+            if ($i -eq 5) { throw "Could not remove '$BuildDir': $($_.Exception.Message)" }
+            Start-Sleep -Milliseconds 500
+        }
+    }
     Write-Host "Build directory cleaned." -ForegroundColor Green
 } else {
     Write-Host "Build directory does not exist." -ForegroundColor Yellow

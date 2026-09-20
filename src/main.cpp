@@ -3,6 +3,7 @@
 #include <commdlg.h>
 #include <richedit.h>
 #include <commctrl.h>
+#include <windowsx.h>
 #include <tchar.h>
 #include <strsafe.h>
 #include <vector>
@@ -24,6 +25,7 @@
 #include "resource.h"
 #include "TextHelpers.h"
 #include "PluginManager.h"
+#include "Updater.h"
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -250,6 +252,19 @@ void LayoutEditorAndTabs();
 void GetEditorAreaRect(RECT* prcOut);
 void BuildTabLabelText(const Document* doc, TCHAR* buf, size_t cch);
 void UpdateTabTitleForIndex(int index);
+void UpdateTabMetrics();
+void CloseDocument(int index);
+
+// Posted (never sent) when a tab's close button is clicked, so the tab control
+// is not destroying windows from inside its own message handling.
+#define WM_APP_CLOSE_TAB (WM_APP + 330)
+
+void SetStatusProgress(int percent);
+
+// Posted to ourselves right after the window is on screen so that anything
+// which touches the disk (plugin DLLs, config) happens after the first paint.
+#define WM_APP_DEFERRED_INIT (WM_APP + 320)
+void DeferredStartupInit(HWND hwnd);
 
 #define WM_LOAD_COMPLETE (WM_USER + 102)
 #define WM_LOAD_PROGRESS (WM_USER + 103)
@@ -1457,6 +1472,12 @@ INT_PTR CALLBACK AboutDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
         }
         break;
     case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_ABOUT_UPDATE)
+        {
+            EndDialog(hDlg, IDOK);
+            PostMessage(hMain, WM_COMMAND, ID_HELP_CHECKUPDATES, 0);
+            return (INT_PTR)TRUE;
+        }
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
         {
             EndDialog(hDlg, LOWORD(wParam));
@@ -2150,12 +2171,318 @@ void LayoutEditorAndTabs()
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tab close buttons
+// ---------------------------------------------------------------------------
+static int  g_TabHoverClose = -1;   // tab whose close button the mouse is over
+static int  g_TabPressClose = -1;   // tab whose close button is being pressed
+static bool g_TabTracking = false;
+static WNDPROC wpOrigTabProc = NULL;
+
+static int TabScale(int value)
+{
+    UINT dpi = hMain ? GetDpiForWindow(hMain) : 96;
+    if (dpi == 0) dpi = 96;
+    return MulDiv(value, (int)dpi, 96);
+}
+
+static int TabCloseButtonSize() { return TabScale(14); }
+
+// The square the "x" is drawn in, given a tab's rectangle.
+static RECT CloseRectFromItemRect(const RECT& rcItem)
+{
+    int size = TabCloseButtonSize();
+    int margin = TabScale(5);
+    int cy = (rcItem.top + rcItem.bottom) / 2;
+
+    RECT rc;
+    rc.right = rcItem.right - margin;
+    rc.left = rc.right - size;
+    rc.top = cy - size / 2;
+    rc.bottom = rc.top + size;
+    return rc;
+}
+
+static BOOL GetTabCloseRect(int index, RECT* prc)
+{
+    if (!hTabCtrl || !prc) return FALSE;
+    RECT rcItem;
+    if (!TabCtrl_GetItemRect(hTabCtrl, index, &rcItem)) return FALSE;
+    // The selected tab is rendered a couple of pixels larger than reported.
+    if (index == TabCtrl_GetCurSel(hTabCtrl))
+        InflateRect(&rcItem, TabScale(2), TabScale(2));
+    *prc = CloseRectFromItemRect(rcItem);
+    return TRUE;
+}
+
+// Index of the tab whose close button is under pt, or -1.
+static int TabCloseHitTest(POINT pt)
+{
+    int count = TabCtrl_GetItemCount(hTabCtrl);
+    for (int i = 0; i < count; ++i)
+    {
+        RECT rc;
+        if (!GetTabCloseRect(i, &rc)) continue;
+        // The selected tab is drawn slightly taller than GetItemRect reports.
+        InflateRect(&rc, TabScale(2), TabScale(3));
+        if (PtInRect(&rc, pt)) return i;
+    }
+    return -1;
+}
+
+static int TabHitTest(POINT pt)
+{
+    TCHITTESTINFO hti = {0};
+    hti.pt = pt;
+    return TabCtrl_HitTest(hTabCtrl, &hti);
+}
+
+static void DrawTabCloseButton(HDC hdc, const RECT& rc, BOOL bHot, BOOL bPressed)
+{
+    if (bHot || bPressed)
+    {
+        COLORREF crFill = bPressed ? RGB(205, 92, 92) : RGB(232, 17, 35);
+        HBRUSH hBr = CreateSolidBrush(crFill);
+        FillRect(hdc, &rc, hBr);
+        DeleteObject(hBr);
+    }
+
+    int inset = TabScale(4);
+    RECT g = rc;
+    InflateRect(&g, -inset, -inset);
+
+    COLORREF crLine = (bHot || bPressed) ? RGB(255, 255, 255) : GetSysColor(COLOR_BTNTEXT);
+    HPEN hPen = CreatePen(PS_SOLID, TabScale(1) < 1 ? 1 : TabScale(1), crLine);
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+
+    MoveToEx(hdc, g.left, g.top, NULL);
+    LineTo(hdc, g.right, g.bottom);
+    MoveToEx(hdc, g.right - 1, g.top, NULL);
+    LineTo(hdc, g.left - 1, g.bottom);
+
+    SelectObject(hdc, hOldPen);
+    DeleteObject(hPen);
+}
+
+// Native tabs size themselves to their label, so all that is needed here is
+// enough horizontal padding to leave room for the close button on the right.
+void UpdateTabMetrics()
+{
+    if (!hTabCtrl) return;
+    TabCtrl_SetPadding(hTabCtrl, TabScale(4) + TabCloseButtonSize(), TabScale(3));
+}
+
+// Closes the document at index. The last remaining tab is emptied instead of
+// removed, so the window never ends up with no document at all.
+void CloseDocument(int index)
+{
+    if (index < 0 || index >= (int)g_Documents.size()) return;
+
+    // The save prompt works on the active document.
+    if (index != g_iActiveDocument) SwitchToTab(index);
+    if (!CheckSaveChanges()) return;
+
+    if (g_Documents.size() == 1)
+    {
+        Document& doc = g_Documents[0];
+        doc.loadSequence++;          // abandon any in-flight background load
+        doc.vf.Close();
+        doc.szFileName[0] = 0;
+        doc.isBinary = FALSE;
+        doc.currentEncoding = ENC_UTF8;
+        doc.ftLastWriteTime = {0};
+        if (doc.hEditor)
+        {
+            SendMessage(doc.hEditor, EM_SETREADONLY, FALSE, 0);
+            SetWindowText(doc.hEditor, _T(""));
+            SendMessage(doc.hEditor, EM_EMPTYUNDOBUFFER, 0, 0);
+        }
+        doc.bIsDirty = FALSE;
+        UpdateTabTitleForIndex(0);
+        UpdateTabMetrics();
+        UpdateTitle();
+        UpdateStatusBar();
+        g_PluginManager.NotifyFileEvent(L"", doc.hEditor, L"New");
+        if (doc.hEditor) SetFocus(doc.hEditor);
+        return;
+    }
+
+    HWND hEd = g_Documents[(size_t)index].hEditor;
+    g_Documents[(size_t)index].loadSequence++;
+    g_Documents[(size_t)index].vf.Close();
+    g_Documents.erase(g_Documents.begin() + index);
+    TabCtrl_DeleteItem(hTabCtrl, index);
+    if (hEd) DestroyWindow(hEd);
+
+    g_TabHoverClose = -1;
+    g_TabPressClose = -1;
+
+    int next = index;
+    if (next >= (int)g_Documents.size()) next = (int)g_Documents.size() - 1;
+
+    g_iActiveDocument = -1;      // force SwitchToTab to rewire everything
+    TabCtrl_SetCurSel(hTabCtrl, next);
+    SwitchToTab(next);
+    UpdateTabMetrics();
+    InvalidateRect(hTabCtrl, NULL, TRUE);
+}
+
+// Subclass of the tab control: hover feedback, close-on-click and
+// close-on-middle-click.
+static LRESULT CALLBACK TabWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_MOUSEMOVE:
+    {
+        if (!g_TabTracking)
+        {
+            TRACKMOUSEEVENT tme = {0};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            if (TrackMouseEvent(&tme)) g_TabTracking = true;
+        }
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int hit = TabCloseHitTest(pt);
+        if (hit != g_TabHoverClose)
+        {
+            g_TabHoverClose = hit;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        break;
+    }
+    case WM_MOUSELEAVE:
+        g_TabTracking = false;
+        if (g_TabHoverClose != -1)
+        {
+            g_TabHoverClose = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        break;
+    case WM_LBUTTONDOWN:
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int hit = TabCloseHitTest(pt);
+        if (hit >= 0)
+        {
+            // Swallow it so the tab is not selected by the close click.
+            g_TabPressClose = hit;
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        break;
+    }
+    case WM_LBUTTONUP:
+    {
+        if (g_TabPressClose >= 0)
+        {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            int pressed = g_TabPressClose;
+            g_TabPressClose = -1;
+            ReleaseCapture();
+            InvalidateRect(hwnd, NULL, FALSE);
+            if (TabCloseHitTest(pt) == pressed)
+                PostMessage(hMain, WM_APP_CLOSE_TAB, (WPARAM)pressed, 0);
+            return 0;
+        }
+        break;
+    }
+    case WM_MBUTTONDOWN:
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int hit = TabHitTest(pt);
+        if (hit >= 0)
+        {
+            PostMessage(hMain, WM_APP_CLOSE_TAB, (WPARAM)hit, 0);
+            return 0;
+        }
+        break;
+    }
+    case WM_PAINT:
+    {
+        // Let the control paint the tabs, then overlay the close buttons.
+        LRESULT res = CallWindowProc(wpOrigTabProc, hwnd, msg, wParam, lParam);
+        HDC hdc = GetDC(hwnd);
+        if (hdc)
+        {
+            int count = TabCtrl_GetItemCount(hwnd);
+            for (int i = 0; i < count; ++i)
+            {
+                RECT rcClose;
+                if (!GetTabCloseRect(i, &rcClose)) continue;
+                DrawTabCloseButton(hdc, rcClose,
+                                   g_TabHoverClose == i,
+                                   g_TabPressClose == i);
+            }
+            ReleaseDC(hwnd, hdc);
+        }
+        return res;
+    }
+    case WM_CAPTURECHANGED:
+        if (g_TabPressClose >= 0)
+        {
+            g_TabPressClose = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        break;
+    }
+    return CallWindowProc(wpOrigTabProc, hwnd, msg, wParam, lParam);
+}
+
+// Tabs grow with the file name up to this much text; longer names are cut
+// down with an ellipsis so one long path cannot swallow the whole tab strip.
+static int TabMaxTextWidth() { return TabScale(200); }
+
+// Shortens buf in place so that it renders no wider than TabMaxTextWidth().
+static void TruncateTabLabel(TCHAR* buf, size_t cch)
+{
+    if (!hTabCtrl || !buf || !buf[0]) return;
+
+    int len = (int)_tcsnlen(buf, cch);
+    if (len <= 0) return;
+
+    HDC hdc = GetDC(hTabCtrl);
+    if (!hdc) return;
+    HFONT hFont = hTabFont ? hTabFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT hOld = (HFONT)SelectObject(hdc, hFont);
+
+    int maxWidth = TabMaxTextWidth();
+    SIZE sz = {0};
+    GetTextExtentPoint32(hdc, buf, len, &sz);
+
+    if (sz.cx > maxWidth)
+    {
+        const TCHAR* ell = _T("\x2026");    // single-character ellipsis
+        SIZE szEll = {0};
+        GetTextExtentPoint32(hdc, ell, 1, &szEll);
+        int budget = maxWidth - szEll.cx;
+        if (budget < 0) budget = 0;
+
+        // Longest prefix that still fits, then append the ellipsis.
+        int fit = 0;
+        GetTextExtentExPoint(hdc, buf, len, budget, &fit, NULL, &sz);
+        if (fit < 1) fit = 1;
+        if ((size_t)(fit + 1) < cch)
+        {
+            buf[fit] = ell[0];
+            buf[fit + 1] = 0;
+        }
+    }
+
+    SelectObject(hdc, hOld);
+    ReleaseDC(hTabCtrl, hdc);
+}
+
 void BuildTabLabelText(const Document* doc, TCHAR* buf, size_t cch)
 {
     if (doc->szFileName[0])
         StringCchPrintf(buf, cch, _T("%s%s%s"), PathFindFileName(doc->szFileName), doc->isBinary ? _T(" [HEX]") : _T(""), doc->bIsDirty ? _T("*") : _T(""));
     else
         StringCchPrintf(buf, cch, _T("Untitled%s"), doc->bIsDirty ? _T("*") : _T(""));
+
+    TruncateTabLabel(buf, cch);
 }
 
 void UpdateTabTitleForIndex(int index)
@@ -2167,6 +2494,8 @@ void UpdateTabTitleForIndex(int index)
     BuildTabLabelText(&g_Documents[(size_t)index], szTab, 256);
     tci.pszText = szTab;
     TabCtrl_SetItem(hTabCtrl, index, &tci);
+    UpdateTabMetrics();
+    InvalidateRect(hTabCtrl, NULL, FALSE);
 }
 
 void SwitchToTab(int index)
@@ -2235,6 +2564,7 @@ void CreateNewDocument(LPCTSTR pszFile)
     BuildTabLabelText(&doc, szTab, 256);
     tci.pszText = szTab;
     TabCtrl_InsertItem(hTabCtrl, newIndex, &tci);
+    UpdateTabMetrics();
 
     SwitchToTab(newIndex);
     ApplyTheme();
@@ -3345,8 +3675,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             0, 0, 0, 0, hStatus, NULL, hInst, NULL);
 
         // Tab Control
-        hTabCtrl = CreateWindowEx(0, WC_TABCONTROL, _T(""), WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+        hTabCtrl = CreateWindowEx(0, WC_TABCONTROL, _T(""),
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_FOCUSNEVER,
             0, 0, 0, 0, hwnd, (HMENU)IDC_TABCTRL, hInst, NULL);
+
+        // Close buttons need hover feedback and click handling of their own.
+        if (hTabCtrl)
+            wpOrigTabProc = (WNDPROC)SetWindowLongPtr(hTabCtrl, GWLP_WNDPROC, (LONG_PTR)TabWndProc);
 
         {
             HDC hdc = GetDC(hwnd);
@@ -3511,6 +3846,72 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             UpdateStatusBar();
         }
         break;
+    case WM_APP_CLOSE_TAB:
+        CloseDocument((int)wParam);
+        return 0;
+    case WM_APP_DEFERRED_INIT:
+        DeferredStartupInit(hwnd);
+        return 0;
+    case WM_UPDATE_STATUS:
+    {
+        int percent = (int)wParam;
+        if (hProgressBarStatus)
+        {
+            if (percent < 0)
+            {
+                ShowWindow(hProgressBarStatus, SW_HIDE);
+            }
+            else
+            {
+                SendMessage(hProgressBarStatus, PBM_SETRANGE32, 0, 100);
+                if (!IsWindowVisible(hProgressBarStatus))
+                {
+                    ShowWindow(hProgressBarStatus, SW_SHOW);
+                    SendMessage(hwnd, WM_SIZE, 0, 0);
+                }
+                SendMessage(hProgressBarStatus, PBM_SETPOS, percent, 0);
+            }
+        }
+        return 0;
+    }
+    case WM_UPDATE_DONE:
+    {
+        wchar_t* pszMsg = (wchar_t*)lParam;
+        if (pszMsg)
+        {
+            MessageBoxW(hwnd, pszMsg, L"Just Notepad",
+                        MB_OK | (wParam == UPDATE_FAILED ? MB_ICONWARNING : MB_ICONINFORMATION));
+            Updater_FreeString(pszMsg);
+        }
+        Updater_Reset();
+        return 0;
+    }
+    case WM_UPDATE_READY:
+    {
+        wchar_t* pszZip = (wchar_t*)lParam;
+        if (!pszZip) { Updater_Reset(); return 0; }
+
+        int r = MessageBoxW(hwnd,
+            L"A new version has been downloaded.\r\n\r\n"
+            L"Just Notepad will close, install the update and start again.\r\n"
+            L"Continue?",
+            L"Update Ready", MB_OKCANCEL | MB_ICONQUESTION);
+
+        if (r == IDOK && CheckAllSaveChanges())
+        {
+            if (Updater_LaunchApplier(pszZip, hwnd))
+            {
+                Updater_FreeString(pszZip);
+                SaveConfig();
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            MessageBoxW(hwnd, L"The update could not be started.", L"Just Notepad", MB_OK | MB_ICONWARNING);
+        }
+        Updater_FreeString(pszZip);
+        Updater_Reset();
+        return 0;
+    }
     case WM_UPDATE_PROGRESS:
     {
         int percent = (int)wParam;
@@ -3820,8 +4221,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 
         
+        case ID_FILE_CLOSETAB:
+            CloseDocument(g_iActiveDocument);
+            break;
+
         case ID_HELP_ABOUT:
             DoAbout();
+            break;
+
+        case ID_HELP_CHECKUPDATES:
+            if (Updater_IsBusy())
+            {
+                MessageBox(hwnd, _T("An update check is already running."), _T("Just Notepad"), MB_OK | MB_ICONINFORMATION);
+            }
+            else
+            {
+                SetCursor(LoadCursor(NULL, IDC_APPSTARTING));
+                Updater_CheckForUpdates(hwnd, false);
+            }
             break;
 
         case ID_EDIT_UNDO: SendMessage(hEditor, EM_UNDO, 0, 0); break;
@@ -4053,12 +4470,41 @@ void Host_GetCurrentFilePath(wchar_t* buffer, int length) {
     }
 }
 
+// Everything here touches the disk (plugin DLLs, ini files), so it runs after
+// the main window is already visible. On a cold start this is what used to make
+// the app appear to hang for seconds before anything was drawn.
+void DeferredStartupInit(HWND hwnd)
+{
+    TCHAR szPluginDir[MAX_PATH];
+    GetModuleFileName(NULL, szPluginDir, MAX_PATH);
+    PathRemoveFileSpec(szPluginDir);
+    PathAppend(szPluginDir, _T("plugins"));
+
+    HostFunctions hostFuncs;
+    hostFuncs.SetProgress = SetStatusProgress;
+    hostFuncs.SaveFile = Host_SaveFile;
+    hostFuncs.OpenFile = Host_OpenFile;
+    hostFuncs.GetCurrentFilePath = Host_GetCurrentFilePath;
+    g_PluginManager.SetHostFunctions(hostFuncs);
+
+    g_PluginManager.LoadPlugins(szPluginDir);
+    UpdatePluginsMenu(hwnd);
+
+    LoadConfig();
+    UpdateStatusBar();
+
+    // Plugins now exist; let them see the document that is already open
+    // (e.g. a file passed on the command line).
+    for (auto& d : g_Documents)
+        g_PluginManager.NotifyFileEvent(d.szFileName, d.hEditor, d.szFileName[0] ? L"Loaded" : L"New");
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     hInst = hInstance;
     LoadLibrary(_T("Msftedit.dll"));
-    
+
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
     icex.dwICC = ICC_BAR_CLASSES | ICC_LINK_CLASS | ICC_TAB_CLASSES;
@@ -4087,10 +4533,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Load Menu and Accelerators from Resource
     HMENU hMenu = LoadMenu(hInstance, MAKEINTRESOURCE(IDR_MAINMENU));
-    
-    // Populate Encoding Menu
+
+    // Populate Encoding Menu. Found by looking for the submenu that holds the
+    // encoding commands, so adding File menu items cannot break it.
     HMENU hFileMenu = GetSubMenu(hMenu, 0);
-    HMENU hEncodingMenu = GetSubMenu(hFileMenu, 10); // Index 10 is Encoding
+    HMENU hEncodingMenu = NULL;
+    for (int i = 0; i < GetMenuItemCount(hFileMenu); ++i)
+    {
+        HMENU hSub = GetSubMenu(hFileMenu, i);
+        if (hSub && GetMenuItemCount(hSub) > 0 &&
+            GetMenuItemID(hSub, 0) == ID_ENCODING_ANSI)
+        {
+            hEncodingMenu = hSub;
+            break;
+        }
+    }
     if (hEncodingMenu)
     {
         while (GetMenuItemCount(hEncodingMenu) > 0) DeleteMenu(hEncodingMenu, 0, MF_BYPOSITION);
@@ -4098,27 +4555,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     SetMenu(hwnd, hMenu);
-    
-    // Load Plugins
-    TCHAR szExePath[MAX_PATH];
-    GetModuleFileName(NULL, szExePath, MAX_PATH);
-    PathRemoveFileSpec(szExePath);
-    PathAppend(szExePath, _T("plugins"));
-    
-    HostFunctions hostFuncs;
-    hostFuncs.SetProgress = SetStatusProgress;
-    hostFuncs.SaveFile = Host_SaveFile;
-    hostFuncs.OpenFile = Host_OpenFile;
-    hostFuncs.GetCurrentFilePath = Host_GetCurrentFilePath;
-    g_PluginManager.SetHostFunctions(hostFuncs);
-    
-    g_PluginManager.LoadPlugins(szExePath);
-    UpdatePluginsMenu(hwnd);
-
-    LoadConfig();
 
     HACCEL hAccel = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDR_ACCELERATOR));
 
+    // Show the window before doing any disk work so the first frame is instant.
     ShowWindow(hwnd, SW_SHOWMAXIMIZED);
     UpdateWindow(hwnd);
 
@@ -4130,6 +4570,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         AddRecentFile(argv[1]);
     }
     if (argv) LocalFree(argv);
+
+    // Plugins and config load once the window is on screen and painted.
+    PostMessage(hwnd, WM_APP_DEFERRED_INIT, 0, 0);
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0))

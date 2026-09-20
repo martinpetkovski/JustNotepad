@@ -1,90 +1,115 @@
 param(
-    [int]$MajorVersion = 1
+    [int]$MajorVersion = 1,
+    [string]$Generator = '',
+    [switch]$SkipClean,
+    [switch]$SkipTests
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'common.ps1')
 
-# Clean and Rebuild
-Write-Host "Cleaning..." -ForegroundColor Cyan
-.\clean.ps1
-
-Write-Host "Rebuilding..." -ForegroundColor Cyan
-.\rebuild.ps1 -Configuration Release
-
-# Update docs/index.html with README.md content
-Write-Host "Updating docs/index.html with README.md content..." -ForegroundColor Cyan
-$ReadmeContent = Get-Content -Path "README.md" -Raw
-# Escape backticks for JS template literal ( ` -> \` )
-$bt = [string][char]0x60
-$ReadmeContentEscaped = $ReadmeContent.Replace($bt, ('\' + $bt))
-# Escape ${ for JS template literal ( ${ -> \${ )
-$ReadmeContentEscaped = $ReadmeContentEscaped.Replace('${', '\${')
-
-$HtmlPath = "docs/index.html"
-$HtmlContent = Get-Content -Path $HtmlPath -Raw
-
-$StartMarker = 'const markdown = ' + [char]0x60
-$EndMarker = [char]0x60 + ';'
-$StartIndex = $HtmlContent.IndexOf($StartMarker)
-
-if ($StartIndex -ge 0) {
-    $EndIndex = $HtmlContent.IndexOf($EndMarker, $StartIndex + $StartMarker.Length)
-    if ($EndIndex -gt $StartIndex) {
-        $NewHtmlContent = $HtmlContent.Substring(0, $StartIndex + $StartMarker.Length) + 
-                          $ReadmeContentEscaped + 
-                          $HtmlContent.Substring($EndIndex)
-        Set-Content -Path $HtmlPath -Value $NewHtmlContent -Encoding UTF8
-        Write-Host "Updated docs/index.html"
+$Root = $PSScriptRoot
+Push-Location $Root
+try {
+    # ----------------------------------------------------------------------
+    # Pre-flight: refuse to release from a dirty tree or without a remote.
+    # ----------------------------------------------------------------------
+    $dirty = @(git status --porcelain | Where-Object { $_ -notmatch '^\?\?' })
+    if ($dirty.Count -gt 0) {
+        Write-Host ($dirty -join "`n") -ForegroundColor Yellow
+        throw "The working tree has uncommitted changes. Commit or stash them before releasing."
     }
-} else {
-    Write-Warning "Could not find markdown content placeholder in docs/index.html"
-}
 
-# Commit changes if any
-if ((git status --porcelain docs/index.html).Length -gt 0) {
-    Write-Host "Committing updated docs/index.html..."
-    git add docs/index.html
-    git commit -m "Update docs/index.html from README.md"
-}
+    $Branch = (git rev-parse --abbrev-ref HEAD).Trim()
+    if (-not (git remote get-url origin 2>$null)) { throw "No 'origin' remote configured." }
 
-# Call the package script
-$ReleaseInfo = .\package.ps1 -MajorVersion $MajorVersion
+    # ----------------------------------------------------------------------
+    # Keep docs/index.html in sync with README.md
+    # ----------------------------------------------------------------------
+    Write-Host "Updating docs/index.html from README.md..." -ForegroundColor Cyan
+    $HtmlPath = Join-Path $Root 'docs/index.html'
+    if (Test-Path $HtmlPath) {
+        $bt = [string][char]0x60
+        $ReadmeContent = Get-Content -Path (Join-Path $Root 'README.md') -Raw
+        $ReadmeContentEscaped = $ReadmeContent.Replace($bt, ('\' + $bt)).Replace('${', '\${')
 
-$TagName = $ReleaseInfo.TagName
-$ZipFile = $ReleaseInfo.ZipFile
-$Version = $ReleaseInfo.Version
+        $HtmlContent = Get-Content -Path $HtmlPath -Raw
+        $StartMarker = 'const markdown = ' + $bt
+        $EndMarker = $bt + ';'
+        $StartIndex = $HtmlContent.IndexOf($StartMarker)
 
-# 4. Push to GitHub / Create Release
-Write-Host "Step 4: Publishing to GitHub..." -ForegroundColor Cyan
+        if ($StartIndex -lt 0) {
+            Write-Warning "Could not find the markdown placeholder in docs/index.html; leaving it untouched."
+        } else {
+            $EndIndex = $HtmlContent.IndexOf($EndMarker, $StartIndex + $StartMarker.Length)
+            if ($EndIndex -le $StartIndex) {
+                Write-Warning "Malformed markdown placeholder in docs/index.html; leaving it untouched."
+            } else {
+                $NewHtmlContent = $HtmlContent.Substring(0, $StartIndex + $StartMarker.Length) +
+                                  $ReadmeContentEscaped +
+                                  $HtmlContent.Substring($EndIndex)
+                Set-Content -Path $HtmlPath -Value $NewHtmlContent -Encoding UTF8 -NoNewline
+                Write-Host "Updated docs/index.html"
+            }
+        }
 
-# Always push the tag first so gh release create finds it
-Write-Host "Pushing tag to remote..."
-git push origin $TagName
-if ($LASTEXITCODE -ne 0) { 
-    Write-Error "Failed to push tag to remote"
-    exit 1 
-}
+        if (@(git status --porcelain -- 'docs/index.html').Count -gt 0) {
+            git add -- 'docs/index.html'
+            git commit -m "Update docs/index.html from README.md" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Failed to commit docs/index.html" }
+        }
+    }
 
-if (Get-Command gh -ErrorAction SilentlyContinue) {
-    Write-Host "GitHub CLI (gh) found. Creating release and uploading asset..."
-    
-    # Create release and upload asset
-    # --generate-notes automatically adds the changelog from git commits
-    gh release create $TagName $ZipFile --title "Release $Version" --generate-notes
-    
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "Release created and asset uploaded successfully!" -ForegroundColor Green
+    # ----------------------------------------------------------------------
+    # Clean, then build + test + package (package.ps1 does the build)
+    # ----------------------------------------------------------------------
+    Invoke-DependencyScripts -Root $Root
+    if (-not $SkipClean) { & (Join-Path $Root 'clean.ps1') }
+
+    $packageArgs = @{
+        MajorVersion  = $MajorVersion
+        Configuration = 'Release'
+        Generator     = $Generator
+    }
+    if ($SkipTests) { $packageArgs['SkipTests'] = $true }
+
+    $ReleaseInfo = & (Join-Path $Root 'package.ps1') @packageArgs
+    if (-not $ReleaseInfo) { throw "package.ps1 did not return release information." }
+
+    $TagName = $ReleaseInfo.TagName
+    $ZipFile = $ReleaseInfo.ZipFile
+    $Version = $ReleaseInfo.Version
+
+    if (-not (Test-Path $ZipFile)) { throw "Release archive is missing: $ZipFile" }
+
+    # ----------------------------------------------------------------------
+    # Publish
+    # ----------------------------------------------------------------------
+    Write-Host "Publishing to GitHub..." -ForegroundColor Cyan
+
+    # The tag must be reachable from the remote branch, so push the commits first.
+    Write-Host "Pushing $Branch..."
+    git push origin $Branch
+    if ($LASTEXITCODE -ne 0) { throw "Failed to push branch '$Branch'" }
+
+    Write-Host "Pushing tag $TagName..."
+    git push origin $TagName
+    if ($LASTEXITCODE -ne 0) { throw "Failed to push tag $TagName" }
+
+    if (Get-Command gh -ErrorAction SilentlyContinue) {
+        Write-Host "Creating GitHub release and uploading the archive..."
+        gh release create $TagName $ZipFile --title "Release $Version" --generate-notes
+        if ($LASTEXITCODE -ne 0) { throw "gh release create failed." }
+        Write-Host "Release created and asset uploaded." -ForegroundColor Green
+        Write-Host "The in-app updater will now see $TagName." -ForegroundColor Green
     } else {
-        Write-Error "Failed to create release with GitHub CLI."
-        exit 1
+        Write-Warning "GitHub CLI ('gh') not found, so the release has no attached archive."
+        Write-Warning "The in-app updater needs the .zip asset to work."
+        Write-Host "ACTION REQUIRED: upload '$ZipFile' to the $TagName release on GitHub." -ForegroundColor Yellow
     }
-} else {
-    Write-Warning "GitHub CLI ('gh') not found."
-    Write-Warning "The release on GitHub will ONLY contain source code."
-    Write-Warning "To automatically upload the zip file, please install GitHub CLI: https://cli.github.com/"
-    
-    Write-Host "Tag pushed to GitHub."
-    Write-Host "ACTION REQUIRED: Please manually upload '$ZipFile' to the release on GitHub." -ForegroundColor Yellow
-}
 
-Write-Host "Release $Version completed successfully!" -ForegroundColor Green
+    Write-Host "Release $Version completed successfully!" -ForegroundColor Green
+}
+finally {
+    Pop-Location
+}

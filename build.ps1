@@ -2,102 +2,39 @@ param(
     [ValidateSet('Debug','Release')]
     [string]$Configuration = 'Release',
     [string]$Generator = '',
-    [switch]$BuildOnly
+    [switch]$BuildOnly,
+    [switch]$Reconfigure
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'common.ps1')
 
-# Resolve paths
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = $PSScriptRoot
 $BuildDir = Join-Path $Root 'build'
 
-# Ensure no running instance blocks linking
-Get-Process "Just Notepad" -ErrorAction SilentlyContinue | Stop-Process -Force
+Stop-JustNotepad
+Initialize-CMake
 
-# Check for CMake
-if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
-    $cmakePaths = @(
-        "C:\Program Files\CMake\bin\cmake.exe",
-        "C:\Program Files (x86)\CMake\bin\cmake.exe",
-        "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
-        "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
-        "C:\Program Files\Microsoft Visual Studio\2022\Professional\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
-    )
-    
-    $cmakePath = $cmakePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
-    
-    if ($cmakePath) {
-        Write-Host "Found CMake at $cmakePath"
-        $env:PATH = "$([System.IO.Path]::GetDirectoryName($cmakePath));$env:PATH"
-    } else {
-        Write-Error "CMake not found. Please install CMake or add it to your PATH."
-        exit 1
-    }
+$Generator = Resolve-Generator -Requested $Generator
+if ($Generator -notlike 'Visual Studio*') { Initialize-MsvcEnvironment | Out-Null }
+
+Write-Host "Generator: $Generator   Configuration: $Configuration" -ForegroundColor Cyan
+
+if ($Reconfigure -or (Test-NeedsConfigure -Root $Root -BuildDir $BuildDir -Generator $Generator)) {
+    Invoke-CMakeConfigure -Root $Root -BuildDir $BuildDir -Generator $Generator -Configuration $Configuration
+} else {
+    Write-Host "Build system is up to date; building changes only." -ForegroundColor DarkGray
 }
 
-# Create build folder if it doesn't exist
-if (-not (Test-Path $BuildDir)) { 
-    New-Item -ItemType Directory -Path $BuildDir | Out-Null 
-}
+Invoke-CMakeBuild -BuildDir $BuildDir -Configuration $Configuration
 
-# Determine generator if not specified
-if (-not $Generator) {
-    # Prefer Ninja if available, else Visual Studio
-    $ninja = Get-Command ninja -ErrorAction SilentlyContinue
-    if ($ninja) { $Generator = 'Ninja' }
-    else { $Generator = 'Visual Studio 17 2022' }
-}
+$ExePath = Get-ExePath -BuildDir $BuildDir -Generator $Generator -Configuration $Configuration
+if (-not (Test-Path $ExePath)) { throw "Executable not found: $ExePath" }
 
-Write-Host "Using generator: $Generator; Configuration: $Configuration"
+Show-PluginSummary -OutputDir (Split-Path $ExePath)
+Write-Host "Built: $ExePath" -ForegroundColor Green
 
-# Configure and Build
-Push-Location $BuildDir
-try {
-    # Only configure if CMakeCache.txt is missing
-    if (-not (Test-Path "CMakeCache.txt")) {
-        Write-Host "Configuring CMake..." -ForegroundColor Yellow
-        cmake -G "$Generator" -DCMAKE_BUILD_TYPE=$Configuration "$Root"
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "CMake configure failed (exit code $LASTEXITCODE)." -ForegroundColor Red
-            exit $LASTEXITCODE
-        }
-    } else {
-        Write-Host "Skipping configuration (CMakeCache.txt exists). Building changes only..." -ForegroundColor Yellow
-    }
-
-    # Build
-    Write-Host "Building Just Notepad and all plugins..." -ForegroundColor Cyan
-    cmake --build . --config $Configuration
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "Build failed (exit code $LASTEXITCODE). Not running the app." -ForegroundColor Red
-        exit $LASTEXITCODE
-    }
-
-    # Resolve executable path based on generator
-    if ($Generator -like 'Visual Studio*') {
-        $ExePath = Join-Path $BuildDir "$Configuration/Just Notepad.exe"
-    } else {
-        $ExePath = Join-Path $BuildDir 'Just Notepad.exe'
-    }
-
-    if (-not (Test-Path $ExePath)) {
-        throw "Executable not found: $ExePath"
-    }
-
-    # Verify plugins were built
-    $PluginsDir = Join-Path (Split-Path $ExePath) "plugins"
-    if (Test-Path $PluginsDir) {
-        $Plugins = Get-ChildItem $PluginsDir *.dll
-        Write-Host "Built $($Plugins.Count) plugins." -ForegroundColor Green
-    } else {
-        Write-Host "Warning: No plugins directory found at $PluginsDir" -ForegroundColor Yellow
-    }
-
-    if (-not $BuildOnly) {
-        Write-Host "Starting app: $ExePath" -ForegroundColor Cyan
-        & $ExePath
-    }
-}
-finally {
-    Pop-Location
+if (-not $BuildOnly) {
+    Write-Host "Starting app..." -ForegroundColor Cyan
+    Start-Process -FilePath $ExePath
 }
