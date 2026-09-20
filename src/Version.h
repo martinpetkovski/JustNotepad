@@ -1,8 +1,8 @@
-#pragma once
-#define APP_VERSION_STRING "1.260328.1"
+﻿#pragma once
+#define APP_VERSION_STRING "1.260920.1"
 #define APP_VERSION_MAJOR 1
 #define APP_VERSION_MINOR 26
-#define APP_VERSION_PATCH 0328
+#define APP_VERSION_PATCH 0920
 #define APP_VERSION_BUILD 1
 
 #define APP_COMPANY_NAME "Martin Petkovski"
