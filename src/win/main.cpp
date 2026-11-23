@@ -229,7 +229,7 @@ struct App {
     bool highlight = true;           // View > Syntax Highlighting
 
     // side pane (data view / Markdown preview)
-    bool sideOn = false;
+    bool sideOn = true;              // on by default: JSON, XML and Markdown open with it
     HWND sideTree = nullptr, sidePreview = nullptr;
     DataTree data;                   // what the tree shows
     std::vector<bool> dataFilled;    // nodes whose children are in the tree
@@ -3204,7 +3204,7 @@ void loadSettings() {
     g.lineNumbers = GetPrivateProfileIntW(L"view", L"lineNumbers", 1, f) != 0;
     g.themeMode = (int)GetPrivateProfileIntW(L"view", L"theme", 0, f);
     g.highlight = GetPrivateProfileIntW(L"view", L"highlight", 1, f) != 0;
-    g.sideOn = GetPrivateProfileIntW(L"view", L"sidePane", 0, f) != 0;
+    g.sideOn = GetPrivateProfileIntW(L"view", L"sidePane", 1, f) != 0;
     if (g.themeMode < 0 || g.themeMode > 2) g.themeMode = 0;
     int w = (int)GetPrivateProfileIntW(L"window", L"w", 0, f);
     int h = (int)GetPrivateProfileIntW(L"window", L"h", 0, f);
