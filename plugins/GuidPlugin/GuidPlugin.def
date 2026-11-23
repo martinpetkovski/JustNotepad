@@ -1,6 +1,0 @@
-LIBRARY GuidPlugin
-EXPORTS
-    GetPluginName
-    GetPluginDescription
-    GetPluginVersion
-    GetPluginMenuItems

@@ -1,8 +1,0 @@
-#pragma once
-
-#define IDD_GIT_OUTPUT 101
-#define IDC_GIT_OUTPUT_TEXT 1001
-
-#define IDD_GIT_COMMIT 102
-#define IDC_GIT_COMMIT_MSG 1002
-#define IDC_STATIC -1

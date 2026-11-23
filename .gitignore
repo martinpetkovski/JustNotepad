@@ -1,26 +1,4 @@
-# Build directories
 build/
 releases/
-bin/
-obj/
-
-# IDE files
-.vscode/
-.vs/
-*.sln
-*.vcxproj
-*.vcxproj.filters
-*.vcxproj.user
-
-# Output files
-*.exe
-*.dll
-*.pdb
-*.ilk
-*.log
-*.exp
-*.lib
-
-# Temporary files
-*.tmp
-*.bak
+.venv/
+*.jn-tmp

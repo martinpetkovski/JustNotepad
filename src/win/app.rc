@@ -1,0 +1,101 @@
+// Resources: icon, manifest, Go To dialog, version info.
+// build.ps1 passes /i docs so the icon is found by name.
+#include <windows.h>
+#include <winver.h>
+#include <commctrl.h>
+#include "resource.h"
+#include "version.h"
+
+// The lowest-numbered icon is the one Explorer shows for the exe.
+IDI_APP ICON "icon.ico"
+
+1 24 "app.manifest"
+
+IDD_GOTO DIALOGEX 0, 0, 180, 54
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Go To Line"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "&Line number:", -1, 8, 10, 52, 10
+    EDITTEXT        IDC_LINE, 62, 8, 110, 13, ES_AUTOHSCROLL | ES_NUMBER
+    DEFPUSHBUTTON   "Go To", IDOK, 66, 32, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 122, 32, 50, 14
+END
+
+IDD_COMMIT DIALOGEX 0, 0, 340, 236
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Submit"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "&Files to submit (untick to leave a file out):", -1, 8, 8, 320, 10
+    CONTROL         "", IDC_FILES, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 8, 20, 324, 92
+    LTEXT           "&Description:", -1, 8, 118, 100, 10
+    EDITTEXT        IDC_MSG, 8, 130, 324, 80, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON   "&Submit", IDOK, 226, 216, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 282, 216, 50, 14
+END
+
+
+IDD_VCSCONNECT DIALOGEX 0, 0, 280, 196
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Connect to Version Control"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "&Use:", -1, 8, 10, 70, 10
+    COMBOBOX        IDC_VCS_KIND, 80, 8, 192, 60, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL
+    GROUPBOX        "Git", -1, 8, 26, 264, 30
+    LTEXT           "&git.exe:", -1, 16, 40, 60, 10
+    EDITTEXT        IDC_GIT_EXE, 80, 38, 184, 13, ES_AUTOHSCROLL
+    GROUPBOX        "Perforce", -1, 8, 60, 264, 98
+    LTEXT           "&p4.exe:", -1, 16, 74, 60, 10
+    EDITTEXT        IDC_P4_EXE, 80, 72, 184, 13, ES_AUTOHSCROLL
+    LTEXT           "&Server (P4PORT):", -1, 16, 92, 62, 10
+    EDITTEXT        IDC_P4_PORT, 80, 90, 184, 13, ES_AUTOHSCROLL
+    LTEXT           "U&ser (P4USER):", -1, 16, 110, 62, 10
+    EDITTEXT        IDC_P4_USER, 80, 108, 184, 13, ES_AUTOHSCROLL
+    LTEXT           "&Workspace:", -1, 16, 128, 62, 10
+    EDITTEXT        IDC_P4_CLIENT, 80, 126, 184, 13, ES_AUTOHSCROLL
+    AUTOCHECKBOX    "&Check out files automatically when I start editing", IDC_AUTOCHECKOUT, 16, 142, 248, 12
+    LTEXT           "Leave a field empty to detect it / use what git and p4 already use.", -1, 8, 162, 264, 10
+    PUSHBUTTON      "&Test", IDC_VCS_TEST, 8, 176, 50, 14
+    DEFPUSHBUTTON   "OK", IDOK, 166, 176, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 222, 176, 50, 14
+END
+
+IDD_ABOUT DIALOGEX 0, 0, 220, 122
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "About JustNotepad"
+FONT 9, "Segoe UI"
+BEGIN
+    ICON            IDI_APP, IDC_ABOUT_ICON, 14, 14, 21, 20
+    LTEXT           "JustNotepad", IDC_ABOUT_TITLE, 45, 11, 165, 16
+    LTEXT           "", IDC_ABOUT_VERSION, 45, 30, 165, 9
+    LTEXT           "Created by Martin Petkovski", -1, 45, 42, 165, 9
+    LTEXT           "This software is Freeware.", -1, 45, 54, 165, 9
+    CONTROL         "<a href=""https://www.najjak.com/justnotepad"">Official Website</a>", IDC_ABOUT_LINK, "SysLink", WS_TABSTOP, 45, 68, 165, 10
+    PUSHBUTTON      "Check for &Updates", IDC_ABOUT_UPDATE, 45, 98, 80, 15
+    DEFPUSHBUTTON   "OK", IDOK, 160, 98, 50, 15
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION APP_VERSION_MAJOR,APP_VERSION_MINOR,APP_VERSION_PATCH,APP_VERSION_BUILD
+PRODUCTVERSION APP_VERSION_MAJOR,APP_VERSION_MINOR,APP_VERSION_PATCH,APP_VERSION_BUILD
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "JustNotepad"
+            VALUE "ProductName", "JustNotepad"
+            VALUE "FileVersion", APP_VERSION_STRING
+            VALUE "ProductVersion", APP_VERSION_STRING
+            VALUE "OriginalFilename", "JustNotepad.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
