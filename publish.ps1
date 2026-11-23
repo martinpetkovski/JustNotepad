@@ -1,5 +1,6 @@
-# Publishes a release: works out the version, stamps it, builds, tests, zips,
-# commits the version bump, tags, pushes, and creates the GitHub release.
+# Publishes a release: refreshes the website from README.md, works out the
+# version, stamps it, builds, tests, zips, commits the version bump, tags,
+# pushes, and creates the GitHub release.
 #
 #   .\publish.ps1                 full release
 #   .\publish.ps1 -DryRun         build, test and zip only; nothing committed, tagged or pushed
@@ -35,6 +36,38 @@ try {
     $haveGh = [bool](Get-Command gh -ErrorAction SilentlyContinue)
     if (-not $haveGh -and -not $DryRun) {
         Write-Warning "GitHub CLI ('gh') not found: the tag will be pushed, but the release must be created by hand."
+    }
+
+    # ----------------------------------------------------------------------
+    # 0. Website: copy README.md into docs/index.html (the page renders it
+    #    with marked), so najjak.com/JustNotepad matches the release.
+    # ----------------------------------------------------------------------
+    Write-Host "Step 0: Updating docs/index.html from README.md..." -ForegroundColor Cyan
+    $HtmlPath = Join-Path $Root 'docs\index.html'
+    if (Test-Path $HtmlPath) {
+        $bt = [string][char]0x60
+        $Readme = Get-Content -Path (Join-Path $Root 'README.md') -Raw -Encoding UTF8
+        # Inside a JavaScript template string, ` and ${ must be escaped.
+        $Escaped = $Readme.Replace($bt, ('\' + $bt)).Replace('${', '\${')
+        $Html = Get-Content -Path $HtmlPath -Raw -Encoding UTF8
+        $StartMarker = 'const markdown = ' + $bt
+        $EndMarker = $bt + ';'
+        $Start = $Html.IndexOf($StartMarker)
+        $End = if ($Start -ge 0) { $Html.IndexOf($EndMarker, $Start + $StartMarker.Length) } else { -1 }
+        if ($Start -lt 0 -or $End -le $Start) {
+            Write-Warning "No markdown placeholder found in docs/index.html; leaving it untouched."
+        } else {
+            $NewHtml = $Html.Substring(0, $Start + $StartMarker.Length) + $Escaped + $Html.Substring($End)
+            if ($NewHtml -ne $Html) {
+                [IO.File]::WriteAllText($HtmlPath, $NewHtml, (New-Object Text.UTF8Encoding($false)))
+                Write-Host "Updated docs/index.html"
+                if (-not $DryRun) {
+                    git add -- 'docs/index.html'
+                    git commit -m "Update docs/index.html from README.md" | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "Failed to commit docs/index.html." }
+                }
+            }
+        }
     }
 
     # ----------------------------------------------------------------------

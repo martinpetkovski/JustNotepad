@@ -72,7 +72,7 @@ BEGIN
     LTEXT           "", IDC_ABOUT_VERSION, 45, 30, 165, 9
     LTEXT           "Created by Martin Petkovski", -1, 45, 42, 165, 9
     LTEXT           "This software is Freeware.", -1, 45, 54, 165, 9
-    CONTROL         "<a href=""https://www.najjak.com/justnotepad"">Official Website</a>", IDC_ABOUT_LINK, "SysLink", WS_TABSTOP, 45, 68, 165, 10
+    CONTROL         "<a href=""https://www.najjak.com/JustNotepad/"">Official Website</a>", IDC_ABOUT_LINK, "SysLink", WS_TABSTOP, 45, 68, 165, 10
     PUSHBUTTON      "Check for &Updates", IDC_ABOUT_UPDATE, 45, 98, 80, 15
     DEFPUSHBUTTON   "OK", IDOK, 160, 98, 50, 15
 END

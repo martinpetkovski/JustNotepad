@@ -1,11 +1,51 @@
 # JustNotepad
 
-A plain text editor for Windows that starts instantly and stays instant at any file size.
-One small exe, no installer, no plugins.
+Yeah, I got genuinely tired of ::certain companies:: shoving LLM "AI" into the most basic things like file editing using Notepad, so I figured the best way to retaliate is to vibe code Just Notepad using LLMs.
 
-## Build
+Just Notepad is just a notepad. Version 2 is a rewrite from scratch: one small exe, no installer, no plugins. It starts instantly and stays instant at any file size, 1 KB or 10 GB. Won't freeze, won't do anything other than what you ask it to do, it's just a notepad and always will be. (Okay, it also does diffs now. You'll like it.)
 
-Needs Visual Studio 2022 (or the Build Tools) with the C++ workload. Nothing else.
+[Download Latest Release](https://github.com/martinpetkovski/JustNotepad/releases/latest)
+
+## Just Notepad vs Windows Notepad
+
+| | Just Notepad | Windows Notepad |
+| :--- | :--- | :--- |
+| **Startup** | Instant | Noticeable |
+| **Huge files (GBs)** | Open instantly, edit, scroll, search | Slow or refuses |
+| **Responsiveness** | Same at any file size | Can lag with large files |
+| **AI Integration** | None. Ever. | Built-in |
+| **Architecture** | Native Win32, single exe | UWP / WinUI |
+
+## What it does
+
+- **Any file, any size.** Big files are memory-mapped, so opening one copies nothing; only what is on screen is ever laid out. Line numbers are counted in the background while you already scroll and edit.
+- **Tabs.** Ctrl+T new, Ctrl+W close, Ctrl+Shift+T reopen, Ctrl+Tab / Ctrl+PgUp / Ctrl+PgDn to switch, Ctrl+1..9 to jump, Ctrl+Shift+PgUp / PgDn to move.
+- **Never asks to save on exit.** Like Notepad: close it and every tab comes back next time, unsaved edits and Untitled text included. Saved every few seconds too, so a crash loses little.
+- **Syntax highlighting** for 47 languages, Unreal C++ and shaders included. View > Syntax Highlighting turns it off.
+- **Light and dark**, following Windows or chosen in View > Theme. Square, late-90s bevels with a modern palette. No rounded corners. Anywhere.
+- **Visual Studio keys**: Ctrl+X / Ctrl+C on nothing takes the whole line, Alt+Up / Down moves lines, Ctrl+D duplicates, Ctrl+L / Ctrl+Shift+L cut / delete a line, Ctrl+Enter / Ctrl+Shift+Enter open a line above / below, Tab / Shift+Tab indent, Ctrl+U / Ctrl+Shift+U change case, Ctrl+] matching bracket, Ctrl+F3 next occurrence.
+- UTF-8, UTF-16 and ANSI files, binary data preserved byte for byte, CRLF / LF kept as found, unlimited undo, find and replace, go to line, word wrap, zoom, any font.
+
+## Version control
+
+Nothing to set up. JustNotepad finds `git.exe` and `p4.exe` on its own (PATH, registry, usual install folders) and uses your existing login. Source Control > Connect lets you pick a Perforce server, user and workspace if you need to.
+
+- **Perforce files check themselves out** the moment you start typing.
+- The status bar shows the branch or the have/head revision and how many changes you have.
+- **Source Control** menu: Diff, Open Changelist Files (opens them all as tabs), Submit Current Changelist (tick which files go in), Revert Changes, Refresh Status, Connect.
+
+## Live diff
+
+**F8** opens a P4Merge-style diff: the depot (or committed) version on the left, your file on the right, and a strip in between joining each change. You keep editing on the right and the diff follows as you type.
+
+- Both sides scroll in lockstep; the shorter side of a change is padded so rows always line up.
+- Changes are coloured across the whole row, line numbers included, and the characters that changed inside a line are marked.
+- Every change has three buttons: **use the depot version**, **use both**, **use yours**. You can switch between them as often as you like until you submit.
+- **F7** / **Shift+F7** or the arrows in the header jump between changes; **Ctrl+R** takes the depot version of the change under the caret.
+
+## Building
+
+Requires Visual Studio 2022 (or the standalone Build Tools) with the C++ workload. No CMake, nothing else.
 
 ```powershell
 .\build.ps1          # release build -> build\JustNotepad.exe
@@ -13,90 +53,42 @@ Needs Visual Studio 2022 (or the Build Tools) with the C++ workload. Nothing els
 .\build.ps1 -Test    # build and run the core tests + benchmark
 ```
 
-## Why it is fast
-
-- **Opening copies nothing.** Large files are memory-mapped; the document is a
-  piece tree that points into the file. Opening 10 GB costs the same as 1 KB.
-- **Edits are O(log n).** Typed text goes into an append-only buffer and the
-  tree gets a new piece. Nothing is ever shifted or re-read. Undo and redo move
-  piece descriptors around.
-- **Only the screen is laid out.** Scrolling is anchored to a byte offset, so
-  painting, the caret and the scrollbar never need to know how many lines the
-  file has.
-- **Line numbers arrive in the background.** A worker thread counts newlines
-  (SSE2, several GB/s) into a small index; until it finishes you can already
-  scroll, edit and search.
-- **Nothing loads before the first frame** except the window and the font.
-  Dialog and shell libraries are delay-loaded.
-
-## What works today
-
-- Open, edit and save any file: UTF-8 (with or without BOM), UTF-16 LE/BE,
-  single-byte ANSI, and binary data (bytes are preserved exactly)
-- Unlimited undo/redo, cut/copy/paste, drag selection, word navigation
-- Find, replace, replace all (match case, whole word, both directions)
-- Go to line, line numbers, word wrap, auto-indent, zoom, font choice
-- CRLF/LF detection, drag and drop, per-monitor DPI, settings remembered
-
-## Version control
-
-Nothing to set up: when a file is opened, JustNotepad looks for a Git
-repository or asks Perforce about it, in the background, using the `git.exe` or
-`p4.exe` already on your PATH (and therefore your existing login).
-
-- The status bar shows the branch (Git) or have/head revision (Perforce) and
-  the number of changes against the base revision (Git `HEAD`, Perforce `#have`).
-- Changed lines are marked in the gutter: green added, blue modified, red where
-  lines were removed.
-- **Source Control** menu: stage / check out, commit / submit this file, revert
-  the file, refresh. Editing a Perforce file that is not checked out offers to
-  check it out.
-
-## Live diff
-
-**F8** splits the window: the base revision on the left, your working text on
-the right. The right side is the normal editor, so you edit inside the diff and
-it updates as you type. **F7** / **Shift+F7** jump between changes and
-**Ctrl+R** puts the base lines back for the change under the caret (one undo
-step).
-
 ## Releasing
 
 ```powershell
-.\publish.ps1           # version, build, test, zip, tag, push, GitHub release
+.\publish.ps1           # sync the website, version, build, test, zip, tag, push, GitHub release
 .\publish.ps1 -DryRun   # everything up to the zip; nothing committed or pushed
 ```
 
-Versions are `<major>.<yyMMdd>.<n>`, where n counts releases on the same day.
-Needs a clean working tree, an `origin` remote and the GitHub CLI (`gh`).
-
-## Roadmap
-
-1. Tabs
-2. Code features: syntax highlighting, multi-cursor, column select, bracket
-   matching, comment toggle, regex search on a background thread
-3. Padded line alignment in the diff view, staging individual changes
+Versions are `<major>.<yyMMdd>.<n>`, where n counts releases on the same day. `publish.ps1` also copies this README into `docs/index.html`, so the website always matches the release. The zip attached to the GitHub release is what the in-app updater (Help > Check for Updates) downloads, so publishing needs the GitHub CLI (`gh`).
 
 ## Source layout
 
 | Path | What |
 |---|---|
-| `src/core/` | Portable core, no OS headers: piece tree, line index, layout, diff, UTF helpers |
-| `src/win/` | Win32 front end: window, painting, input, file I/O, dialogs, version control |
+| `src/core/` | Portable core, no OS headers: piece tree, line index, layout, diff, syntax highlighting, UTF helpers |
+| `src/win/` | Win32 front end: window, painting, input, tabs, session, theme, dialogs, version control, updater |
 | `tests/` | Differential tests and benchmark for the core |
-| `docs/icon.ico` | Application icon |
+| `docs/` | The website (generated from this README) and the icon |
 
 ## Known limits
 
-- The grid is fixed-pitch. Scripts that need shaping (Arabic, Indic) and colour
-  emoji do not render properly yet.
-- A single line longer than 16 KB is shown as several rows.
+- The grid is fixed-pitch. Scripts that need shaping (Arabic, Indic) and colour emoji do not render properly yet.
 - Saving a memory-mapped file (over 32 MB) clears its undo history.
 - Case-insensitive search folds ASCII letters only.
-- Change markers and the diff view are off for files over 16 MB.
-- The diff view lines the two sides up at the middle of the window; it does not
-  pad them, so rows above and below a change can sit at different heights.
-- Perforce is detected for files the server already knows; brand-new files
-  cannot be added from the editor yet.
-- UTF-16 files are converted in memory on load, so they do not open instantly
-  when very large.
+- The diff and change markers are off for files over 16 MB.
+- Brand-new files cannot be added to Perforce from the editor yet.
+
+# License
+
+Copyright 2025-2026 ©Martin Petkovski
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+# About
+
+Created by [Martin Petkovski](https://www.najjak.com/). Website: [najjak.com/JustNotepad](https://www.najjak.com/JustNotepad/)
