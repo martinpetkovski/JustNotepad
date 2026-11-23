@@ -5,6 +5,8 @@
 //   - a copy of this exe goes next to it as uninstall.exe
 //   - Start menu shortcut (and a desktop one if ticked)
 //   - an entry in Settings > Apps, so it can be removed like any other app
+//   - optional: the file types you tick open with JustNotepad, and
+//     "Edit with JustNotepad" in the right-click menu
 // Uninstall (uninstall.exe /uninstall, which is what Settings runs):
 //   removes all of the above. Your settings and session are kept in %APPDATA%.
 #ifndef UNICODE
@@ -21,7 +23,9 @@
 #include <shobjidl.h>
 #include <shellapi.h>
 
+#include <algorithm>
 #include <string>
+#include <vector>
 
 #include "../win/theme.h"
 #include "../win/version.h"
@@ -37,6 +41,190 @@ const wchar_t* const kUninstallKey = L"Software\\Microsoft\\Windows\\CurrentVers
 const wchar_t* const kAppFrameClass = L"JustNotepadFrame";  // main window class of the app
 
 bool g_uninstall = false;
+
+// ---- file types
+//
+// Everything is per user (HKCU\Software\Classes), no admin rights. Windows
+// does not let a program take over a type the user already picked a default
+// for (since Windows 8 that choice is protected); there JustNotepad is added
+// to "Open with" and to Settings > Default apps, where one click makes it the
+// default. Types with no default yet open with JustNotepad straight away.
+const wchar_t* const kProgId = L"JustNotepad.File";
+const wchar_t* const kAppKey = L"Software\\JustNotepad";
+const wchar_t* const kCapabilities = L"Software\\JustNotepad\\Capabilities";
+
+struct FileType { const wchar_t* ext; bool on; };
+const FileType kTypes[] = {
+    // text and notes
+    {L".txt", true}, {L".log", true}, {L".md", true}, {L".markdown", false}, {L".csv", false}, {L".tsv", false},
+    {L".nfo", false},
+    // settings and data
+    {L".ini", true}, {L".cfg", true}, {L".conf", true}, {L".config", false}, {L".properties", true},
+    {L".json", true}, {L".jsonc", true}, {L".xml", true}, {L".yaml", true}, {L".yml", true}, {L".toml", true},
+    {L".editorconfig", true}, {L".gitignore", true}, {L".gitattributes", true}, {L".env", false},
+    // C family and shaders
+    {L".c", true}, {L".h", true}, {L".cpp", true}, {L".hpp", true}, {L".cc", true}, {L".cxx", true}, {L".hh", true},
+    {L".inl", true}, {L".cs", true}, {L".hlsl", true}, {L".hlsli", true}, {L".glsl", true}, {L".usf", true},
+    {L".ush", true}, {L".shader", false},
+    // other languages
+    {L".java", true}, {L".kt", true}, {L".go", true}, {L".rs", true}, {L".swift", false}, {L".py", false},
+    {L".rb", true}, {L".php", false}, {L".lua", true}, {L".pl", false}, {L".dart", true}, {L".scala", true},
+    {L".js", false}, {L".mjs", false}, {L".ts", true}, {L".tsx", true}, {L".jsx", true}, {L".sql", true},
+    // web
+    {L".html", false}, {L".htm", false}, {L".css", true}, {L".scss", true}, {L".less", true}, {L".vue", true},
+    // scripts (opening them in an editor instead of running them is safer, but it changes what a double-click does)
+    {L".sh", true}, {L".bash", true}, {L".ps1", false}, {L".psm1", true}, {L".bat", false}, {L".cmd", false},
+    // build files and patches
+    {L".cmake", true}, {L".mk", true}, {L".gradle", true}, {L".csproj", false}, {L".vcxproj", false},
+    {L".props", false}, {L".targets", false}, {L".uproject", false}, {L".uplugin", false}, {L".diff", true},
+    {L".patch", true},
+};
+
+HKEY createKey(const std::wstring& path) {
+    HKEY k = nullptr;
+    RegCreateKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, nullptr, 0, KEY_READ | KEY_WRITE, nullptr, &k, nullptr);
+    return k;
+}
+
+void setString(HKEY k, const wchar_t* name, const std::wstring& v);
+
+std::wstring readString(HKEY root, const std::wstring& path, const wchar_t* name) {
+    wchar_t buf[512] = L"";
+    DWORD size = sizeof(buf);
+    if (RegGetValueW(root, path.c_str(), name, RRF_RT_REG_SZ, nullptr, buf, &size) != ERROR_SUCCESS) return L"";
+    return buf;
+}
+
+// The user has picked a default for `ext` themselves (Windows protects it).
+bool userChoseDefault(const wchar_t* ext) {
+    HKEY k;
+    std::wstring p = std::wstring(L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\") + ext + L"\\UserChoice";
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, p.c_str(), 0, KEY_READ, &k) != ERROR_SUCCESS) return false;
+    RegCloseKey(k);
+    return true;
+}
+
+// The extensions ticked last time (to pre-tick them and to undo them).
+std::vector<std::wstring> savedTypes() {
+    std::vector<std::wstring> v;
+    std::wstring list = readString(HKEY_CURRENT_USER, kAppKey, L"FileTypes");
+    size_t a = 0;
+    while (a < list.size()) {
+        size_t b = list.find(L';', a);
+        if (b == std::wstring::npos) b = list.size();
+        if (b > a) v.push_back(list.substr(a, b - a));
+        a = b + 1;
+    }
+    return v;
+}
+
+void unregisterTypes() {
+    for (const std::wstring& ext : savedTypes()) {
+        std::wstring key = L"Software\\Classes\\" + ext;
+        HKEY k;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, (key + L"\\OpenWithProgids").c_str(), 0, KEY_WRITE, &k) == ERROR_SUCCESS) {
+            RegDeleteValueW(k, kProgId);
+            RegCloseKey(k);
+        }
+        if (readString(HKEY_CURRENT_USER, key, nullptr) == kProgId &&
+            RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_WRITE, &k) == ERROR_SUCCESS) {
+            RegDeleteValueW(k, nullptr);  // we were its default: give it back
+            RegCloseKey(k);
+        }
+    }
+    RegDeleteTreeW(HKEY_CURRENT_USER, (std::wstring(L"Software\\Classes\\") + kProgId).c_str());
+    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\Applications\\JustNotepad.exe");
+    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shell\\JustNotepad");
+    RegDeleteTreeW(HKEY_CURRENT_USER, kCapabilities);
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\RegisteredApplications", 0, KEY_WRITE, &k) == ERROR_SUCCESS) {
+        RegDeleteValueW(k, L"JustNotepad");
+        RegCloseKey(k);
+    }
+    RegDeleteTreeW(HKEY_CURRENT_USER, kAppKey);
+}
+
+// Registers `exts`; returns how many of them still need confirming in
+// Settings > Default apps (the user had picked another default).
+int registerTypes(const std::wstring& exe, const std::vector<std::wstring>& exts, bool context) {
+    unregisterTypes();  // start clean: unticked types are released
+    const std::wstring open = L"\"" + exe + L"\" \"%1\"";
+    const std::wstring icon = L"\"" + exe + L"\",0";
+    if (HKEY k = createKey(std::wstring(L"Software\\Classes\\") + kProgId)) {
+        setString(k, nullptr, L"Text file (JustNotepad)");
+        RegCloseKey(k);
+    }
+    if (HKEY k = createKey(std::wstring(L"Software\\Classes\\") + kProgId + L"\\DefaultIcon")) {
+        setString(k, nullptr, icon);
+        RegCloseKey(k);
+    }
+    if (HKEY k = createKey(std::wstring(L"Software\\Classes\\") + kProgId + L"\\shell\\open\\command")) {
+        setString(k, nullptr, open);
+        RegCloseKey(k);
+    }
+    // The app itself, for "Open with" and Settings > Default apps.
+    if (HKEY k = createKey(L"Software\\Classes\\Applications\\JustNotepad.exe\\shell\\open\\command")) {
+        setString(k, nullptr, open);
+        RegCloseKey(k);
+    }
+    if (HKEY k = createKey(L"Software\\Classes\\Applications\\JustNotepad.exe")) {
+        setString(k, L"FriendlyAppName", L"JustNotepad");
+        RegCloseKey(k);
+    }
+    if (HKEY k = createKey(kCapabilities)) {
+        setString(k, L"ApplicationName", L"JustNotepad");
+        setString(k, L"ApplicationDescription", L"Just a notepad. Opens any file instantly.");
+        setString(k, L"ApplicationIcon", icon);
+        RegCloseKey(k);
+    }
+    if (HKEY k = createKey(L"Software\\RegisteredApplications")) {
+        setString(k, L"JustNotepad", kCapabilities);
+        RegCloseKey(k);
+    }
+    int needConfirm = 0;
+    std::wstring list;
+    HKEY fa = createKey(std::wstring(kCapabilities) + L"\\FileAssociations");
+    HKEY st = createKey(L"Software\\Classes\\Applications\\JustNotepad.exe\\SupportedTypes");
+    for (const std::wstring& ext : exts) {
+        if (fa) setString(fa, ext.c_str(), kProgId);
+        if (st) RegSetValueExW(st, ext.c_str(), 0, REG_SZ, (const BYTE*)L"", sizeof(wchar_t));
+        if (HKEY k = createKey(L"Software\\Classes\\" + ext + L"\\OpenWithProgids")) {
+            RegSetValueExW(k, kProgId, 0, REG_NONE, nullptr, 0);
+            RegCloseKey(k);
+        }
+        if (userChoseDefault(ext.c_str())) {
+            needConfirm++;
+        } else if (HKEY k = createKey(L"Software\\Classes\\" + ext)) {
+            setString(k, nullptr, kProgId);  // no default chosen yet: JustNotepad opens it
+            RegCloseKey(k);
+        }
+        list += ext + L";";
+    }
+    if (fa) RegCloseKey(fa);
+    if (st) RegCloseKey(st);
+    if (context) {
+        if (HKEY k = createKey(L"Software\\Classes\\*\\shell\\JustNotepad")) {
+            setString(k, nullptr, L"Edit with JustNotepad");
+            setString(k, L"Icon", icon);
+            RegCloseKey(k);
+        }
+        if (HKEY k = createKey(L"Software\\Classes\\*\\shell\\JustNotepad\\command")) {
+            setString(k, nullptr, open);
+            RegCloseKey(k);
+        }
+    }
+    if (HKEY k = createKey(kAppKey)) {
+        setString(k, L"FileTypes", list);
+        setString(k, L"ContextMenu", context ? L"1" : L"0");
+        RegCloseKey(k);
+    }
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    return needConfirm;
+}
+
+std::vector<std::wstring> g_types;  // ticked in the dialog
+bool g_context = true;
+int g_needConfirm = 0;
 Palette g_pal;
 HFONT g_titleFont = nullptr;
 
@@ -233,6 +421,7 @@ bool install(HWND owner, bool desktop) {
         setDword(k, L"NoRepair", 1);
         RegCloseKey(k);
     }
+    g_needConfirm = registerTypes(exe, g_types, g_context);
     return true;
 }
 
@@ -242,6 +431,8 @@ bool uninstall(HWND owner) {
     DeleteFileW((dir + L"\\JustNotepad.exe").c_str());
     DeleteFileW(startMenuLink().c_str());
     DeleteFileW(desktopLink().c_str());
+    unregisterTypes();
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     RegDeleteTreeW(HKEY_CURRENT_USER, kUninstallKey);
     // This exe (uninstall.exe) cannot delete itself while running: a hidden
     // cmd waits a moment, then removes it and the folder.
@@ -286,6 +477,22 @@ INT_PTR CALLBACK setupProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
                                            L"Your settings are kept.");
             ShowWindow(GetDlgItem(dlg, IDC_DESKTOP), SW_HIDE);
             ShowWindow(GetDlgItem(dlg, IDC_BROWSE), SW_HIDE);
+            for (int id : {IDC_TYPESLABEL, IDC_TYPES, IDC_ALL, IDC_NONE, IDC_CONTEXT}) ShowWindow(GetDlgItem(dlg, id), SW_HIDE);
+            // Buttons right under the folder; the window shrinks to fit.
+            RECT d = {0, 75, 0, 0};
+            MapDialogRect(dlg, &d);
+            RECT ok, wr;
+            GetWindowRect(GetDlgItem(dlg, IDOK), &ok);
+            MapWindowPoints(nullptr, dlg, (POINT*)&ok, 2);
+            const int dy = ok.top - d.top;
+            for (int id : {IDOK, IDCANCEL}) {
+                RECT b;
+                GetWindowRect(GetDlgItem(dlg, id), &b);
+                MapWindowPoints(nullptr, dlg, (POINT*)&b, 2);
+                SetWindowPos(GetDlgItem(dlg, id), nullptr, b.left, b.top - dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+            }
+            GetWindowRect(dlg, &wr);
+            SetWindowPos(dlg, nullptr, 0, 0, wr.right - wr.left, wr.bottom - wr.top - dy, SWP_NOMOVE | SWP_NOZORDER);
             SendDlgItemMessageW(dlg, IDC_PATH, EM_SETREADONLY, TRUE, 0);
             ShowWindow(GetDlgItem(dlg, IDC_RUN), SW_HIDE);
             SetDlgItemTextW(dlg, IDOK, L"&Uninstall");
@@ -297,6 +504,26 @@ INT_PTR CALLBACK setupProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
             CheckDlgButton(dlg, IDC_DESKTOP,
                            GetFileAttributesW(desktopLink().c_str()) != INVALID_FILE_ATTRIBUTES ? BST_CHECKED : BST_UNCHECKED);
             CheckDlgButton(dlg, IDC_RUN, BST_CHECKED);
+            // File types: ticked as last time, or the suggested set on a first install.
+            HWND lv = GetDlgItem(dlg, IDC_TYPES);
+            ListView_SetExtendedListViewStyle(lv, LVS_EX_CHECKBOXES | LVS_EX_DOUBLEBUFFER);
+            ListView_SetColumnWidth(lv, 0, MulDiv(84, (int)GetDpiForWindow(dlg), 96));
+            const std::vector<std::wstring> before = savedTypes();
+            const bool first = readString(HKEY_CURRENT_USER, kAppKey, L"FileTypes").empty() &&
+                               GetFileAttributesW((installDir() + L"\\JustNotepad.exe").c_str()) == INVALID_FILE_ATTRIBUTES;
+            int i = 0;
+            for (const FileType& t : kTypes) {
+                LVITEMW it = {};
+                it.mask = LVIF_TEXT;
+                it.iItem = i;
+                it.pszText = (LPWSTR)t.ext;
+                ListView_InsertItem(lv, &it);
+                bool on = first ? t.on : std::find(before.begin(), before.end(), t.ext) != before.end();
+                ListView_SetCheckState(lv, i, on ? TRUE : FALSE);
+                i++;
+            }
+            const std::wstring ctx = readString(HKEY_CURRENT_USER, kAppKey, L"ContextMenu");
+            CheckDlgButton(dlg, IDC_CONTEXT, ctx == L"0" ? BST_UNCHECKED : BST_CHECKED);
         }
         return TRUE;
     }
@@ -304,6 +531,11 @@ INT_PTR CALLBACK setupProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
         if (themeDrawDialogButton((DRAWITEMSTRUCT*)lp, g_pal)) return TRUE;
         break;
     case WM_COMMAND:
+        if (LOWORD(wp) == IDC_ALL || LOWORD(wp) == IDC_NONE) {
+            HWND lv = GetDlgItem(dlg, IDC_TYPES);
+            for (int i = 0; i < ListView_GetItemCount(lv); i++) ListView_SetCheckState(lv, i, LOWORD(wp) == IDC_ALL);
+            return TRUE;
+        }
         if (LOWORD(wp) == IDC_BROWSE) {
             std::wstring p = installDir();
             if (browseForFolder(dlg, p)) SetDlgItemTextW(dlg, IDC_PATH, p.c_str());
@@ -317,6 +549,11 @@ INT_PTR CALLBACK setupProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
                 while (!p.empty() && (p.back() == L' ' || p.back() == L'\\' || p.back() == L'/')) p.pop_back();
                 while (!p.empty() && p.front() == L' ') p.erase(p.begin());
                 g_chosenDir = p;
+                g_types.clear();
+                HWND lv = GetDlgItem(dlg, IDC_TYPES);
+                for (int i = 0; i < ListView_GetItemCount(lv) && i < (int)(sizeof(kTypes) / sizeof(kTypes[0])); i++)
+                    if (ListView_GetCheckState(lv, i)) g_types.push_back(kTypes[i].ext);
+                g_context = IsDlgButtonChecked(dlg, IDC_CONTEXT) == BST_CHECKED;
             }
             HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
             bool ok;
@@ -328,6 +565,17 @@ INT_PTR CALLBACK setupProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
                 const bool run = IsDlgButtonChecked(dlg, IDC_RUN) == BST_CHECKED;
                 ok = install(dlg, IsDlgButtonChecked(dlg, IDC_DESKTOP) == BST_CHECKED);
                 SetCursor(old);
+                if (ok && g_needConfirm > 0) {
+                    wchar_t m[512];
+                    swprintf(m, 512,
+                             L"%d of the file types you ticked already open with another app, and Windows asks you "
+                             L"to confirm the change yourself.\n\nOpen Default apps now? Choose JustNotepad there "
+                             L"(\"Set default\").",
+                             g_needConfirm);
+                    if (MessageBoxW(dlg, m, kTitle, MB_YESNO | MB_ICONINFORMATION) == IDYES)
+                        ShellExecuteW(nullptr, L"open", L"ms-settings:defaultapps?registeredAppUser=JustNotepad", nullptr,
+                                      nullptr, SW_SHOWNORMAL);
+                }
                 if (ok && run) ShellExecuteW(nullptr, L"open", (installDir() + L"\\JustNotepad.exe").c_str(), nullptr,
                                              installDir().c_str(), SW_SHOWNORMAL);
                 else if (ok) MessageBoxW(dlg, L"JustNotepad is installed. Find it in the Start menu.", kTitle, MB_OK | MB_ICONINFORMATION);

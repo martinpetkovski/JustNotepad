@@ -9,3 +9,8 @@
 #define IDC_RUN 105
 #define IDC_SETUP_ICON 106
 #define IDC_BROWSE 107
+#define IDC_TYPES 108
+#define IDC_TYPESLABEL 109
+#define IDC_ALL 110
+#define IDC_NONE 111
+#define IDC_CONTEXT 112
