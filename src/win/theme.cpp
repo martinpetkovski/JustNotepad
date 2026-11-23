@@ -499,6 +499,21 @@ void themeOwnerDrawMenu(HMENU bar) {
         if (HMENU s = GetSubMenu(bar, i)) ownerDrawPopup(s);  // the bar itself is drawn by the UAH messages
 }
 
+void themeOwnerDrawPopup(HMENU popup) { ownerDrawPopup(popup); }
+
+void themeReleasePopup(HMENU m) {
+    int n = GetMenuItemCount(m);
+    for (int i = 0; i < n; i++) {
+        MENUITEMINFOW mii = {sizeof(mii)};
+        mii.fMask = MIIM_FTYPE | MIIM_DATA | MIIM_SUBMENU;
+        if (!GetMenuItemInfoW(m, i, TRUE, &mii)) continue;
+        if (mii.hSubMenu) themeReleasePopup(mii.hSubMenu);
+        if ((mii.fType & MFT_OWNERDRAW) && mii.dwItemData) delete (MenuItem*)mii.dwItemData;
+    }
+}
+
+void themePopupColors(HMENU popup, const Palette& p) { applyMenuBrush(popup, brushFor(g_menuBrush, g_menuBrushCol, p.face)); }
+
 void themeSetMenuText(HMENU bar, UINT id, const wchar_t* text) {
     if (MenuItem* it = itemFor(bar, id)) it->text = text;
 }

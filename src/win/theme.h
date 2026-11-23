@@ -60,6 +60,11 @@ void drawGlyph(HDC dc, const RECT& r, Glyph gl, COLORREF c1, COLORREF c2, bool p
 // Turns every item below the menu bar into an owner-drawn one (keeps its text).
 void themeOwnerDrawMenu(HMENU bar);
 void themeSetMenuText(HMENU bar, UINT id, const wchar_t* text);
+// The same for a context menu (a popup on its own) and its submenus.
+void themeOwnerDrawPopup(HMENU popup);
+void themePopupColors(HMENU popup, const Palette& p);
+// Frees what themeOwnerDrawPopup attached to a popup; call before DestroyMenu.
+void themeReleasePopup(HMENU popup);
 void themeSetMenuRadio(HMENU bar, UINT id);  // checked shows a dot instead of a tick
 void themeMenuColors(HMENU bar, const Palette& p);
 void themeMeasureMenuItem(HWND hwnd, MEASUREITEMSTRUCT* mi, HFONT font);

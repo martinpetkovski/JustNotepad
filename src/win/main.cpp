@@ -259,6 +259,13 @@ unsigned g_gen = 0;  // source of unique ids for background work replies
 
 INT_PTR dialogTheme(HWND dlg, UINT msg, WPARAM wp, LPARAM lp);
 void scrollRows(int n);
+bool findBarOpen();
+void updateFindStatus(u64 hit);
+void paintRowMatches(HDC dc, const Row& r, int y, const LayoutCfg& c);
+void closeFindBar();
+void showEditorMenu(POINT screen);
+POINT caretPoint();
+void onCommand(int id);
 void layoutFrame();
 bool sideVisible();
 void updateSidePane();
@@ -1133,6 +1140,7 @@ void paintView(HWND hwnd) {
         }
         // What the next row is: a new line (number it) or a wrap continuation.
 
+        paintRowMatches(dc, r, y, c);
         if (s < e && e > r.start && s < r.next) {
             int c0 = s <= r.start ? 0 : colOf(g.d->doc, r, s, c);
             int c1 = e > r.end ? colOf(g.d->doc, r, r.end, c) + 1 : colOf(g.d->doc, r, e, c);
@@ -3026,6 +3034,277 @@ bool wholeWordAt(u64 pos, u64 n) {
 
 bool searchProgress(u64) { return (GetAsyncKeyState(VK_ESCAPE) & 0x8000) == 0; }
 
+// ====================================================================== bars (find bar, data view search)
+//
+// A strip with one or two text boxes and square 3D buttons, part of the main
+// window: the editor's find / replace bar and the data view's search box.
+
+struct BarButton {
+    int id;
+    const wchar_t* text;  // label, or nullptr for a glyph
+    int glyph;            // Glyph when text is null
+    bool toggle;          // stays pushed in while on
+    bool on;
+    int row;              // 0 first row, 1 replace row
+    RECT rc;
+    const wchar_t* tip;
+};
+
+struct Bar {
+    HWND wnd = nullptr, edit = nullptr, edit2 = nullptr;
+    bool twoRows = false;  // find bar: the replace row is open
+    std::vector<BarButton> buttons;
+    int hot = -1, press = -1;
+    std::wstring status;   // "3 of 12", "No results", ...
+    bool noMatch = false;
+    const wchar_t* label1 = L"";
+    const wchar_t* label2 = L"";
+    std::function<void(int)> action;      // a button, or Enter (id 1) / Shift+Enter (id 2) / Esc (id 3)
+    std::function<void()> changed;        // the first box's text changed
+};
+
+Bar g_findBar, g_dataBar;
+const wchar_t* const kBarClass = L"JustNotepadBar";
+enum BarIds { BAR_ENTER = 1, BAR_SHIFTENTER = 2, BAR_ESC = 3, BAR_CASE = 10, BAR_WORD, BAR_PREV, BAR_NEXT, BAR_CLOSE,
+              BAR_REPLMODE, BAR_REPLACE, BAR_REPLACEALL };
+
+int barRowH() { return g.statusH + MulDiv(10, g.dpi, 96); }
+int barHeight(const Bar& b) { return b.wnd && IsWindowVisible(b.wnd) ? barRowH() * (b.twoRows ? 2 : 1) : 0; }
+
+std::wstring editText(HWND e) {
+    int n = GetWindowTextLengthW(e);
+    std::wstring s((size_t)n + 1, L'\0');
+    GetWindowTextW(e, &s[0], n + 1);
+    s.resize((size_t)n);
+    return s;
+}
+
+void barLayout(Bar& b) {
+    RECT rc;
+    GetClientRect(b.wnd, &rc);
+    const int px = MulDiv(1, g.dpi, 96), rh = barRowH(), bs = rh - 10 * px, pad = 8 * px, gap = 4 * px;
+    const int labelW = 58 * px;
+    // Buttons from the right, per row.
+    int xr[2] = {(int)rc.right - pad, (int)rc.right - pad};
+    const int statusW = 86 * px;
+    for (int k = (int)b.buttons.size() - 1; k >= 0; k--) {
+        BarButton& bt = b.buttons[(size_t)k];
+        HDC dc = GetDC(b.wnd);
+        HGDIOBJ of = SelectObject(dc, g.uiFont);
+        SIZE sz = {bs, bs};
+        if (bt.text) {
+            GetTextExtentPoint32W(dc, bt.text, lstrlenW(bt.text), &sz);
+            sz.cx = std::max(bs, (int)sz.cx + 14 * px);
+        } else {
+            sz.cx = bs;
+        }
+        SelectObject(dc, of);
+        ReleaseDC(b.wnd, dc);
+        int y = bt.row * rh + (rh - bs) / 2;
+        bt.rc = {xr[bt.row] - (int)sz.cx, y, xr[bt.row], y + bs};
+        xr[bt.row] -= (int)sz.cx + gap;
+    }
+    xr[0] -= statusW;  // room for "3 of 12" between the text box and the buttons
+    const int ex = pad + labelW, eh = bs - 4 * px;
+    const int ew1 = std::max(60 * px, xr[0] - ex - gap);
+    MoveWindow(b.edit, ex + 2 * px, (rh - eh) / 2, ew1 - 4 * px, eh, TRUE);
+    if (b.edit2) {
+        const int ew2 = std::max(60 * px, xr[1] - ex - gap);
+        MoveWindow(b.edit2, ex + 2 * px, rh + (rh - eh) / 2, ew2 - 4 * px, eh, TRUE);
+        ShowWindow(b.edit2, b.twoRows ? SW_SHOW : SW_HIDE);
+    }
+}
+
+void paintBar(HWND hwnd) {
+    Bar& b = *(Bar*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    PAINTSTRUCT ps;
+    HDC wdc = BeginPaint(hwnd, &ps);
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, std::max(1, (int)rc.right), std::max(1, (int)rc.bottom));
+    HGDIOBJ ob = SelectObject(dc, bmp);
+    fillRect(dc, 0, 0, rc.right, rc.bottom, g.pal.face);
+    fillRect(dc, 0, rc.bottom - 1, rc.right, rc.bottom, g.pal.border);
+    HGDIOBJ of = SelectObject(dc, g.uiFont);
+    SetBkMode(dc, TRANSPARENT);
+    const int px = MulDiv(1, g.dpi, 96), rh = barRowH(), pad = 8 * px;
+    // Labels, and a sunken 90s frame around each text box.
+    for (int row = 0; row < (b.twoRows ? 2 : 1); row++) {
+        HWND e = row == 0 ? b.edit : b.edit2;
+        if (!e) continue;
+        RECT er;
+        GetWindowRect(e, &er);
+        MapWindowPoints(nullptr, hwnd, (POINT*)&er, 2);
+        InflateRect(&er, 2 * px, 2 * px);
+        fillRect(dc, er.left, er.top, er.right, er.bottom, g.pal.bg);
+        drawButton3D(dc, er, BTN_PRESSED, g.pal, 0);
+        fillRect(dc, er.left + 2, er.top + 2, er.right - 2, er.bottom - 2, g.pal.bg);
+        RECT lr = {pad, row * rh, er.left - 4 * px, (row + 1) * rh};
+        SetTextColor(dc, g.pal.faceText);
+        const wchar_t* lab = row == 0 ? b.label1 : b.label2;
+        DrawTextW(dc, lab, -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+    // Status ("3 of 12"), right after the first text box.
+    if (!b.status.empty()) {
+        RECT er;
+        GetWindowRect(b.edit, &er);
+        MapWindowPoints(nullptr, hwnd, (POINT*)&er, 2);
+        int left = er.right + 8 * px, right = left + 82 * px;
+        for (const BarButton& bt : b.buttons)
+            if (bt.row == 0 && bt.rc.left >= left) right = std::min(right, (int)bt.rc.left - 4 * px);
+        RECT sr = {left, 0, right, rh};
+        SetTextColor(dc, b.noMatch ? (g.pal.dark ? RGB(255, 120, 110) : RGB(190, 30, 30)) : blend(g.pal.faceText, g.pal.face, 70));
+        DrawTextW(dc, b.status.c_str(), -1, &sr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    for (size_t k = 0; k < b.buttons.size(); k++) {
+        const BarButton& bt = b.buttons[k];
+        if (bt.row == 1 && !b.twoRows) continue;
+        const bool hot = b.hot == (int)k, held = hot && b.press == (int)k;
+        ButtonState st = held ? BTN_PRESSED : bt.on ? (hot ? BTN_LATCHED_HOT : BTN_LATCHED) : hot ? BTN_HOT : BTN_NORMAL;
+        drawButton3D(dc, bt.rc, st, g.pal, g.pal.accent);
+        if (bt.text) {
+            RECT tr = bt.rc;
+            if (held || bt.on) OffsetRect(&tr, 1, 1);
+            SetTextColor(dc, g.pal.faceText);
+            DrawTextW(dc, bt.text, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            drawGlyph(dc, bt.rc, (Glyph)bt.glyph, g.pal.faceText, g.pal.faceText, held || bt.on);
+        }
+    }
+    SelectObject(dc, of);
+    BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, ob);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+int barButtonAt(Bar& b, POINT pt) {
+    for (size_t k = 0; k < b.buttons.size(); k++) {
+        if (b.buttons[k].row == 1 && !b.twoRows) continue;
+        if (PtInRect(&b.buttons[k].rc, pt)) return (int)k;
+    }
+    return -1;
+}
+
+// Keys in the text boxes: Enter / Shift+Enter / Esc go to the bar's action,
+// Tab moves between the boxes and back to the editor.
+LRESULT CALLBACK barEditProc(HWND e, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
+    Bar& b = *(Bar*)ref;
+    if (msg == WM_KEYDOWN) {
+        const bool shift = GetKeyState(VK_SHIFT) < 0;
+        if (wp == VK_RETURN) {
+            if (b.action) b.action(e == b.edit2 ? (shift ? BAR_REPLACEALL : BAR_REPLACE) : shift ? BAR_SHIFTENTER : BAR_ENTER);
+            return 0;
+        }
+        if (wp == VK_ESCAPE) {
+            if (b.action) b.action(BAR_ESC);
+            return 0;
+        }
+        if (wp == VK_TAB) {
+            if (e == b.edit && b.edit2 && b.twoRows && !shift) SetFocus(b.edit2);
+            else if (e == b.edit2 && shift) SetFocus(b.edit);
+            else SetFocus(g.view);
+            return 0;
+        }
+    }
+    if (msg == WM_CHAR && (wp == L'\r' || wp == 27 || wp == L'\t')) return 0;  // no beep
+    if (msg == WM_CHAR && wp == 1) {  // Ctrl+A in a box: select all of it
+        SendMessageW(e, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    return DefSubclassProc(e, msg, wp, lp);
+}
+
+LRESULT CALLBACK barProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    Bar* bp = (Bar*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (msg >= WM_CTLCOLORMSGBOX && msg <= WM_CTLCOLORSTATIC && bp) {
+        INT_PTR r = themeCtlColor(msg, wp, g.pal);
+        if (msg == WM_CTLCOLOREDIT && (HWND)lp == bp->edit && bp->noMatch)
+            SetTextColor((HDC)wp, g.pal.dark ? RGB(255, 120, 110) : RGB(190, 30, 30));
+        return r;
+    }
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: paintBar(hwnd); return 0;
+    case WM_SIZE:
+        if (bp) barLayout(*bp);
+        return 0;
+    case WM_COMMAND:
+        if (bp && HIWORD(wp) == EN_CHANGE && (HWND)lp == bp->edit && bp->changed) bp->changed();
+        return 0;
+    case WM_MOUSEMOVE: {
+        if (!bp) break;
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        int h = barButtonAt(*bp, pt);
+        if (h != bp->hot) {
+            bp->hot = h;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&tme);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (bp && GetCapture() != hwnd && bp->hot >= 0) {
+            bp->hot = -1;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+        if (bp && bp->hot >= 0) {
+            bp->press = bp->hot;
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONUP: {
+        if (!bp || GetCapture() != hwnd) return 0;
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        int k = barButtonAt(*bp, pt), p = bp->press;
+        bp->press = -1;
+        ReleaseCapture();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        if (k == p && k >= 0 && bp->action) bp->action(bp->buttons[(size_t)k].id);
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if (bp && bp->press >= 0) {
+            bp->press = -1;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void createBar(Bar& b, HWND parent, bool withSecondBox) {
+    b.wnd = CreateWindowExW(0, kBarClass, L"", WS_CHILD | WS_CLIPCHILDREN, 0, 0, 0, 0, parent, nullptr, g.inst, nullptr);
+    SetWindowLongPtrW(b.wnd, GWLP_USERDATA, (LONG_PTR)&b);
+    auto box = [&](int id) {
+        HWND e = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, b.wnd,
+                                 (HMENU)(INT_PTR)id, g.inst, nullptr);
+        SendMessageW(e, WM_SETFONT, (WPARAM)g.uiFont, FALSE);
+        SetWindowTheme(e, L"", L"");
+        SetWindowSubclass(e, barEditProc, 1, (DWORD_PTR)&b);
+        return e;
+    };
+    b.edit = box(100);
+    if (withSecondBox) b.edit2 = box(101);
+}
+
+void themeBars() {
+    for (Bar* b : {&g_findBar, &g_dataBar}) {
+        if (!b->wnd) continue;
+        if (b->edit) SendMessageW(b->edit, WM_SETFONT, (WPARAM)g.uiFont, TRUE);
+        if (b->edit2) SendMessageW(b->edit2, WM_SETFONT, (WPARAM)g.uiFont, TRUE);
+        barLayout(*b);
+        InvalidateRect(b->wnd, nullptr, TRUE);
+    }
+}
+
 u64 findFrom(const std::string& nd, u64 from, bool down, bool matchCase, bool word) {
     const u64 size = g.d->doc.size();
     for (;;) {
@@ -3048,6 +3327,8 @@ bool findNext(bool down) {
     u64 hit = findFrom(nd, down ? selMax() : selMin(), down, g.findCase, g.findWord);
     if (hit == NPOS) hit = findFrom(nd, down ? 0 : g.d->doc.size(), down, g.findCase, g.findWord);  // wrap around
     SetCursor(old);
+    if (findBarOpen()) updateFindStatus(hit);
+    if (hit == NPOS && findBarOpen()) return false;
     if (hit == NPOS) {
         std::wstring msg = std::wstring(L"Cannot find \"") + g.findBuf + L"\"";
         MessageBoxW(g.findDlg ? g.findDlg : g.frame, msg.c_str(), kAppName, MB_OK | MB_ICONINFORMATION);
@@ -3096,46 +3377,193 @@ void replaceAll() {
     SetCursor(old);
     afterEdit(std::min(g.d->caret, g.d->doc.size()));
     wchar_t b[96];
-    swprintf(b, 96, L"Replaced %llu occurrence(s).", (unsigned long long)count);
-    MessageBoxW(g.findDlg ? g.findDlg : g.frame, b, kAppName, MB_OK | MB_ICONINFORMATION);
+    swprintf(b, 96, L"Replaced %llu", (unsigned long long)count);
+    if (findBarOpen()) {
+        g_findBar.status = b;
+        g_findBar.noMatch = count == 0;
+        InvalidateRect(g_findBar.wnd, nullptr, FALSE);
+    } else {
+        MessageBoxW(g.frame, b, kAppName, MB_OK | MB_ICONINFORMATION);
+    }
 }
 
-void showFind(bool replace) {
-    if (g.findDlg) {
-        // Switching between Find and Replace needs a new dialog.
-        DestroyWindow(g.findDlg);
-        g.findDlg = nullptr;
+// ---- the editor's find / replace bar
+
+bool findBarOpen() { return g_findBar.wnd && IsWindowVisible(g_findBar.wnd); }
+
+std::string findNeedle() { return toDocBytes(g.findBuf, lstrlenW(g.findBuf)); }
+
+// "3 of 12": counts matches (files up to 16 MB; beyond that just found / not found).
+void updateFindStatus(u64 hit) {
+    std::string nd = findNeedle();
+    g_findBar.noMatch = false;
+    if (nd.empty()) {
+        g_findBar.status.clear();
+    } else if (hit == NPOS) {
+        g_findBar.status = L"No results";
+        g_findBar.noMatch = true;
+    } else if (g.d->doc.size() <= (16u << 20)) {
+        u64 total = 0, index = 0, pos = 0;
+        for (;;) {
+            u64 h = findFrom(nd, pos, true, g.findCase, g.findWord);
+            if (h == NPOS || total > 999999) break;
+            total++;
+            if (h <= hit) index = total;
+            pos = h + std::max<u64>(1, nd.size());
+        }
+        wchar_t b[64];
+        swprintf(b, 64, L"%llu of %llu", (unsigned long long)index, (unsigned long long)total);
+        g_findBar.status = b;
+    } else {
+        g_findBar.status = L"Found";
     }
-    // Seed with the selection when it is short and on one line.
+    if (g_findBar.wnd) InvalidateRect(g_findBar.wnd, nullptr, FALSE);
+    if (g_findBar.edit) InvalidateRect(g_findBar.edit, nullptr, TRUE);
+}
+
+// Searches from `from` (wrapping), selects the hit and keeps the focus where it is.
+bool findAndSelect(u64 from, bool down) {
+    std::string nd = findNeedle();
+    if (nd.empty()) {
+        updateFindStatus(NPOS);
+        return false;
+    }
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    u64 hit = findFrom(nd, from, down, g.findCase, g.findWord);
+    if (hit == NPOS) hit = findFrom(nd, down ? 0 : g.d->doc.size(), down, g.findCase, g.findWord);  // wrap around
+    SetCursor(old);
+    if (hit != NPOS) {
+        g.d->anchor = hit;
+        g.d->caret = hit + nd.size();
+        g.d->wantCol = -1;
+        g.d->doc.breakCoalesce();
+        refresh(true);
+    }
+    updateFindStatus(hit);
+    InvalidateRect(g.view, nullptr, FALSE);  // match highlights
+    return hit != NPOS;
+}
+
+void openFindBar(bool replace) {
+    // Start from the selection when it is short and on one line.
     if (hasSel() && selMax() - selMin() < 200) {
         std::string s = g.d->doc.text(selMin(), selMax() - selMin());
         if (s.find('\n') == std::string::npos && s.find('\r') == std::string::npos) {
             std::wstring w = fromDocBytes(s);
             lstrcpynW(g.findBuf, w.c_str(), 256);
+            SetWindowTextW(g_findBar.edit, g.findBuf);
         }
     }
-    g.fr = FINDREPLACEW{};
-    g.fr.lStructSize = sizeof(g.fr);
-    g.fr.hwndOwner = g.frame;
-    g.fr.Flags = FR_DOWN | (g.findCase ? FR_MATCHCASE : 0) | (g.findWord ? FR_WHOLEWORD : 0);
-    g.fr.lpstrFindWhat = g.findBuf;
-    g.fr.wFindWhatLen = (WORD)sizeof(g.findBuf);
-    g.fr.lpstrReplaceWith = g.replBuf;
-    g.fr.wReplaceWithLen = (WORD)sizeof(g.replBuf);
-    g.findDlg = replace ? ReplaceTextW(&g.fr) : FindTextW(&g.fr);
+    g_findBar.twoRows = replace;
+    for (BarButton& bt : g_findBar.buttons) {
+        if (bt.id == BAR_CASE) bt.on = g.findCase;
+        if (bt.id == BAR_WORD) bt.on = g.findWord;
+        if (bt.id == BAR_REPLMODE) bt.on = replace;
+    }
+    ShowWindow(g_findBar.wnd, SW_SHOW);
+    layoutFrame();
+    barLayout(g_findBar);
+    SetFocus(replace && GetWindowTextLengthW(g_findBar.edit) > 0 ? g_findBar.edit2 : g_findBar.edit);
+    SendMessageW(GetFocus(), EM_SETSEL, 0, -1);
+    updateFindStatus(lstrlenW(g.findBuf) && hasSel() && selectionMatches(findNeedle()) ? selMin() : NPOS);
+    if (!lstrlenW(g.findBuf)) g_findBar.status.clear();
+    InvalidateRect(g_findBar.wnd, nullptr, FALSE);
+    InvalidateRect(g.view, nullptr, FALSE);
 }
 
-void onFindMessage(LPFINDREPLACEW p) {
-    if (p->Flags & FR_DIALOGTERM) {
-        g.findDlg = nullptr;
-        return;
-    }
-    g.findCase = (p->Flags & FR_MATCHCASE) != 0;
-    g.findWord = (p->Flags & FR_WHOLEWORD) != 0;
-    if (p->Flags & FR_FINDNEXT) findNext((p->Flags & FR_DOWN) != 0);
-    else if (p->Flags & FR_REPLACE) replaceOne();
-    else if (p->Flags & FR_REPLACEALL) replaceAll();
+void closeFindBar() {
+    if (!findBarOpen()) return;
+    ShowWindow(g_findBar.wnd, SW_HIDE);
+    layoutFrame();
+    SetFocus(g.view);
+    InvalidateRect(g.view, nullptr, FALSE);
 }
+
+void showFind(bool replace) { openFindBar(replace); }
+
+void onFindBarAction(int id) {
+    switch (id) {
+    case BAR_ENTER:
+    case BAR_NEXT: findAndSelect(selMax(), true); break;
+    case BAR_SHIFTENTER:
+    case BAR_PREV: findAndSelect(selMin(), false); break;
+    case BAR_ESC:
+    case BAR_CLOSE: closeFindBar(); break;
+    case BAR_CASE:
+    case BAR_WORD:
+        for (BarButton& bt : g_findBar.buttons)
+            if (bt.id == id) {
+                bt.on = !bt.on;
+                (id == BAR_CASE ? g.findCase : g.findWord) = bt.on;
+            }
+        findAndSelect(selMin(), true);  // the current match may no longer count
+        break;
+    case BAR_REPLMODE: openFindBar(!g_findBar.twoRows); break;
+    case BAR_REPLACE: {
+        std::wstring r = editText(g_findBar.edit2);
+        lstrcpynW(g.replBuf, r.c_str(), 256);
+        replaceOne();
+        break;
+    }
+    case BAR_REPLACEALL: {
+        std::wstring r = editText(g_findBar.edit2);
+        lstrcpynW(g.replBuf, r.c_str(), 256);
+        replaceAll();
+        break;
+    }
+    }
+    if (findBarOpen() && GetFocus() == g.view && id != BAR_ESC && id != BAR_CLOSE) SetFocus(g_findBar.edit);
+}
+
+// Typing in the find box searches straight away, from where the current match starts.
+void onFindBarChanged() {
+    std::wstring t = editText(g_findBar.edit);
+    lstrcpynW(g.findBuf, t.c_str(), 256);
+    findAndSelect(hasSel() ? selMin() : g.d->caret, true);
+}
+
+void setupFindBar() {
+    createBar(g_findBar, g.frame, true);
+    g_findBar.label1 = L"Find";
+    g_findBar.label2 = L"Replace";
+    g_findBar.buttons = {
+        {BAR_CASE, L"Aa", 0, true, g.findCase, 0, {}, L"Match case"},
+        {BAR_WORD, L"ab", 0, true, g.findWord, 0, {}, L"Whole word"},
+        {BAR_PREV, nullptr, GLYPH_UP, false, false, 0, {}, L"Previous (Shift+Enter)"},
+        {BAR_NEXT, nullptr, GLYPH_DOWN, false, false, 0, {}, L"Next (Enter)"},
+        {BAR_REPLMODE, L"Replace", 0, true, false, 0, {}, L"Show replace (Ctrl+H)"},
+        {BAR_CLOSE, nullptr, GLYPH_CLOSE, false, false, 0, {}, L"Close (Esc)"},
+        {BAR_REPLACE, L"Replace", 0, false, false, 1, {}, L"Replace (Enter)"},
+        {BAR_REPLACEALL, L"Replace All", 0, false, false, 1, {}, L"Replace all (Shift+Enter)"},
+    };
+    g_findBar.action = onFindBarAction;
+    g_findBar.changed = onFindBarChanged;
+}
+
+// Match highlights for one editor row (visible rows only, so this is cheap).
+void paintRowMatches(HDC dc, const Row& r, int y, const LayoutCfg& c) {
+    if (!findBarOpen()) return;
+    const std::string nd = findNeedle();
+    if (nd.empty() || nd.size() > 255 || r.end <= r.start || r.end - r.start > (1u << 16)) return;
+    // Search a little past the row so matches that cross its edge still show.
+    const u64 from = r.start > nd.size() ? r.start - nd.size() + 1 : 0;
+    u64 to = std::min(g.d->doc.size(), r.end + nd.size() - 1);
+    u64 pos = from;
+    while (pos < to) {
+        u64 h = g.d->doc.searchFwd(nd, pos, to, g.findCase);
+        if (h == NPOS) break;
+        pos = h + 1;
+        if (g.findWord && !wholeWordAt(h, nd.size())) continue;
+        u64 a = std::max(h, r.start), b = std::min(h + nd.size(), r.end);
+        if (b <= a) continue;
+        int c0 = colOf(g.d->doc, r, a, c), c1 = colOf(g.d->doc, r, b, c);
+        int x0 = std::max(g.gutterPx, g.gutterPx + (c0 - g.d->hcol) * g.cw);
+        int x1 = std::min(g.cliW, g.gutterPx + (c1 - g.d->hcol) * g.cw);
+        if (x1 > x0) fillRect(dc, x0, y, x1, y + g.ch, blend(RGB(255, 200, 40), g.pal.bg, g.pal.dark ? 35 : 45));
+    }
+}
+
+void onFindMessage(LPFINDREPLACEW) {}
 
 INT_PTR CALLBACK gotoProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
     if (INT_PTR br = dialogTheme(dlg, msg, wp, lp)) return br;
@@ -3567,6 +3995,8 @@ void fillKids(HTREEITEM item, int id) {
 }
 
 // Re-reads the document into the tree, keeping what was expanded and selected.
+void runDataSearch(bool keepPlace);
+
 void rebuildDataView() {
     if (!g.sideTree) return;
     // Remember the open branches and the selection by path.
@@ -3666,6 +4096,7 @@ void rebuildDataView() {
     SendMessageW(g.sideTree, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g.sideTree, nullptr, TRUE);
     g.treeUpdating = false;
+    if (g_dataBar.edit && GetWindowTextLengthW(g_dataBar.edit)) runDataSearch(true);
 }
 
 int treeNodeOf(HTREEITEM it) {
@@ -3720,6 +4151,106 @@ bool applyNodeEdit(int id, const std::wstring& text) {
     replaceRange(n.vstart, n.vend, raw, n.vstart, n.vstart + raw.size());
     rebuildDataView();
     return true;
+}
+
+// ---- data view search
+
+std::vector<int> g_dataHits;  // nodes matching the search, in document order
+int g_dataHit = -1;
+
+std::string lowerAscii(std::string s) {
+    for (char& c : s) c = (char)((c >= 'A' && c <= 'Z') ? c + 32 : c);
+    return s;
+}
+
+// Finds the tree item for node `id`, opening its parents on the way (they
+// are filled in lazily).
+HTREEITEM revealNode(int id) {
+    std::vector<int> chain;
+    for (int k = id; k >= 0; k = g.data.nodes[(size_t)k].parent) chain.push_back(k);
+    std::reverse(chain.begin(), chain.end());
+    if (sideKind() == SIDE_XML && !chain.empty() && chain[0] == 0) chain.erase(chain.begin());  // the hidden document node
+    HTREEITEM level = TreeView_GetRoot(g.sideTree), found = nullptr;
+    for (size_t i = 0; i < chain.size(); i++) {
+        found = nullptr;
+        for (HTREEITEM it = level; it; it = TreeView_GetNextSibling(g.sideTree, it))
+            if (treeNodeOf(it) == chain[i]) {
+                found = it;
+                break;
+            }
+        if (!found) return nullptr;
+        if (i + 1 < chain.size()) {
+            fillKids(found, chain[i]);
+            TreeView_Expand(g.sideTree, found, TVE_EXPAND);
+            level = TreeView_GetChild(g.sideTree, found);
+        }
+    }
+    return found;
+}
+
+void showDataHit() {
+    wchar_t b[64];
+    if (g_dataHits.empty()) {
+        g_dataBar.status = editText(g_dataBar.edit).empty() ? L"" : L"No results";
+        g_dataBar.noMatch = !g_dataBar.status.empty();
+    } else {
+        swprintf(b, 64, L"%d of %d", g_dataHit + 1, (int)g_dataHits.size());
+        g_dataBar.status = b;
+        g_dataBar.noMatch = false;
+        if (HTREEITEM it = revealNode(g_dataHits[(size_t)g_dataHit])) {
+            g.treeUpdating = true;
+            TreeView_SelectItem(g.sideTree, it);
+            TreeView_EnsureVisible(g.sideTree, it);
+            g.treeUpdating = false;
+            showNodeInEditor(g_dataHits[(size_t)g_dataHit]);
+        }
+    }
+    InvalidateRect(g_dataBar.wnd, nullptr, FALSE);
+    InvalidateRect(g_dataBar.edit, nullptr, TRUE);
+}
+
+// Every key, name and value of the whole document, opened or not (ignores case).
+void runDataSearch(bool keepPlace) {
+    std::wstring w = editText(g_dataBar.edit);
+    const std::string q = lowerAscii(toDocBytes(w.c_str(), (int)w.size()));
+    const int before = g_dataHit;
+    g_dataHits.clear();
+    g_dataHit = -1;
+    if (!q.empty()) {
+        for (size_t i = 0; i < g.data.nodes.size(); i++) {
+            const DataNode& n = g.data.nodes[i];
+            if (sideKind() == SIDE_XML && i == 0) continue;
+            const bool container = n.kind == DataNode::Object || n.kind == DataNode::Array;
+            if (lowerAscii(n.label).find(q) != std::string::npos || (!container && lowerAscii(n.value).find(q) != std::string::npos))
+                g_dataHits.push_back((int)i);
+        }
+        if (!g_dataHits.empty()) g_dataHit = keepPlace ? std::clamp(before, 0, (int)g_dataHits.size() - 1) : 0;
+    }
+    showDataHit();
+}
+
+void onDataBarAction(int id) {
+    if (id == BAR_ESC) {
+        SetWindowTextW(g_dataBar.edit, L"");
+        SetFocus(g.sideTree);
+        return;
+    }
+    if (g_dataHits.empty()) return;
+    const int n = (int)g_dataHits.size();
+    if (id == BAR_ENTER || id == BAR_NEXT) g_dataHit = (g_dataHit + 1) % n;
+    if (id == BAR_SHIFTENTER || id == BAR_PREV) g_dataHit = (g_dataHit + n - 1) % n;
+    showDataHit();
+}
+
+void setupDataBar() {
+    createBar(g_dataBar, g.frame, false);
+    g_dataBar.label1 = L"Search";
+    g_dataBar.buttons = {
+        {BAR_PREV, nullptr, GLYPH_UP, false, false, 0, {}, L"Previous (Shift+Enter)"},
+        {BAR_NEXT, nullptr, GLYPH_DOWN, false, false, 0, {}, L"Next (Enter)"},
+    };
+    g_dataBar.action = onDataBarAction;
+    g_dataBar.changed = []() { runDataSearch(false); };
 }
 
 // ---- Markdown preview
@@ -4216,6 +4747,7 @@ void updateSidePane() {
     const bool vis = sideVisible();
     const int kind = sideKind();
     ShowWindow(g.sideTree, vis && (kind == SIDE_JSON || kind == SIDE_XML) ? SW_SHOW : SW_HIDE);
+    if (g_dataBar.wnd) ShowWindow(g_dataBar.wnd, vis && (kind == SIDE_JSON || kind == SIDE_XML) ? SW_SHOW : SW_HIDE);
     ShowWindow(g.sidePreview, vis && kind == SIDE_MD ? SW_SHOW : SW_HIDE);
     if (!vis) return;
     if (kind == SIDE_MD) {
@@ -4312,6 +4844,7 @@ void applyTheme() {
     SendMessageW(g.view, WM_THEMECHANGED, 0, 0);
     themeMenuColors(g.menu, g.pal);
     themeSidePane();
+    themeBars();
     if (g.sidePreview) InvalidateRect(g.sidePreview, nullptr, FALSE);
     DrawMenuBar(g.frame);
     RedrawWindow(g.frame, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
@@ -4696,7 +5229,11 @@ void layoutFrame() {
     RECT rc;
     GetClientRect(g.frame, &rc);
     int h = std::max<int>(0, rc.bottom - g.statusH);
-    int top = tabBarH() + headerH();
+    const int headerTop = tabBarH() + headerH();
+    // The find bar sits right above the text, across the window.
+    const int fb = barHeight(g_findBar);
+    if (g_findBar.wnd && fb) MoveWindow(g_findBar.wnd, 0, headerTop, rc.right, fb, TRUE);
+    const int top = headerTop + fb;
     int left = 0;
     if (g.diffOn) {
         int sw = stripW();
@@ -4711,14 +5248,17 @@ void layoutFrame() {
         const int min = MulDiv(220, g.dpi, 96);
         int sw = std::clamp((int)rc.right * 42 / 100, std::min(min, (int)rc.right / 2), std::max(0, (int)rc.right - min));
         right = rc.right - sw;
-        MoveWindow(g.sideTree, right, top, sw, h - top, TRUE);
+        // The data view's search box on top of its tree.
+        const int sb = barRowH();
+        if (g_dataBar.wnd) MoveWindow(g_dataBar.wnd, right, top, sw, sb, TRUE);
+        MoveWindow(g.sideTree, right, top + sb, sw, std::max(0, h - top - sb), TRUE);
         MoveWindow(g.sidePreview, right, top, sw, h - top, TRUE);
     }
     g.sideShown = sideVisible();
     MoveWindow(g.view, left, top, right - left, h - top, TRUE);
     RECT s = {0, h, rc.right, rc.bottom};
     InvalidateRect(g.frame, &s, FALSE);
-    RECT hd = {0, 0, rc.right, top};
+    RECT hd = {0, 0, rc.right, headerTop};
     InvalidateRect(g.frame, &hd, FALSE);
 }
 
@@ -4985,6 +5525,77 @@ INT_PTR CALLBACK aboutProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
     return FALSE;
 }
 
+// Where the caret is drawn, in view coordinates (for the keyboard context menu).
+POINT caretPoint() {
+    POINT pt = {g.gutterPx, 0};
+    for (size_t i = 0; i < g.rows.size(); i++) {
+        if (!g.rowFill[i] && rowHas(g.d->doc, g.rows[i], g.d->caret)) {
+            int col = colOf(g.d->doc, g.rows[i], g.d->caret, cfg());
+            pt.x = std::max(g.gutterPx, g.gutterPx + (col - g.d->hcol) * g.cw);
+            pt.y = (int)(i + 1) * g.ch;
+            break;
+        }
+    }
+    return pt;
+}
+
+// The right-click menu: everything that applies to the selection or the caret.
+void showEditorMenu(POINT screen) {
+    const bool sel = hasSel(), ro = false;
+    (void)ro;
+    HMENU m = CreatePopupMenu();
+    auto item = [&](HMENU into, UINT id, const wchar_t* text, bool enabled = true) {
+        AppendMenuW(into, MF_STRING | (enabled ? 0 : MF_GRAYED), id, text);
+    };
+    auto sep = [&](HMENU into) { AppendMenuW(into, MF_SEPARATOR, 0, nullptr); };
+    item(m, IDM_UNDO, L"&Undo\tCtrl+Z", g.d->doc.canUndo());
+    item(m, IDM_REDO, L"&Redo\tCtrl+Y", g.d->doc.canRedo());
+    sep(m);
+    item(m, IDM_CUT, sel ? L"Cu&t\tCtrl+X" : L"Cu&t Line\tCtrl+X");
+    item(m, IDM_COPY, sel ? L"&Copy\tCtrl+C" : L"&Copy Line\tCtrl+C");
+    item(m, IDM_PASTE, L"&Paste\tCtrl+V", IsClipboardFormatAvailable(CF_UNICODETEXT) != 0);
+    item(m, IDM_DELETE, L"&Delete\tDel", sel);
+    sep(m);
+    item(m, IDM_SELECTALL, L"Select &All\tCtrl+A");
+    item(m, IDM_SELECTWORD, L"Select &Word");
+    sep(m);
+    // Selection: case, find more of it.
+    item(m, IDM_UPPER, L"Make U&ppercase\tCtrl+Shift+U", sel);
+    item(m, IDM_LOWER, L"Make &Lowercase\tCtrl+U", sel);
+    item(m, IDM_FINDWORD, sel ? L"Find &Next of Selection\tCtrl+F3" : L"Find &Next of Word\tCtrl+F3");
+    item(m, IDM_FINDWORD_PREV, sel ? L"Find Pre&vious of Selection\tCtrl+Shift+F3" : L"Find Pre&vious of Word\tCtrl+Shift+F3");
+    sep(m);
+    HMENU line = CreatePopupMenu();
+    item(line, IDM_LINE_DUP, sel ? L"D&uplicate Selection\tCtrl+D" : L"D&uplicate Line\tCtrl+D");
+    item(line, IDM_LINE_DELETE, L"&Delete Line\tCtrl+Shift+L");
+    sep(line);
+    item(line, IDM_LINE_UP, L"Move &Up\tAlt+Up");
+    item(line, IDM_LINE_DOWN, L"Move Dow&n\tAlt+Down");
+    sep(line);
+    item(line, IDM_OUTDENT, L"&Outdent\tShift+Tab");
+    item(line, IDM_LINE_ABOVE, L"Insert Line &Above\tCtrl+Enter");
+    item(line, IDM_LINE_BELOW, L"Insert Line &Below\tCtrl+Shift+Enter");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)line, sel ? L"&Lines" : L"&Line");
+    item(m, IDM_BRACKET, L"Go to Matching &Bracket\tCtrl+]");
+    // Version control and views, when they apply to this file.
+    const bool vcs = g.d->vcs.kind != VcsKind::None && !g.d->vcs.toolMissing;
+    if (vcs || sideKind() != SIDE_NONE) sep(m);
+    if (vcs) {
+        item(m, IDM_DIFF, g.diffOn ? L"Hide &Diff\tF8" : L"Show &Diff\tF8");
+        if (g.diffOn) item(m, IDM_REVERTCHANGE, L"Use Depot &Version of This Change\tCtrl+R", !g.d->hunks.empty());
+    }
+    if (sideKind() == SIDE_MD) item(m, IDM_SIDEVIEW, sideVisible() ? L"Hide Markdown &Preview\tCtrl+Shift+V" : L"Markdown &Preview\tCtrl+Shift+V");
+    else if (sideKind() != SIDE_NONE) item(m, IDM_SIDEVIEW, sideVisible() ? L"Hide Data &View\tCtrl+Shift+V" : L"Data &View\tCtrl+Shift+V");
+
+    themeOwnerDrawPopup(m);
+    themePopupColors(m, g.pal);
+    // Commands come back here; the frame draws the items (owner-drawn).
+    UINT cmd = (UINT)TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, screen.x, screen.y, g.frame, nullptr);
+    themeReleasePopup(m);
+    DestroyMenu(m);
+    if (cmd) onCommand((int)cmd);
+}
+
 void onCommand(int id) {
     if (id >= IDM_TAB1 && id < IDM_TAB1 + 9) {
         // Ctrl+1..8: that tab; Ctrl+9: the last one, as in browsers.
@@ -5230,6 +5841,9 @@ void onKeyDown(WPARAM vk) {
             afterEdit(g.d->caret);
         }
         break;
+    case VK_ESCAPE:
+        if (findBarOpen()) closeFindBar();
+        break;
     case VK_INSERT:
         if (ctrl) doCopy();
         else if (shift) doPaste();
@@ -5313,6 +5927,22 @@ LRESULT CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetCapture(hwnd);
         SetTimer(hwnd, kTimerDrag, 50, nullptr);
         moveCaret(p, (wp & MK_SHIFT) != 0);
+        return 0;
+    }
+    case WM_RBUTTONDOWN: {
+        // A right click outside the selection moves the caret there first.
+        SetFocus(hwnd);
+        u64 p = posFromPoint(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        if (!(hasSel() && p >= selMin() && p <= selMax())) moveCaret(p, false);
+        return 0;
+    }
+    case WM_CONTEXTMENU: {
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (pt.x == -1 && pt.y == -1) {  // Shift+F10 / menu key: at the caret
+            pt = caretPoint();
+            ClientToScreen(hwnd, &pt);
+        }
+        showEditorMenu(pt);
         return 0;
     }
     case WM_LBUTTONDBLCLK: {
@@ -5447,6 +6077,8 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                          TVS_SHOWSELALWAYS | TVS_EDITLABELS | TVS_INFOTIP,
                                      0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)1, g.inst, nullptr);
         TreeView_SetExtendedStyle(g.sideTree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
+        setupFindBar();
+        setupDataBar();
         g.sidePreview = CreateWindowExW(0, kPreviewClass, L"", WS_CHILD | WS_VSCROLL, 0, 0, 0, 0, hwnd, nullptr, g.inst, nullptr);
         return 0;
     case WM_ERASEBKGND: return 1;
@@ -5574,6 +6206,9 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         return 0;
     case WM_APP_VCS: onVcsResult((unsigned)wp, (VcsInfo*)lp); return 0;
+    case WM_COPYDATA:
+        onOpenFromOtherCopy((const COPYDATASTRUCT*)lp);
+        return TRUE;
     case WM_NOTIFY:
         if (((NMHDR*)lp)->hwndFrom == g.sideTree) return onTreeNotify((NMHDR*)lp);
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -5640,8 +6275,56 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
+// One window: a second copy started with files (double-clicking a file, "Open
+// with", the command line) hands them to the running window as tabs and quits.
+const ULONG_PTR kCopyDataOpen = 0x4A4E4F50;  // "JNOP"
+
+bool handToRunningCopy() {
+    // The mutex closes the gap between "is one running?" and its window appearing.
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Local\\JustNotepad.SingleWindow");
+    const bool another = mutex && GetLastError() == ERROR_ALREADY_EXISTS;
+    if (!another) return false;  // we are the first: keep the mutex for our lifetime
+    HWND w = nullptr;
+    for (int i = 0; i < 40 && !(w = FindWindowW(kFrameClass, nullptr)); i++) Sleep(50);
+    if (!w) return false;
+    // Full paths, so the other window does not depend on our working folder.
+    std::wstring list;
+    for (int i = 1; i < __argc; i++) {
+        if (!__wargv[i][0]) continue;
+        wchar_t full[32768];
+        DWORD n = GetFullPathNameW(__wargv[i], 32768, full, nullptr);
+        list += (n && n < 32768 ? full : __wargv[i]);
+        list += L'\n';
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    AllowSetForegroundWindow(pid);  // let it come to the front
+    COPYDATASTRUCT cd = {kCopyDataOpen, (DWORD)((list.size() + 1) * sizeof(wchar_t)), (void*)list.c_str()};
+    DWORD_PTR res = 0;
+    return SendMessageTimeoutW(w, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 5000, &res) != 0;
+}
+
+// The running window receives files from another copy.
+void onOpenFromOtherCopy(const COPYDATASTRUCT* cd) {
+    if (!cd || cd->dwData != kCopyDataOpen || !cd->lpData) return;
+    std::wstring list((const wchar_t*)cd->lpData, cd->cbData / sizeof(wchar_t));
+    size_t a = 0;
+    while (a < list.size()) {
+        size_t b = list.find(L'\n', a);
+        if (b == std::wstring::npos) b = list.size();
+        std::wstring f = list.substr(a, b - a);
+        while (!f.empty() && f.back() == L'\0') f.pop_back();
+        if (!f.empty()) openInTab(f);
+        a = b + 1;
+    }
+    if (IsIconic(g.frame)) ShowWindow(g.frame, SW_RESTORE);
+    SetForegroundWindow(g.frame);
+    SetFocus(g.view);
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g.inst = inst;
+    if (handToRunningCopy()) return 0;
     loadSettings();
     INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES | ICC_LINK_CLASS | ICC_TREEVIEW_CLASSES};
     InitCommonControlsEx(&icc);
@@ -5682,6 +6365,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     dcl.lpfnWndProc = previewProc;
     dcl.lpszClassName = kPreviewClass;
     RegisterClassExW(&dcl);
+    dcl.lpfnWndProc = barProc;
+    dcl.lpszClassName = kBarClass;
+    dcl.style = CS_DBLCLKS;
+    RegisterClassExW(&dcl);
 
     g.menu = buildMenu();
     themeOwnerDrawMenu(g.menu);
@@ -5719,14 +6406,23 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        // While a tree value is being edited its text box gets every key
-        // (Ctrl+V, Ctrl+Z ... must not reach the editor behind it).
-        if (g.sideTree && GetParent(msg.hwnd) == g.sideTree) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-            continue;
+        // Text boxes (find bar, data search, a tree value being edited) get
+        // their own keys: Ctrl+V, Ctrl+Z, Ctrl+A ... must not reach the editor.
+        // Only find-related shortcuts still work from them.
+        if (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN || msg.message == WM_CHAR) {
+            wchar_t cls[8] = L"";
+            HWND f = GetFocus();
+            if (f && GetClassNameW(f, cls, 8) && lstrcmpiW(cls, L"Edit") == 0) {
+                const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+                const bool findKey = msg.message == WM_KEYDOWN &&
+                                     (msg.wParam == VK_F3 || (ctrl && (msg.wParam == 'F' || msg.wParam == 'H')));
+                if (!(findKey && TranslateAcceleratorW(g.frame, g.accel, &msg))) {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                continue;
+            }
         }
-        if (g.findDlg && IsDialogMessageW(g.findDlg, &msg)) continue;
         if (TranslateAcceleratorW(g.frame, g.accel, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
