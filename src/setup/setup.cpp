@@ -19,6 +19,7 @@
 #include <objbase.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <shellapi.h>
 
 #include <string>
 
@@ -208,7 +209,7 @@ INT_PTR CALLBACK setupProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
         HICON icon = nullptr;
         LoadIconWithScaleDown(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP), sz, sz, &icon);
         if (icon) {
-            SendDlgItemMessageW(dlg, IDC_ICON, STM_SETICON, (WPARAM)icon, 0);
+            SendDlgItemMessageW(dlg, IDC_SETUP_ICON, STM_SETICON, (WPARAM)icon, 0);
             SendMessageW(dlg, WM_SETICON, ICON_BIG, (LPARAM)icon);
         }
         SetDlgItemTextW(dlg, IDC_PATH, installDir().c_str());

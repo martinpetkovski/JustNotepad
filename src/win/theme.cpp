@@ -578,7 +578,7 @@ void themeDrawMenuItem(DRAWITEMSTRUCT* di, HFONT font, const Palette& p) {
             using namespace Gdiplus;
             Graphics gr(dc);
             gr.SetSmoothingMode(SmoothingModeAntiAlias);
-            const float cx = (cr.left + cr.right) / 2.0f, cy = (cr.top + cr.bottom) / 2.0f, s = MulDiv(4, dpi, 96);
+            const float cx = (cr.left + cr.right) / 2.0f, cy = (cr.top + cr.bottom) / 2.0f, s = (float)MulDiv(4, dpi, 96);
             if (it->radio) {
                 SolidBrush b(gp(fg));
                 gr.FillRectangle(&b, cx - s * 0.6f, cy - s * 0.6f, s * 1.2f, s * 1.2f);  // square dot
@@ -607,7 +607,7 @@ void themeDrawMenuItem(DRAWITEMSTRUCT* di, HFONT font, const Palette& p) {
         using namespace Gdiplus;
         Graphics gr(dc);
         gr.SetSmoothingMode(SmoothingModeAntiAlias);
-        const float cx = r.right - padR / 2.0f, cy = (r.top + r.bottom) / 2.0f, s = MulDiv(3, dpi, 96);
+        const float cx = (float)r.right - padR / 2.0f, cy = (r.top + r.bottom) / 2.0f, s = (float)MulDiv(3, dpi, 96);
         SolidBrush b(gp(fg));
         PointF pts[3] = {{cx - s * 0.6f, cy - s * 1.2f}, {cx - s * 0.6f, cy + s * 1.2f}, {cx + s * 0.8f, cy}};
         gr.FillPolygon(&b, pts, 3);

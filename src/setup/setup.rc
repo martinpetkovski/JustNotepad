@@ -16,7 +16,7 @@ STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMEN
 CAPTION "JustNotepad Setup"
 FONT 9, "Segoe UI"
 BEGIN
-    ICON            IDI_APP, IDC_ICON, 14, 14, 21, 20
+    ICON            IDI_APP, IDC_SETUP_ICON, 14, 14, 21, 20
     LTEXT           "Install JustNotepad", IDC_TITLE, 45, 11, 215, 16
     LTEXT           "", IDC_INFO, 45, 31, 215, 20
     EDITTEXT        IDC_PATH, 45, 53, 215, 13, ES_AUTOHSCROLL | ES_READONLY
