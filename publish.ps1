@@ -139,6 +139,23 @@ try {
     if (Test-Path $ZipFile) { Remove-Item -Force $ZipFile }
     Compress-Archive -LiteralPath $ExePath -DestinationPath $ZipFile
     Write-Host "Created $ZipFile" -ForegroundColor Green
+    # SHA-256 of the zip, published with it. The in-app updater and install.ps1
+    # refuse a download whose hash does not match this file.
+    $HashFile = "$ZipFile.sha256"
+    $Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ZipFile).Hash.ToLowerInvariant()
+    [IO.File]::WriteAllText($HashFile, "$Hash  $(Split-Path $ZipFile -Leaf)`n", (New-Object Text.UTF8Encoding($false)))
+    Write-Host "SHA-256: $Hash"
+
+    # The installer, under a fixed name so the website can always link to
+    # releases/latest/download/JustNotepad-Setup.exe.
+    $SetupBuilt = Join-Path $Root 'build\JustNotepad-Setup.exe'
+    if (-not (Test-Path $SetupBuilt)) { throw "Installer not found: $SetupBuilt" }
+    $SetupFile = Join-Path $ReleasesRoot 'JustNotepad-Setup.exe'
+    Copy-Item -Force $SetupBuilt $SetupFile
+    $SetupHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $SetupFile).Hash.ToLowerInvariant()
+    $SetupHashFile = "$SetupFile.sha256"
+    [IO.File]::WriteAllText($SetupHashFile, "$SetupHash  JustNotepad-Setup.exe`n", (New-Object Text.UTF8Encoding($false)))
+    Write-Host "Installer: $SetupFile  SHA-256: $SetupHash"
 
     if ($DryRun) {
         git checkout --quiet -- 'src/win/version.h'
@@ -169,7 +186,7 @@ try {
 
     if ($haveGh) {
         Write-Host "Creating the GitHub release and uploading the archive..."
-        gh release create $TagName $ZipFile --title "Release $Version" --generate-notes
+        gh release create $TagName $ZipFile $HashFile $SetupFile $SetupHashFile --title "Release $Version" --generate-notes
         if ($LASTEXITCODE -ne 0) { throw "gh release create failed. The tag is pushed; create the release by hand and attach $ZipFile." }
         Write-Host "Release $Version published." -ForegroundColor Green
     } else {

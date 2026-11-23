@@ -62,4 +62,15 @@ $exe = Join-Path $out 'JustNotepad.exe'
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
 Write-Host "Built $exe ($([math]::Round((Get-Item $exe).Length / 1KB)) KB)"
+
+# The installer: one exe that carries JustNotepad.exe inside it (see src\setup).
+New-Item -ItemType Directory -Force (Join-Path $out 'setupobj') | Out-Null
+$setupRes = Join-Path $out 'setup.res'
+& rc /nologo /i (Join-Path $root 'docs') /i $out /i (Join-Path $root 'src\win') /fo $setupRes (Join-Path $root 'src\setup\setup.rc')
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
+$setupExe = Join-Path $out 'JustNotepad-Setup.exe'
+& cl @common @opt "/Fo:$objDir/setupobj/" "/Fd:$objDir/setupobj/" "/Fe:$setupExe" (Join-Path $root 'src\setup\setup.cpp') (Join-Path $root 'src\win\theme.cpp') $setupRes `
+    /link @link /SUBSYSTEM:WINDOWS /MANIFEST:NO user32.lib gdi32.lib shell32.lib ole32.lib advapi32.lib comctl32.lib uxtheme.lib dwmapi.lib gdiplus.lib
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
+Write-Host "Built $setupExe ($([math]::Round((Get-Item $setupExe).Length / 1KB)) KB)"
 if ($Run) { & $exe }

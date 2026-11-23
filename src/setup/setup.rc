@@ -1,0 +1,52 @@
+// JustNotepad installer resources. build.ps1 passes /i docs /i build so the
+// icon and the freshly built JustNotepad.exe are found by name.
+#include <windows.h>
+#include <winver.h>
+#include "resource.h"
+#include "../win/version.h"
+
+IDI_APP ICON "icon.ico"
+1 24 "app.manifest"
+
+// The program being installed, carried inside the installer.
+IDR_APPEXE RCDATA "JustNotepad.exe"
+
+IDD_SETUP DIALOGEX 0, 0, 270, 136
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "JustNotepad Setup"
+FONT 9, "Segoe UI"
+BEGIN
+    ICON            IDI_APP, IDC_ICON, 14, 14, 21, 20
+    LTEXT           "Install JustNotepad", IDC_TITLE, 45, 11, 215, 16
+    LTEXT           "", IDC_INFO, 45, 31, 215, 20
+    EDITTEXT        IDC_PATH, 45, 53, 215, 13, ES_AUTOHSCROLL | ES_READONLY
+    AUTOCHECKBOX    "Create a &desktop shortcut", IDC_DESKTOP, 45, 74, 215, 11
+    AUTOCHECKBOX    "&Start JustNotepad when done", IDC_RUN, 45, 88, 215, 11
+    DEFPUSHBUTTON   "&Install", IDOK, 156, 114, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 212, 114, 50, 15
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION APP_VERSION_MAJOR,APP_VERSION_MINOR,APP_VERSION_PATCH,APP_VERSION_BUILD
+PRODUCTVERSION APP_VERSION_MAJOR,APP_VERSION_MINOR,APP_VERSION_PATCH,APP_VERSION_BUILD
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Martin Petkovski"
+            VALUE "FileDescription", "JustNotepad Setup"
+            VALUE "ProductName", "JustNotepad"
+            VALUE "FileVersion", APP_VERSION_STRING
+            VALUE "ProductVersion", APP_VERSION_STRING
+            VALUE "OriginalFilename", "JustNotepad-Setup.exe"
+            VALUE "LegalCopyright", "Copyright (C) 2025-2026 Martin Petkovski"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

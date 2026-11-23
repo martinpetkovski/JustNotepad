@@ -20,7 +20,15 @@ Yeah, I got genuinely tired of ::certain companies:: shoving LLM "AI" into the m
 
 Just Notepad is just a notepad. Version 2 is a rewrite from scratch: one small exe, no installer, no plugins. It starts instantly and stays instant at any file size, 1 KB or 10 GB. Won't freeze, won't do anything other than what you ask it to do, it's just a notepad and always will be. (Okay, it also does diffs now. You'll like it.)
 
-[Download Latest Release](https://github.com/martinpetkovski/JustNotepad/releases/latest)
+## Download
+
+[Download the installer](https://github.com/martinpetkovski/JustNotepad/releases/latest/download/JustNotepad-Setup.exe)
+
+Installs for you only, no admin rights needed. You get a Start menu entry, an optional desktop shortcut, and an entry in Settings > Apps to remove it like any other app. Running it again updates JustNotepad; the app also updates itself (Help > Check for Updates).
+
+JustNotepad is not code-signed, so the first time Windows says "Windows protected your PC": click **More info**, then **Run anyway**. That is Windows being careful with any unsigned download, not something wrong with the file. Every download has a \`.sha256\` checksum next to it on the [releases page](https://github.com/martinpetkovski/JustNotepad/releases/latest) if you want to verify it.
+
+Prefer no installer? [Download the zip](https://github.com/martinpetkovski/JustNotepad/releases/latest) and run \`JustNotepad.exe\` from anywhere.
 
 ## Just Notepad vs Windows Notepad
 
@@ -64,7 +72,7 @@ Nothing to set up. JustNotepad finds \`git.exe\` and \`p4.exe\` on its own (PATH
 Requires Visual Studio 2022 (or the standalone Build Tools) with the C++ workload. No CMake, nothing else.
 
 \`\`\`powershell
-.\build.ps1          # release build -> build\JustNotepad.exe
+.\build.ps1          # release build -> build\JustNotepad.exe and build\JustNotepad-Setup.exe
 .\build.ps1 -Run     # build and start
 .\build.ps1 -Test    # build and run the core tests + benchmark
 \`\`\`
@@ -84,6 +92,7 @@ Versions are \`<major>.<yyMMdd>.<n>\`, where n counts releases on the same day. 
 |---|---|
 | \`src/core/\` | Portable core, no OS headers: piece tree, line index, layout, diff, syntax highlighting, UTF helpers |
 | \`src/win/\` | Win32 front end: window, painting, input, tabs, session, theme, dialogs, version control, updater |
+| \`src/setup/\` | The installer / uninstaller (carries \`JustNotepad.exe\` inside it) |
 | \`tests/\` | Differential tests and benchmark for the core |
 | \`docs/\` | The website (generated from this README) and the icon |
 

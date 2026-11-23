@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <shellapi.h>
+#include <bcrypt.h>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -21,6 +22,7 @@
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -263,6 +265,49 @@ static bool HttpGet(const std::wstring& url, std::wstring* pBody,
 }
 
 // ---------------------------------------------------------------------------
+// Integrity: SHA-256 of the downloaded file must match the published one.
+// ---------------------------------------------------------------------------
+static bool Sha256File(const std::wstring& path, std::wstring& hexOut)
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE h = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return false;
+    bool ok = BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0) == 0;
+    HANDLE f = ok ? CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr)
+                  : INVALID_HANDLE_VALUE;
+    ok = ok && f != INVALID_HANDLE_VALUE;
+    std::vector<unsigned char> buf(1 << 16);
+    while (ok) {
+        DWORD got = 0;
+        if (!ReadFile(f, buf.data(), (DWORD)buf.size(), &got, nullptr)) { ok = false; break; }
+        if (got == 0) break;
+        ok = BCryptHashData(h, buf.data(), got, 0) == 0;
+    }
+    unsigned char digest[32] = {};
+    ok = ok && BCryptFinishHash(h, digest, sizeof(digest), 0) == 0;
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    if (h) BCryptDestroyHash(h);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    if (!ok) return false;
+    static const wchar_t* hex = L"0123456789abcdef";
+    hexOut.clear();
+    for (unsigned char b : digest) { hexOut += hex[b >> 4]; hexOut += hex[b & 15]; }
+    return true;
+}
+
+// The first 64 hex digits of a ".sha256" file ("<hash>  <name>"), lower case.
+static std::wstring ParseSha256(const std::wstring& text)
+{
+    std::wstring out;
+    for (wchar_t c : text) {
+        if (iswxdigit(c)) out += (wchar_t)towlower(c);
+        else if (!out.empty()) break;
+        if (out.size() == 64) break;
+    }
+    return out.size() == 64 ? out : std::wstring();
+}
+
+// ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
 static std::wstring GetUpdateTempDir()
@@ -333,6 +378,24 @@ static void UpdateWorker(HWND hMain, bool bSilent)
         }
     }
 
+    // The published SHA-256 of that zip (a ".sha256" asset of the same release).
+    std::wstring shaUrl;
+    pos = 0;
+    if (!zipUrl.empty())
+    for (;;)
+    {
+        std::wstring candidate;
+        size_t end = 0;
+        if (!JsonFindString(json, L"browser_download_url", candidate, pos, &end)) break;
+        pos = end;
+        // The zip's own checksum: "<zip url>.sha256" (a release also has the installer's).
+        if (_wcsicmp(candidate.c_str(), (zipUrl + L".sha256").c_str()) == 0)
+        {
+            shaUrl = candidate;
+            break;
+        }
+    }
+
     if (zipUrl.empty())
     {
         Finish(hMain, UPDATE_FAILED,
@@ -348,6 +411,21 @@ static void UpdateWorker(HWND hMain, bool bSilent)
     if (!HttpGet(zipUrl, nullptr, &zipPath, hMain))
     {
         Finish(hMain, UPDATE_FAILED, L"Downloading the update failed. Please try again later.");
+        g_busy = false;
+        return;
+    }
+
+    // Never install something that does not match what was published.
+    std::wstring shaText, expected, actual;
+    if (shaUrl.empty() || !HttpGet(shaUrl, &shaText, nullptr, nullptr) ||
+        (expected = ParseSha256(shaText)).empty() || !Sha256File(zipPath, actual) || actual != expected)
+    {
+        DeleteFileW(zipPath.c_str());
+        Finish(hMain, UPDATE_FAILED,
+               shaUrl.empty() ? L"Version " + tag + L" has no published checksum, so it was not installed.\r\n"
+                                L"Please download it manually from GitHub."
+                              : L"The downloaded update did not match its published checksum and was deleted.\r\n"
+                                L"Nothing was changed. Please try again later.");
         g_busy = false;
         return;
     }
