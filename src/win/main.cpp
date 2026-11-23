@@ -259,6 +259,7 @@ unsigned g_gen = 0;  // source of unique ids for background work replies
 
 INT_PTR dialogTheme(HWND dlg, UINT msg, WPARAM wp, LPARAM lp);
 void scrollRows(int n);
+void onOpenFromOtherCopy(const COPYDATASTRUCT* cd);
 bool findBarOpen();
 void updateFindStatus(u64 hit);
 void paintRowMatches(HDC dc, const Row& r, int y, const LayoutCfg& c);
