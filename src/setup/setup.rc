@@ -19,7 +19,8 @@ BEGIN
     ICON            IDI_APP, IDC_SETUP_ICON, 14, 14, 21, 20
     LTEXT           "Install JustNotepad", IDC_TITLE, 45, 11, 215, 16
     LTEXT           "", IDC_INFO, 45, 31, 215, 20
-    EDITTEXT        IDC_PATH, 45, 53, 215, 13, ES_AUTOHSCROLL | ES_READONLY
+    EDITTEXT        IDC_PATH, 45, 53, 160, 13, ES_AUTOHSCROLL | WS_TABSTOP
+    PUSHBUTTON      "&Browse...", IDC_BROWSE, 210, 52, 50, 15
     AUTOCHECKBOX    "Create a &desktop shortcut", IDC_DESKTOP, 45, 74, 215, 11
     AUTOCHECKBOX    "&Start JustNotepad when done", IDC_RUN, 45, 88, 215, 11
     DEFPUSHBUTTON   "&Install", IDOK, 156, 114, 50, 15

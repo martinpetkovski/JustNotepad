@@ -8,3 +8,4 @@
 #define IDC_DESKTOP 104
 #define IDC_RUN 105
 #define IDC_SETUP_ICON 106
+#define IDC_BROWSE 107

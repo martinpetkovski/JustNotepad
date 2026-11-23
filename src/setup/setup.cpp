@@ -48,7 +48,60 @@ std::wstring knownFolder(REFKNOWNFOLDERID id) {
     return s;
 }
 
-std::wstring installDir() { return knownFolder(FOLDERID_LocalAppData) + L"\\Programs\\JustNotepad"; }
+std::wstring defaultDir() { return knownFolder(FOLDERID_LocalAppData) + L"\\Programs\\JustNotepad"; }
+
+// Where JustNotepad is (or goes): the folder chosen in the dialog, else where
+// it was installed before (recorded in the Settings > Apps entry), else the default.
+std::wstring g_chosenDir;
+std::wstring installDir() {
+    if (!g_chosenDir.empty()) return g_chosenDir;
+    wchar_t buf[MAX_PATH] = L"";
+    DWORD size = sizeof(buf);
+    if (RegGetValueW(HKEY_CURRENT_USER, kUninstallKey, L"InstallLocation", RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS &&
+        buf[0])
+        return buf;
+    return defaultDir();
+}
+
+// True if files can be created in `dir` (creating it if needed) without admin rights.
+bool canWriteTo(const std::wstring& dir) {
+    int r = SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+    if (r != ERROR_SUCCESS && r != ERROR_ALREADY_EXISTS && r != ERROR_FILE_EXISTS) return false;
+    std::wstring probe = dir + L"\\.justnotepad-write-test";
+    HANDLE h = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+}
+
+// Folder picker; the result gets "\JustNotepad" added unless it already ends with it.
+bool browseForFolder(HWND owner, std::wstring& io) {
+    IFileOpenDialog* fd = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fd)))) return false;
+    DWORD opts = 0;
+    fd->GetOptions(&opts);
+    fd->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    fd->SetTitle(L"Choose where to install JustNotepad");
+    bool ok = false;
+    if (SUCCEEDED(fd->Show(owner))) {
+        IShellItem* item = nullptr;
+        PWSTR path = nullptr;
+        if (SUCCEEDED(fd->GetResult(&item)) && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+            std::wstring p = path;
+            while (!p.empty() && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+            size_t slash = p.find_last_of(L"\\/");
+            std::wstring last = slash == std::wstring::npos ? p : p.substr(slash + 1);
+            if (_wcsicmp(last.c_str(), L"JustNotepad") != 0) p += L"\\JustNotepad";
+            io = p;
+            ok = true;
+        }
+        CoTaskMemFree(path);
+        if (item) item->Release();
+    }
+    fd->Release();
+    return ok;
+}
 std::wstring startMenuLink() { return knownFolder(FOLDERID_Programs) + L"\\JustNotepad.lnk"; }
 std::wstring desktopLink() { return knownFolder(FOLDERID_Desktop) + L"\\JustNotepad.lnk"; }
 
@@ -122,8 +175,21 @@ bool writeFileReplacing(const std::wstring& path, const void* data, DWORD n, DWO
 }
 
 bool install(HWND owner, bool desktop) {
-    if (!closeRunningApp(owner)) return false;
     const std::wstring dir = installDir(), exe = dir + L"\\JustNotepad.exe", unexe = dir + L"\\uninstall.exe";
+    if (dir.size() < 3 || dir[1] != L':' || (dir[2] != L'\\' && dir[2] != L'/')) {
+        if (!(dir.size() > 2 && dir[0] == L'\\' && dir[1] == L'\\')) {  // not C:\... nor \\server\...
+            MessageBoxW(owner, L"Please enter a full folder path, such as C:\\Tools\\JustNotepad.", kTitle, MB_OK | MB_ICONINFORMATION);
+            return false;
+        }
+    }
+    if (!canWriteTo(dir)) {
+        std::wstring m = L"You can't write to\n\n" + dir +
+                         L"\n\nwithout administrator rights. JustNotepad installs for you only, and it updates itself, "
+                         L"so it needs a folder you can write to (Program Files is not one). Please choose another folder.";
+        MessageBoxW(owner, m.c_str(), kTitle, MB_OK | MB_ICONINFORMATION);
+        return false;
+    }
+    if (!closeRunningApp(owner)) return false;
     int r = SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
     if (r != ERROR_SUCCESS && r != ERROR_ALREADY_EXISTS && r != ERROR_FILE_EXISTS) {
         fail(owner, L"Could not create " + dir, (DWORD)r);
@@ -219,10 +285,12 @@ INT_PTR CALLBACK setupProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
             SetDlgItemTextW(dlg, IDC_INFO, L"JustNotepad will be removed from this folder, the Start menu and the desktop. "
                                            L"Your settings are kept.");
             ShowWindow(GetDlgItem(dlg, IDC_DESKTOP), SW_HIDE);
+            ShowWindow(GetDlgItem(dlg, IDC_BROWSE), SW_HIDE);
+            SendDlgItemMessageW(dlg, IDC_PATH, EM_SETREADONLY, TRUE, 0);
             ShowWindow(GetDlgItem(dlg, IDC_RUN), SW_HIDE);
             SetDlgItemTextW(dlg, IDOK, L"&Uninstall");
         } else {
-            std::wstring info = L"JustNotepad " SW(APP_VERSION_STRING) L" will be installed for you (no admin rights needed) in:";
+            std::wstring info = L"JustNotepad " SW(APP_VERSION_STRING) L" will be installed for you (no admin rights needed) in this folder:";
             SetDlgItemTextW(dlg, IDC_INFO, info.c_str());
             const bool upgrading = GetFileAttributesW((installDir() + L"\\JustNotepad.exe").c_str()) != INVALID_FILE_ATTRIBUTES;
             if (upgrading) SetDlgItemTextW(dlg, IDOK, L"&Update");
@@ -236,7 +304,20 @@ INT_PTR CALLBACK setupProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
         if (themeDrawDialogButton((DRAWITEMSTRUCT*)lp, g_pal)) return TRUE;
         break;
     case WM_COMMAND:
+        if (LOWORD(wp) == IDC_BROWSE) {
+            std::wstring p = installDir();
+            if (browseForFolder(dlg, p)) SetDlgItemTextW(dlg, IDC_PATH, p.c_str());
+            return TRUE;
+        }
         if (LOWORD(wp) == IDOK) {
+            if (!g_uninstall) {
+                wchar_t buf[MAX_PATH] = L"";
+                GetDlgItemTextW(dlg, IDC_PATH, buf, MAX_PATH);
+                std::wstring p = buf;
+                while (!p.empty() && (p.back() == L' ' || p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+                while (!p.empty() && p.front() == L' ') p.erase(p.begin());
+                g_chosenDir = p;
+            }
             HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
             bool ok;
             if (g_uninstall) {
