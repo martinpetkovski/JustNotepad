@@ -26,6 +26,7 @@
 #include <wchar.h>
 
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <ctype.h>
 #include <memory>
@@ -34,7 +35,9 @@
 #include <vector>
 
 #include "../core/diff.h"
+#include "../core/datatree.h"
 #include "../core/highlight.h"
+#include "../core/markdown.h"
 #include "../core/doc.h"
 #include "../core/layout.h"
 #include "../core/lineindex.h"
@@ -54,6 +57,7 @@ const wchar_t* const kFrameClass = L"JustNotepadFrame";
 const wchar_t* const kViewClass = L"JustNotepadView";
 const wchar_t* const kDiffClass = L"JustNotepadDiff";
 const wchar_t* const kStripClass = L"JustNotepadDiffStrip";
+const wchar_t* const kPreviewClass = L"JustNotepadPreview";
 
 #define JN_WIDEN2(x) L##x
 #define JN_WIDEN(x) JN_WIDEN2(x)
@@ -73,7 +77,7 @@ const u64 kDiffInstant = 256u << 10;
 
 const UINT WM_APP_INDEX = WM_APP + 1, WM_APP_VCS = WM_APP + 2, WM_APP_P4ASK = WM_APP + 3,
            WM_APP_P4EDITED = WM_APP + 4;
-const UINT_PTR kTimerBlink = 1, kTimerIndex = 2, kTimerDrag = 3, kTimerDiff = 4, kTimerSession = 5;
+const UINT_PTR kTimerBlink = 1, kTimerIndex = 2, kTimerDrag = 3, kTimerDiff = 4, kTimerSession = 5, kTimerSide = 6;
 
 const COLORREF kAdded = RGB(40, 160, 70), kChanged = RGB(40, 110, 220), kRemoved = RGB(210, 60, 60);
 // The two sides of the diff, as in P4Merge: the depot / committed version on
@@ -223,6 +227,18 @@ struct App {
     Palette pal = makePalette(false);
     int themeMode = 0;               // 0 system, 1 light, 2 dark
     bool highlight = true;           // View > Syntax Highlighting
+
+    // side pane (data view / Markdown preview)
+    bool sideOn = false;
+    HWND sideTree = nullptr, sidePreview = nullptr;
+    DataTree data;                   // what the tree shows
+    std::vector<bool> dataFilled;    // nodes whose children are in the tree
+    const DocState* dataDoc = nullptr;
+    u64 dataVersion = NPOS;
+    bool treeUpdating = false;
+    int mdScroll = 0;
+    u64 mdSyncedTop = NPOS;
+    bool sideShown = false;          // what layoutFrame last laid out
     struct IconHit { RECT rc; int hunk, choice; };
     std::vector<IconHit> icons;      // choice buttons as last painted in the strip
     int hoverHunk = -1, hoverChoice = -1;
@@ -243,6 +259,11 @@ unsigned g_gen = 0;  // source of unique ids for background work replies
 
 INT_PTR dialogTheme(HWND dlg, UINT msg, WPARAM wp, LPARAM lp);
 void scrollRows(int n);
+void layoutFrame();
+bool sideVisible();
+void updateSidePane();
+void syncPreviewToEditor();
+void themeSidePane();
 void addTab();
 bool isPristine(const DocState* d);
 void paintTabs(HDC dc);
@@ -699,6 +720,16 @@ DocState* tabByVcsGen(unsigned gen);
 
 void refresh(bool followCaret) {
     if (!g.view) return;
+    if (g.sideTree) {
+        const bool want = sideVisible();
+        if (want != g.sideShown) {
+            g.sideShown = want;
+            layoutFrame();
+            updateSidePane();
+        } else if (want && g.dataDoc == g.d && g.dataVersion != g.d->doc.version()) {
+            SetTimer(g.frame, kTimerSide, 400, nullptr);  // the tree follows once typing pauses
+        }
+    }
     if (g.d->vcs.haveBase && g.d->diffDocVersion != g.d->doc.version()) {
         if (g.d->doc.size() <= kDiffInstant) recomputeDiff();
         else SetTimer(g.frame, kTimerDiff, 150, nullptr);
@@ -721,6 +752,10 @@ void refresh(bool followCaret) {
         UpdateWindow(g.strip);
     }
     updateStatus();
+    if (g.sideShown && g.sidePreview && IsWindowVisible(g.sidePreview)) {
+        InvalidateRect(g.sidePreview, nullptr, FALSE);  // laid out again if the text changed
+        syncPreviewToEditor();
+    }
 }
 
 void scrollRows(int n) {
@@ -2117,6 +2152,7 @@ void toggleDiff() {
     ShowWindow(g.diffPane, g.diffOn ? SW_SHOW : SW_HIDE);
     ShowWindow(g.strip, g.diffOn ? SW_SHOW : SW_HIDE);
     layoutFrame();
+    updateSidePane();
     if (!g.diffOn && g.wrapBeforeDiff) setWrap(true);
     refresh(true);
 }
@@ -3168,6 +3204,7 @@ void loadSettings() {
     g.lineNumbers = GetPrivateProfileIntW(L"view", L"lineNumbers", 1, f) != 0;
     g.themeMode = (int)GetPrivateProfileIntW(L"view", L"theme", 0, f);
     g.highlight = GetPrivateProfileIntW(L"view", L"highlight", 1, f) != 0;
+    g.sideOn = GetPrivateProfileIntW(L"view", L"sidePane", 0, f) != 0;
     if (g.themeMode < 0 || g.themeMode > 2) g.themeMode = 0;
     int w = (int)GetPrivateProfileIntW(L"window", L"w", 0, f);
     int h = (int)GetPrivateProfileIntW(L"window", L"h", 0, f);
@@ -3212,6 +3249,7 @@ void saveSettings() {
     putInt(L"view", L"lineNumbers", g.lineNumbers ? 1 : 0, f);
     putInt(L"view", L"theme", g.themeMode, f);
     putInt(L"view", L"highlight", g.highlight ? 1 : 0, f);
+    putInt(L"view", L"sidePane", g.sideOn ? 1 : 0, f);
     WINDOWPLACEMENT wp = {};
     wp.length = sizeof(wp);
     if (GetWindowPlacement(g.frame, &wp)) {
@@ -3439,6 +3477,826 @@ void gotoBracket(bool select) {
     refresh(true);
 }
 
+// ====================================================================== side pane: data view and Markdown preview
+//
+// One pane to the right of the editor (View > Data View / Preview,
+// Ctrl+Shift+V). JSON and XML show as a tree of their structure: clicking a
+// node selects it in the editor, F2 or a double click edits a value in place.
+// Markdown shows rendered, following the editor as you scroll and type.
+
+enum SideKind { SIDE_NONE, SIDE_JSON, SIDE_XML, SIDE_MD };
+
+const u64 kSideMax = 64ull << 20;  // larger files: no tree / preview
+
+int sideKind() {
+    if (!g.d || !g.d->lang) return SIDE_NONE;
+    const char* n = langName(g.d->lang);
+    if (strcmp(n, "JSON") == 0) return SIDE_JSON;
+    if (strcmp(n, "XML") == 0) return SIDE_XML;
+    if (strcmp(n, "Markdown") == 0) return SIDE_MD;
+    return SIDE_NONE;
+}
+
+bool sideVisible() { return g.sideOn && !g.diffOn && sideKind() != SIDE_NONE; }
+
+std::wstring docWide(const std::string& bytes) { return fromDocBytes(bytes); }
+
+// ---- data view (tree)
+
+std::wstring nodePath(int id) {
+    std::wstring p;
+    while (id >= 0 && id < (int)g.data.nodes.size()) {
+        p = fromDocBytes(g.data.nodes[(size_t)id].label) + L"/" + p;
+        id = g.data.nodes[(size_t)id].parent;
+    }
+    return p;
+}
+
+std::wstring nodeLabel(const DataNode& n) {
+    auto cut = [](std::wstring s) {
+        for (wchar_t& c : s)
+            if (c == L'\n' || c == L'\r' || c == L'\t') c = L' ';
+        if (s.size() > 200) s = s.substr(0, 200) + L"\x2026";
+        return s;
+    };
+    const std::wstring label = fromDocBytes(n.label), value = cut(fromDocBytes(n.value));
+    switch (n.kind) {
+    case DataNode::Object:
+    case DataNode::Array: return label + L"  " + value;
+    case DataNode::String: return label + L": \"" + value + L"\"";
+    case DataNode::Element: return L"<" + label + L">" + (value.empty() ? L"" : L"  " + value);
+    case DataNode::Attribute: return label + L" = \"" + value + L"\"";
+    case DataNode::Text: return value;
+    case DataNode::Comment: return L"<!--" + value + L"-->";
+    default: return label + L": " + value;
+    }
+}
+
+bool nodeEditable(const DataNode& n) {
+    switch (n.kind) {
+    case DataNode::String:
+    case DataNode::Number:
+    case DataNode::Bool:
+    case DataNode::Null:
+    case DataNode::Attribute:
+    case DataNode::Text:
+    case DataNode::Comment: return n.vend > n.vstart || n.kind == DataNode::Attribute || n.kind == DataNode::String;
+    case DataNode::Element: return n.vend > n.vstart;  // an element holding only text
+    default: return false;
+    }
+}
+
+HTREEITEM insertNode(HTREEITEM parent, int id) {
+    const DataNode& n = g.data.nodes[(size_t)id];
+    std::wstring text = nodeLabel(n);
+    TVINSERTSTRUCTW is = {};
+    is.hParent = parent;
+    is.hInsertAfter = TVI_LAST;
+    is.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
+    is.item.pszText = (LPWSTR)text.c_str();
+    is.item.lParam = id;
+    // Children are added only when the node is first expanded (huge files stay quick).
+    is.item.cChildren = n.kids.empty() ? 0 : 1;
+    return (HTREEITEM)SendMessageW(g.sideTree, TVM_INSERTITEMW, 0, (LPARAM)&is);
+}
+
+void fillKids(HTREEITEM item, int id) {
+    if (id < 0 || (size_t)id >= g.dataFilled.size() || g.dataFilled[(size_t)id]) return;
+    g.dataFilled[(size_t)id] = true;
+    for (int k : g.data.nodes[(size_t)id].kids) insertNode(item, k);
+}
+
+// Re-reads the document into the tree, keeping what was expanded and selected.
+void rebuildDataView() {
+    if (!g.sideTree) return;
+    // Remember the open branches and the selection by path.
+    std::vector<std::wstring> open;
+    std::wstring selPath;
+    std::function<void(HTREEITEM)> walk = [&](HTREEITEM it) {
+        for (; it; it = TreeView_GetNextSibling(g.sideTree, it)) {
+            TVITEMW tv = {};
+            tv.mask = TVIF_PARAM | TVIF_STATE;
+            tv.hItem = it;
+            tv.stateMask = TVIS_EXPANDED;
+            TreeView_GetItem(g.sideTree, &tv);
+            if ((int)tv.lParam >= 0 && (tv.state & TVIS_EXPANDED)) {
+                open.push_back(nodePath((int)tv.lParam));
+                walk(TreeView_GetChild(g.sideTree, it));
+            }
+        }
+    };
+    if (g.dataDoc == g.d) {
+        walk(TreeView_GetRoot(g.sideTree));
+        if (HTREEITEM s = TreeView_GetSelection(g.sideTree)) {
+            TVITEMW tv = {};
+            tv.mask = TVIF_PARAM;
+            tv.hItem = s;
+            TreeView_GetItem(g.sideTree, &tv);
+            if ((int)tv.lParam >= 0) selPath = nodePath((int)tv.lParam);
+        }
+    }
+    g.treeUpdating = true;
+    SendMessageW(g.sideTree, WM_SETREDRAW, FALSE, 0);
+    TreeView_DeleteAllItems(g.sideTree);
+    g.data = DataTree();
+    g.dataFilled.clear();
+    g.dataDoc = g.d;
+    g.dataVersion = g.d->doc.version();
+    const int kind = sideKind();
+    if (g.d->doc.size() > kSideMax) {
+        g.data.ok = false;
+        g.data.error = "The file is too large for the data view (limit 64 MB)";
+    } else {
+        std::string text = g.d->doc.text(0, g.d->doc.size());
+        g.data = kind == SIDE_XML ? parseXml(text.data(), text.size(), 20000000) : parseJson(text.data(), text.size(), 20000000);
+    }
+    g.dataFilled.assign(g.data.nodes.size(), false);
+    if (!g.data.ok) {
+        // The first error, on top; clicking it goes there.
+        std::wstring m = L"\x26A0 " + widenUtf8(g.data.error);
+        if (g.d->doc.linesKnown() && g.d->doc.size() <= kSideMax) {
+            wchar_t b[64];
+            swprintf(b, 64, L" (line %llu)", (unsigned long long)g.d->doc.lineOf(std::min(g.data.errorPos, g.d->doc.size())) + 1);
+            m += b;
+        }
+        TVINSERTSTRUCTW is = {};
+        is.hParent = TVI_ROOT;
+        is.hInsertAfter = TVI_LAST;
+        is.item.mask = TVIF_TEXT | TVIF_PARAM;
+        is.item.pszText = (LPWSTR)m.c_str();
+        is.item.lParam = -1;
+        SendMessageW(g.sideTree, TVM_INSERTITEMW, 0, (LPARAM)&is);
+    }
+    if (!g.data.nodes.empty()) {
+        // XML: the document node itself is not shown, its children are the top level.
+        std::vector<int> top;
+        if (kind == SIDE_XML) top = g.data.nodes[0].kids, g.dataFilled[0] = true;
+        else top.push_back(0);
+        std::function<void(HTREEITEM, int)> restore = [&](HTREEITEM it, int id) {
+            const std::wstring path = nodePath(id);
+            const bool wasOpen = std::find(open.begin(), open.end(), path) != open.end();
+            const bool firstTime = open.empty() && g.data.nodes[(size_t)id].parent <= 0;  // a new file: open the top
+            if ((wasOpen || firstTime) && !g.data.nodes[(size_t)id].kids.empty()) {
+                fillKids(it, id);
+                TreeView_Expand(g.sideTree, it, TVE_EXPAND);
+                for (HTREEITEM c = TreeView_GetChild(g.sideTree, it); c; c = TreeView_GetNextSibling(g.sideTree, c)) {
+                    TVITEMW tv = {};
+                    tv.mask = TVIF_PARAM;
+                    tv.hItem = c;
+                    TreeView_GetItem(g.sideTree, &tv);
+                    restore(c, (int)tv.lParam);
+                }
+            }
+            if (!selPath.empty() && path == selPath) TreeView_SelectItem(g.sideTree, it);
+        };
+        for (int id : top) {
+            HTREEITEM it = insertNode(TVI_ROOT, id);
+            restore(it, id);
+        }
+    }
+    if (g.data.truncated) {
+        TVINSERTSTRUCTW is = {};
+        is.hParent = TVI_ROOT;
+        is.hInsertAfter = TVI_LAST;
+        is.item.mask = TVIF_TEXT | TVIF_PARAM;
+        is.item.pszText = (LPWSTR)L"\x2026 (too many nodes to show them all)";
+        is.item.lParam = -1;
+        SendMessageW(g.sideTree, TVM_INSERTITEMW, 0, (LPARAM)&is);
+    }
+    SendMessageW(g.sideTree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g.sideTree, nullptr, TRUE);
+    g.treeUpdating = false;
+}
+
+int treeNodeOf(HTREEITEM it) {
+    if (!it) return -2;
+    TVITEMW tv = {};
+    tv.mask = TVIF_PARAM;
+    tv.hItem = it;
+    TreeView_GetItem(g.sideTree, &tv);
+    return (int)tv.lParam;
+}
+
+// Selects a node's text in the editor (without taking the focus).
+void showNodeInEditor(int id) {
+    u64 a, b;
+    if (id == -1) {  // the error line
+        a = b = std::min(g.data.errorPos, g.d->doc.size());
+    } else if (id >= 0 && (size_t)id < g.data.nodes.size()) {
+        a = g.data.nodes[(size_t)id].start;
+        b = g.data.nodes[(size_t)id].end;
+    } else {
+        return;
+    }
+    if (g.dataVersion != g.d->doc.version()) return;  // the tree is behind; it catches up shortly
+    a = std::min(a, g.d->doc.size());
+    b = std::min(b, g.d->doc.size());
+    g.d->caret = a;  // caret on the start so it scrolls there; the selection covers the node
+    g.d->anchor = b;
+    g.d->wantCol = -1;
+    refresh(true);
+}
+
+// Writes an edited value back into the document (one undo step).
+bool applyNodeEdit(int id, const std::wstring& text) {
+    if (id < 0 || (size_t)id >= g.data.nodes.size() || g.dataVersion != g.d->doc.version()) return false;
+    const DataNode n = g.data.nodes[(size_t)id];
+    std::string v = toDocBytes(text.c_str(), (int)text.size()), raw;
+    switch (n.kind) {
+    case DataNode::String: raw = jsonQuote(v); break;
+    case DataNode::Number:
+    case DataNode::Bool:
+    case DataNode::Null: raw = jsonIsLiteral(v) ? v : jsonQuote(v); break;  // anything else becomes a string
+    case DataNode::Attribute: raw = xmlEscape(v, true); break;
+    case DataNode::Comment:
+        if (v.find("--") != std::string::npos) {
+            MessageBoxW(g.frame, L"An XML comment cannot contain \"--\".", kAppName, MB_OK | MB_ICONINFORMATION);
+            return false;
+        }
+        raw = v;
+        break;
+    default: raw = xmlEscape(v, false); break;
+    }
+    replaceRange(n.vstart, n.vend, raw, n.vstart, n.vstart + raw.size());
+    rebuildDataView();
+    return true;
+}
+
+// ---- Markdown preview
+
+enum MdFont { MF_BODY = 0, MF_BOLD = 1, MF_ITALIC = 2, MF_BOLDITALIC = 3, MF_CODE = 4, MF_H1 = 5 };  // H1..H6 = 5..10
+
+struct MdOp {
+    enum Kind : u8 { Text, Fill, Box };
+    Kind kind = Text;
+    RECT rc = {};
+    std::wstring text;
+    int font = MF_BODY;
+    COLORREF color = 0;
+    bool strike = false, underline = false;
+    std::string url;
+};
+
+struct MdLayout {
+    std::vector<MdOp> ops;
+    std::vector<int> blockTop;  // y of each block
+    int height = 0, width = -1;
+    u64 version = NPOS;
+    const DocState* doc = nullptr;
+};
+MdLayout g_md;
+std::vector<MdBlock> g_mdBlocks;
+HFONT g_mdFonts[11] = {};
+int g_mdFontDpi = 0, g_mdFontPt = 0;
+
+void makeMdFonts() {
+    if (g_mdFontDpi == g.dpi && g_mdFontPt == g.fontPt && g_mdFonts[0]) return;
+    for (HFONT& f : g_mdFonts)
+        if (f) DeleteObject(f), f = nullptr;
+    g_mdFontDpi = g.dpi;
+    g_mdFontPt = g.fontPt;
+    const int body = -MulDiv(g.fontPt, g.dpi, 72);
+    auto mk = [&](int h, int weight, bool italic, const wchar_t* face) {
+        return CreateFontW(h, 0, 0, 0, weight, italic, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, face);
+    };
+    g_mdFonts[MF_BODY] = mk(body, FW_NORMAL, false, L"Segoe UI");
+    g_mdFonts[MF_BOLD] = mk(body, FW_SEMIBOLD, false, L"Segoe UI");
+    g_mdFonts[MF_ITALIC] = mk(body, FW_NORMAL, true, L"Segoe UI");
+    g_mdFonts[MF_BOLDITALIC] = mk(body, FW_SEMIBOLD, true, L"Segoe UI");
+    g_mdFonts[MF_CODE] = mk(body * 92 / 100, FW_NORMAL, false, g.fontFace.c_str());
+    static const int scale[6] = {200, 160, 135, 115, 100, 90};
+    for (int k = 0; k < 6; k++) g_mdFonts[MF_H1 + k] = mk(body * scale[k] / 100, FW_BOLD, false, L"Segoe UI");
+}
+
+int fontHeight(HDC dc, int f) {
+    TEXTMETRICW tm;
+    SelectObject(dc, g_mdFonts[f]);
+    GetTextMetricsW(dc, &tm);
+    return tm.tmHeight;
+}
+
+void layoutMarkdown(int width) {
+    makeMdFonts();
+    HDC dc = GetDC(g.sidePreview);
+    HGDIOBJ oldFont = SelectObject(dc, g_mdFonts[MF_BODY]);
+    MdLayout L;
+    L.width = width;
+    L.version = g.d->doc.version();
+    L.doc = g.d;
+    const int px = MulDiv(1, g.dpi, 96);
+    const int pad = 18 * px, maxX = std::max(pad + 40 * px, width - pad);
+    const COLORREF fg = g.pal.fg, bg = g.pal.bg, dim = blend(fg, bg, 55), codeBg = blend(fg, bg, g.pal.dark ? 9 : 6);
+    const COLORREF heading = g.pal.dark ? RGB(240, 240, 240) : RGB(10, 10, 10);
+    const int bodyH = fontHeight(dc, MF_BODY);
+    int y = pad;
+
+    auto measure = [&](const std::wstring& s, int f) {
+        SIZE sz = {};
+        SelectObject(dc, g_mdFonts[f]);
+        GetTextExtentPoint32W(dc, s.c_str(), (int)s.size(), &sz);
+        return (int)sz.cx;
+    };
+    auto fontFor = [&](const MdRun& r, int base) {
+        if (r.style & MdRun::Code) return (int)MF_CODE;
+        if (base >= MF_H1) return base;
+        int f = MF_BODY;
+        if (r.style & MdRun::Bold) f |= MF_BOLD;
+        if (r.style & MdRun::Italic) f |= MF_ITALIC;
+        return f;
+    };
+    // Lays out runs from x0 to maxX starting at y; returns the y below the last line.
+    auto flow = [&](const std::vector<MdRun>& runs, int x0, int top, int baseFont, COLORREF color) {
+        const int lh = fontHeight(dc, baseFont) * 135 / 100;
+        int x = x0, yy = top;
+        for (const MdRun& r : runs) {
+            const int f = fontFor(r, baseFont);
+            const std::wstring w = fromDocBytes(r.text);
+            size_t i = 0;
+            while (i < w.size()) {
+                if (w[i] == L'\n') {  // hard line break
+                    x = x0;
+                    yy += lh;
+                    i++;
+                    continue;
+                }
+                // A token: a word with the spaces after it.
+                size_t e = i;
+                while (e < w.size() && w[e] != L' ' && w[e] != L'\n') e++;
+                while (e < w.size() && w[e] == L' ') e++;
+                std::wstring tok = w.substr(i, e - i);
+                int tw = measure(tok, f);
+                if (x + tw > maxX && x > x0) {
+                    x = x0;
+                    yy += lh;
+                    while (!tok.empty() && tok[0] == L' ') tok.erase(0, 1);
+                    tw = measure(tok, f);
+                }
+                if (r.style & MdRun::Code) {
+                    std::wstring core = tok;
+                    while (!core.empty() && core.back() == L' ') core.pop_back();
+                    MdOp b;
+                    b.kind = MdOp::Fill;
+                    b.rc = {x - 2 * px, yy, x + measure(core, f) + 2 * px, yy + lh - 2 * px};
+                    b.color = codeBg;
+                    L.ops.push_back(b);
+                }
+                MdOp t;
+                t.kind = MdOp::Text;
+                t.rc = {x, yy + (lh - fontHeight(dc, f)) / 2, x + tw, yy + lh};
+                t.text = tok;
+                t.font = f;
+                t.color = (r.style & MdRun::Link) ? g.pal.accent : color;
+                t.strike = (r.style & MdRun::Strike) != 0;
+                t.underline = (r.style & MdRun::Link) != 0;
+                t.url = r.url;
+                L.ops.push_back(std::move(t));
+                x += tw;
+                i = e;
+            }
+        }
+        return yy + lh;
+    };
+
+    L.blockTop.resize(g_mdBlocks.size());
+    for (size_t bi = 0; bi < g_mdBlocks.size(); bi++) {
+        const MdBlock& b = g_mdBlocks[bi];
+        const int qx = pad + b.quote * 16 * px;
+        const int blockY = y;
+        L.blockTop[bi] = y;
+        switch (b.kind) {
+        case MdBlock::Heading: {
+            const int f = MF_H1 + std::clamp(b.level, 1, 6) - 1;
+            y += (b.level <= 2 ? 14 : 8) * px;
+            L.blockTop[bi] = y;
+            y = flow(b.runs, qx, y, f, heading);
+            if (b.level <= 2) {  // a rule under the big headings
+                MdOp r;
+                r.kind = MdOp::Fill;
+                r.rc = {qx, y + 2 * px, maxX, y + 3 * px};
+                r.color = g.pal.border;
+                L.ops.push_back(r);
+                y += 6 * px;
+            }
+            y += 6 * px;
+            break;
+        }
+        case MdBlock::Paragraph: y = flow(b.runs, qx, y, MF_BODY, fg) + bodyH * 6 / 10; break;
+        case MdBlock::ListItem: {
+            const int ind = qx + b.level * 22 * px, textX = ind + 20 * px;
+            const int lh = bodyH * 135 / 100;
+            if (b.task >= 0) {  // a square check box
+                const int s = bodyH * 7 / 10;
+                MdOp box;
+                box.kind = MdOp::Box;
+                box.rc = {ind + 2 * px, y + (lh - s) / 2, ind + 2 * px + s, y + (lh - s) / 2 + s};
+                box.color = b.task ? g.pal.accent : dim;
+                box.strike = b.task == 1;  // "checked"
+                L.ops.push_back(box);
+            } else {
+                MdOp m;
+                m.kind = MdOp::Text;
+                m.text = b.ordered ? std::to_wstring(b.number) + L"." : (b.level % 2 ? L"\x25E6" : L"\x2022");
+                m.font = MF_BODY;
+                m.color = dim;
+                m.rc = {ind, y + (lh - bodyH) / 2, textX, y + lh};
+                L.ops.push_back(m);
+            }
+            y = flow(b.runs, textX, y, MF_BODY, b.task == 1 ? dim : fg);
+            // A small gap after the last item of a list.
+            bool lastInList = bi + 1 == g_mdBlocks.size() || g_mdBlocks[bi + 1].kind != MdBlock::ListItem;
+            y += lastInList ? bodyH * 6 / 10 : 2 * px;
+            break;
+        }
+        case MdBlock::CodeBlock: {
+            const int lh = fontHeight(dc, MF_CODE) * 125 / 100, ip = 10 * px;
+            MdOp box;
+            box.kind = MdOp::Fill;
+            box.rc = {qx, y, maxX, y + (int)b.code.size() * lh + 2 * ip};
+            box.color = codeBg;
+            L.ops.push_back(box);
+            int yy = y + ip;
+            for (const std::string& line : b.code) {
+                std::wstring w = fromDocBytes(line);
+                for (size_t k = 0; k < w.size(); k++)  // tabs as 4 spaces
+                    if (w[k] == L'\t') w.replace(k, 1, L"    ");
+                MdOp t;
+                t.kind = MdOp::Text;
+                t.text = w;
+                t.font = MF_CODE;
+                t.color = fg;
+                t.rc = {qx + ip, yy, maxX - ip, yy + lh};
+                L.ops.push_back(std::move(t));
+                yy += lh;
+            }
+            y = yy + ip + bodyH * 6 / 10;
+            break;
+        }
+        case MdBlock::Rule: {
+            MdOp r;
+            r.kind = MdOp::Fill;
+            r.rc = {qx, y + bodyH / 2, maxX, y + bodyH / 2 + 2 * px};
+            r.color = g.pal.border;
+            L.ops.push_back(r);
+            y += bodyH + bodyH * 6 / 10;
+            break;
+        }
+        case MdBlock::Table: {
+            const size_t cols = b.align.size();
+            const int cp = 8 * px, lh = bodyH * 150 / 100;
+            std::vector<int> w(cols, 0);
+            auto cellText = [&](const std::vector<MdRun>& runs) {
+                std::wstring s;
+                for (const MdRun& r : runs) s += fromDocBytes(r.text);
+                return s;
+            };
+            for (size_t r = 0; r < b.rows.size(); r++)
+                for (size_t c = 0; c < cols && c < b.rows[r].size(); c++)
+                    w[c] = std::max(w[c], measure(cellText(b.rows[r][c]), r == 0 ? MF_BOLD : MF_BODY) + 2 * cp);
+            int total = 0;
+            for (int v : w) total += v;
+            const int avail = maxX - qx;
+            if (total > avail && total > 0)  // too wide: shrink the columns in proportion
+                for (int& v : w) v = std::max(24 * px, v * avail / total);
+            for (size_t r = 0; r < b.rows.size(); r++) {
+                int x = qx;
+                if (r == 0) {
+                    MdOp h;
+                    h.kind = MdOp::Fill;
+                    h.rc = {qx, y, qx + std::min(total, avail), y + lh};
+                    h.color = codeBg;
+                    L.ops.push_back(h);
+                }
+                for (size_t c = 0; c < cols; c++) {
+                    std::wstring s = c < b.rows[r].size() ? cellText(b.rows[r][c]) : L"";
+                    const int f = r == 0 ? MF_BOLD : MF_BODY, tw = measure(s, f);
+                    int tx = x + cp;
+                    if (b.align[c] == 0) tx = x + (w[c] - tw) / 2;
+                    else if (b.align[c] == 1) tx = x + w[c] - cp - tw;
+                    MdOp t;
+                    t.kind = MdOp::Text;
+                    t.text = s;
+                    t.font = f;
+                    t.color = fg;
+                    t.rc = {std::max(tx, x + cp), y + (lh - bodyH) / 2, x + w[c] - cp, y + lh};
+                    L.ops.push_back(std::move(t));
+                    // Cell border: square, one pixel.
+                    MdOp e;
+                    e.kind = MdOp::Box;
+                    e.rc = {x, y, x + w[c] + 1, y + lh + 1};
+                    e.color = g.pal.border;
+                    L.ops.push_back(e);
+                    x += w[c];
+                }
+                y += lh;
+            }
+            y += bodyH * 6 / 10;
+            break;
+        }
+        }
+        if (b.quote > 0) {  // the quote bar, the height of the block
+            for (int q = 0; q < b.quote; q++) {
+                MdOp bar;
+                bar.kind = MdOp::Fill;
+                bar.rc = {pad + q * 16 * px, blockY, pad + q * 16 * px + 3 * px, y - bodyH * 4 / 10};
+                bar.color = blend(fg, bg, 30);
+                L.ops.push_back(bar);
+            }
+        }
+    }
+    L.height = y + pad;
+    SelectObject(dc, oldFont);
+    ReleaseDC(g.sidePreview, dc);
+    g_md = std::move(L);
+}
+
+void reparseMarkdown() {
+    if (g.d->doc.size() > kSideMax) g_mdBlocks.clear();
+    else g_mdBlocks = parseMarkdown(g.d->doc.text(0, g.d->doc.size()));
+    g_md.width = -1;  // lay out again on the next paint
+}
+
+void updatePreviewScrollbar() {
+    RECT rc;
+    GetClientRect(g.sidePreview, &rc);
+    SCROLLINFO si = {sizeof(si), SIF_RANGE | SIF_PAGE | SIF_POS};
+    si.nMax = std::max(0, g_md.height);
+    si.nPage = (UINT)rc.bottom;
+    g.mdScroll = std::clamp(g.mdScroll, 0, std::max(0, g_md.height - (int)rc.bottom));
+    si.nPos = g.mdScroll;
+    SetScrollInfo(g.sidePreview, SB_VERT, &si, TRUE);
+}
+
+// Scrolls the preview to where the editor is: the block holding the editor's
+// top line, plus how far into that block it is.
+void syncPreviewToEditor() {
+    if (!g.sidePreview || !IsWindowVisible(g.sidePreview) || !g.d->doc.linesKnown() || g_md.blockTop.empty()) return;
+    const u64 top = g.d->doc.lineOf(g.d->top);
+    if (top == g.mdSyncedTop) return;  // the editor did not move: leave the preview where you put it
+    g.mdSyncedTop = top;
+    int y = 0;
+    for (size_t i = 0; i < g_mdBlocks.size(); i++) {
+        const MdBlock& b = g_mdBlocks[i];
+        if (b.line > top) break;
+        y = g_md.blockTop[i];
+        if (top < b.lineEnd && b.lineEnd > b.line) {
+            int next = i + 1 < g_md.blockTop.size() ? g_md.blockTop[i + 1] : g_md.height;
+            y += (int)((next - g_md.blockTop[i]) * (double)(top - b.line) / (b.lineEnd - b.line));
+            break;
+        }
+    }
+    g.mdScroll = std::max(0, y - MulDiv(18, g.dpi, 96));
+    updatePreviewScrollbar();
+    InvalidateRect(g.sidePreview, nullptr, FALSE);
+}
+
+void paintPreview(HWND hwnd) {
+    PAINTSTRUCT ps;
+    HDC wdc = BeginPaint(hwnd, &ps);
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    const int W = rc.right, H = rc.bottom;
+    if (W <= 0 || H <= 0) {
+        EndPaint(hwnd, &ps);
+        return;
+    }
+    if (g_md.width != W || g_md.version != g.d->doc.version() || g_md.doc != g.d) {
+        if (g_md.version != g.d->doc.version() || g_md.doc != g.d) reparseMarkdown();
+        layoutMarkdown(W);
+        updatePreviewScrollbar();
+    }
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, W, H);
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+    fillRect(dc, 0, 0, W, H, g.pal.bg);
+    fillRect(dc, 0, 0, edgeW(), H, g.pal.border);  // a line between editor and preview
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ oldFont = SelectObject(dc, g_mdFonts[MF_BODY]);
+    const int s = g.mdScroll;
+    for (const MdOp& op : g_md.ops) {
+        if (op.rc.bottom - s < 0 || op.rc.top - s > H) continue;
+        RECT r = op.rc;
+        OffsetRect(&r, 0, -s);
+        if (op.kind == MdOp::Fill) {
+            fillRect(dc, r.left, r.top, r.right, r.bottom, op.color);
+        } else if (op.kind == MdOp::Box) {
+            HBRUSH b = CreateSolidBrush(op.color);
+            FrameRect(dc, &r, b);
+            if (op.strike) {  // a ticked task box: filled inside
+                RECT in = r;
+                InflateRect(&in, -3, -3);
+                FillRect(dc, &in, b);
+            }
+            DeleteObject(b);
+        } else {
+            SelectObject(dc, g_mdFonts[op.font]);
+            SetTextColor(dc, op.color);
+            ExtTextOutW(dc, r.left, r.top, ETO_CLIPPED, &r, op.text.c_str(), (UINT)op.text.size(), nullptr);
+            if (op.strike || op.underline) {
+                SIZE sz = {};
+                std::wstring t = op.text;
+                while (!t.empty() && t.back() == L' ') t.pop_back();
+                GetTextExtentPoint32W(dc, t.c_str(), (int)t.size(), &sz);
+                TEXTMETRICW tm;
+                GetTextMetricsW(dc, &tm);
+                int ly = op.strike ? r.top + tm.tmAscent * 6 / 10 : r.top + tm.tmAscent + 1;
+                fillRect(dc, r.left, ly, r.left + sz.cx, ly + std::max(1, MulDiv(1, g.dpi, 96)), op.color);
+            }
+        }
+    }
+    if (g_mdBlocks.empty()) {
+        SelectObject(dc, g.uiFont);
+        SetTextColor(dc, blend(g.pal.fg, g.pal.bg, 45));
+        RECT t = rc;
+        DrawTextW(dc, g.d->doc.size() > kSideMax ? L"The file is too large to preview (limit 64 MB)." : L"Nothing to preview yet.",
+                  -1, &t, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(dc, oldFont);
+    BitBlt(wdc, 0, 0, W, H, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+const MdOp* linkAt(int x, int y) {
+    for (const MdOp& op : g_md.ops) {
+        if (op.kind != MdOp::Text || op.url.empty()) continue;
+        RECT r = op.rc;
+        OffsetRect(&r, 0, -g.mdScroll);
+        POINT pt = {x, y};
+        if (PtInRect(&r, pt)) return &op;
+    }
+    return nullptr;
+}
+
+void openLink(const std::string& url) {
+    std::wstring u = widenUtf8(url);
+    if (u.rfind(L"http://", 0) == 0 || u.rfind(L"https://", 0) == 0 || u.rfind(L"mailto:", 0) == 0) {
+        ShellExecuteW(nullptr, L"open", u.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    if (u.empty() || u[0] == L'#') return;
+    // A relative link to another file: open it in a tab.
+    for (wchar_t& c : u)
+        if (c == L'/') c = L'\\';
+    std::wstring path = dirOf(g.d->path) + L"\\" + u;
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) openInTab(path);
+}
+
+LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: paintPreview(hwnd); return 0;
+    case WM_SIZE:
+        g_md.width = -1;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_MOUSEWHEEL: {
+        int lines = 3;
+        SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+        const int step = MulDiv(g.ch, lines, 1);
+        g.mdScroll -= GET_WHEEL_DELTA_WPARAM(wp) * step / WHEEL_DELTA;
+        updatePreviewScrollbar();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    case WM_VSCROLL: {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        SCROLLINFO si = {sizeof(si), SIF_ALL};
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        switch (LOWORD(wp)) {
+        case SB_LINEUP: g.mdScroll -= g.ch * 2; break;
+        case SB_LINEDOWN: g.mdScroll += g.ch * 2; break;
+        case SB_PAGEUP: g.mdScroll -= rc.bottom * 9 / 10; break;
+        case SB_PAGEDOWN: g.mdScroll += rc.bottom * 9 / 10; break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: g.mdScroll = si.nTrackPos; break;
+        case SB_TOP: g.mdScroll = 0; break;
+        case SB_BOTTOM: g.mdScroll = g_md.height; break;
+        }
+        updatePreviewScrollbar();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    case WM_SETCURSOR: {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd, &pt);
+        if (LOWORD(lp) == HTCLIENT && linkAt(pt.x, pt.y)) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        break;
+    }
+    case WM_LBUTTONUP:
+        if (const MdOp* op = linkAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp))) openLink(op->url);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ---- the pane as a whole
+
+void themeSidePane() {
+    if (!g.sideTree) return;
+    SetWindowTheme(g.sideTree, g.pal.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    TreeView_SetBkColor(g.sideTree, g.pal.bg);
+    TreeView_SetTextColor(g.sideTree, g.pal.fg);
+    TreeView_SetLineColor(g.sideTree, blend(g.pal.fg, g.pal.bg, 35));
+    SendMessageW(g.sideTree, WM_SETFONT, (WPARAM)g.font, TRUE);
+    SetWindowTheme(g.sidePreview, g.pal.dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+    g_md.width = -1;
+}
+
+// Brings the pane up to date with the open tab (after switching tab, opening,
+// toggling, or an edit settled).
+void updateSidePane() {
+    if (!g.sideTree) return;
+    const bool vis = sideVisible();
+    const int kind = sideKind();
+    ShowWindow(g.sideTree, vis && (kind == SIDE_JSON || kind == SIDE_XML) ? SW_SHOW : SW_HIDE);
+    ShowWindow(g.sidePreview, vis && kind == SIDE_MD ? SW_SHOW : SW_HIDE);
+    if (!vis) return;
+    if (kind == SIDE_MD) {
+        g.mdSyncedTop = NPOS;
+        InvalidateRect(g.sidePreview, nullptr, FALSE);
+        syncPreviewToEditor();
+    } else if (g.dataDoc != g.d || g.dataVersion != g.d->doc.version()) {
+        rebuildDataView();
+    }
+}
+
+void toggleSidePane() {
+    if (sideKind() == SIDE_NONE) {
+        MessageBeep(MB_OK);
+        return;
+    }
+    g.sideOn = !(g.sideOn && !g.diffOn);
+    if (g.sideOn && g.diffOn) toggleDiff();  // one or the other beside the editor
+    layoutFrame();
+    updateSidePane();
+    saveSettings();
+}
+
+// WM_NOTIFY from the tree.
+LRESULT onTreeNotify(NMHDR* nm) {
+    switch (nm->code) {
+    case TVN_ITEMEXPANDINGW: {
+        NMTREEVIEWW* tv = (NMTREEVIEWW*)nm;
+        if (tv->action == TVE_EXPAND) fillKids(tv->itemNew.hItem, (int)tv->itemNew.lParam);
+        return FALSE;
+    }
+    case TVN_SELCHANGEDW: {
+        NMTREEVIEWW* tv = (NMTREEVIEWW*)nm;
+        if (!g.treeUpdating && tv->action != TVC_UNKNOWN) showNodeInEditor((int)tv->itemNew.lParam);
+        return 0;
+    }
+    case TVN_KEYDOWN: {
+        NMTVKEYDOWN* k = (NMTVKEYDOWN*)nm;
+        if (k->wVKey == VK_F2) {
+            if (HTREEITEM s = TreeView_GetSelection(g.sideTree)) TreeView_EditLabel(g.sideTree, s);
+            return TRUE;
+        }
+        if (k->wVKey == VK_RETURN) {
+            showNodeInEditor(treeNodeOf(TreeView_GetSelection(g.sideTree)));
+            SetFocus(g.view);
+            return TRUE;
+        }
+        return 0;
+    }
+    case NM_DBLCLK: {
+        // Leaves: double click edits the value. Branches open and close as usual.
+        HTREEITEM s = TreeView_GetSelection(g.sideTree);
+        int id = treeNodeOf(s);
+        if (id >= 0 && (size_t)id < g.data.nodes.size() && g.data.nodes[(size_t)id].kids.empty() &&
+            nodeEditable(g.data.nodes[(size_t)id])) {
+            TreeView_EditLabel(g.sideTree, s);
+            return TRUE;
+        }
+        return 0;
+    }
+    case TVN_BEGINLABELEDITW: {
+        NMTVDISPINFOW* di = (NMTVDISPINFOW*)nm;
+        int id = (int)di->item.lParam;
+        if (g.dataVersion != g.d->doc.version()) {  // the tree is behind the text: catch up first
+            rebuildDataView();
+            return TRUE;
+        }
+        if (id < 0 || (size_t)id >= g.data.nodes.size() || !nodeEditable(g.data.nodes[(size_t)id])) return TRUE;
+        if (HWND e = TreeView_GetEditControl(g.sideTree))
+            SetWindowTextW(e, fromDocBytes(g.data.nodes[(size_t)id].value).c_str());
+        return FALSE;
+    }
+    case TVN_ENDLABELEDITW: {
+        NMTVDISPINFOW* di = (NMTVDISPINFOW*)nm;
+        if (di->item.pszText) applyNodeEdit((int)di->item.lParam, di->item.pszText);
+        return FALSE;  // the tree is rebuilt from the new text, labels included
+    }
+    }
+    return 0;
+}
+
 // ====================================================================== theme
 
 bool wantDark() { return g.themeMode == 2 || (g.themeMode == 0 && systemUsesDarkMode()); }
@@ -3453,6 +4311,8 @@ void applyTheme() {
     SetWindowTheme(g.view, dark ? L"DarkMode_Explorer" : nullptr, nullptr);
     SendMessageW(g.view, WM_THEMECHANGED, 0, 0);
     themeMenuColors(g.menu, g.pal);
+    themeSidePane();
+    if (g.sidePreview) InvalidateRect(g.sidePreview, nullptr, FALSE);
     DrawMenuBar(g.frame);
     RedrawWindow(g.frame, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
 }
@@ -3733,6 +4593,7 @@ HMENU buildMenu() {
     AppendMenuW(view, MF_STRING, IDM_WRAP, L"&Word Wrap\tAlt+Z");
     AppendMenuW(view, MF_STRING, IDM_LINENUMBERS, L"&Line Numbers");
     AppendMenuW(view, MF_STRING, IDM_HIGHLIGHT, L"Syntax &Highlighting");
+    AppendMenuW(view, MF_STRING, IDM_SIDEVIEW, L"Data View / &Preview\tCtrl+Shift+V");
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, MF_STRING, IDM_FONT, L"&Font...");
     AppendMenuW(view, MF_STRING, IDM_ZOOMIN, L"Zoom &In\tCtrl+Plus");
@@ -3772,6 +4633,7 @@ HACCEL buildAccelerators() {
         {FVIRTKEY | FCONTROL, VK_TAB, IDM_NEXTTAB},
         {FVIRTKEY | FCONTROL | FSHIFT, VK_TAB, IDM_PREVTAB},
         {FVIRTKEY | FCONTROL | FSHIFT, 'O', IDM_VCS_FILES},
+        {FVIRTKEY | FCONTROL | FSHIFT, 'V', IDM_SIDEVIEW},
         {FVIRTKEY | FCONTROL, 'S', IDM_SAVE},
         {FVIRTKEY | FCONTROL | FSHIFT, 'S', IDM_SAVEAS},
         {FVIRTKEY | FCONTROL, 'Z', IDM_UNDO},
@@ -3843,7 +4705,17 @@ void layoutFrame() {
         MoveWindow(g.strip, left, top, sw, h - top, TRUE);
         left += sw;
     }
-    MoveWindow(g.view, left, top, rc.right - left, h - top, TRUE);
+    int right = rc.right;
+    if (sideVisible()) {
+        // The data view / preview takes about two fifths, on the right.
+        const int min = MulDiv(220, g.dpi, 96);
+        int sw = std::clamp((int)rc.right * 42 / 100, std::min(min, (int)rc.right / 2), std::max(0, (int)rc.right - min));
+        right = rc.right - sw;
+        MoveWindow(g.sideTree, right, top, sw, h - top, TRUE);
+        MoveWindow(g.sidePreview, right, top, sw, h - top, TRUE);
+    }
+    g.sideShown = sideVisible();
+    MoveWindow(g.view, left, top, right - left, h - top, TRUE);
     RECT s = {0, h, rc.right, rc.bottom};
     InvalidateRect(g.frame, &s, FALSE);
     RECT hd = {0, 0, rc.right, top};
@@ -3891,6 +4763,8 @@ void activateTab(int i) {
     invalidateTabs();
     InvalidateRect(g.diffPane, nullptr, FALSE);
     InvalidateRect(g.strip, nullptr, FALSE);
+    layoutFrame();
+    updateSidePane();
     SetFocus(g.view);
 }
 
@@ -4039,6 +4913,7 @@ void setZoom(int pt) {
     if (pt == g.fontPt) return;
     g.fontPt = pt;
     makeFonts();
+    themeSidePane();
     refresh(true);
 }
 
@@ -4062,6 +4937,7 @@ void cmdFont() {
     g.fontFace = lf.lfFaceName;
     g.fontPt = std::max(6, std::min(72, cf.iPointSize / 10));
     makeFonts();
+    themeSidePane();
     refresh(true);
 }
 
@@ -4228,6 +5104,7 @@ void onCommand(int id) {
         g.d->p4Asked = false;  // a failed automatic checkout is tried again on the next edit
         if (!g.d->path.empty()) startVcsQuery(true);
         break;
+    case IDM_SIDEVIEW: toggleSidePane(); break;
     case IDM_HIGHLIGHT:
         g.highlight = !g.highlight;
         saveSettings();
@@ -4266,6 +5143,14 @@ void updateMenu() {
     CheckMenuItem(g.menu, IDM_WRAP, MF_BYCOMMAND | (g.wrap ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(g.menu, IDM_LINENUMBERS, MF_BYCOMMAND | (g.lineNumbers ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(g.menu, IDM_HIGHLIGHT, MF_BYCOMMAND | (g.highlight ? MF_CHECKED : MF_UNCHECKED));
+    {
+        const int k = sideKind();
+        themeSetMenuText(g.menu, IDM_SIDEVIEW, k == SIDE_MD                     ? L"Markdown &Preview\tCtrl+Shift+V"
+                                               : k == SIDE_JSON || k == SIDE_XML ? L"&Data View\tCtrl+Shift+V"
+                                                                                 : L"Data View / &Preview\tCtrl+Shift+V");
+        en(IDM_SIDEVIEW, k != SIDE_NONE);
+        CheckMenuItem(g.menu, IDM_SIDEVIEW, MF_BYCOMMAND | (sideVisible() ? MF_CHECKED : MF_UNCHECKED));
+    }
     en(IDM_WRAP, !g.diffOn);
     CheckMenuItem(g.menu, IDM_DIFF, MF_BYCOMMAND | (g.diffOn ? MF_CHECKED : MF_UNCHECKED));
     const bool p4 = g.d->vcs.kind == VcsKind::Perforce;
@@ -4557,6 +5442,12 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g.wrap) ShowScrollBar(g.view, SB_HORZ, FALSE);
         g.diffPane = CreateWindowExW(0, kDiffClass, L"", WS_CHILD, 0, 0, 0, 0, hwnd, nullptr, g.inst, nullptr);
         g.strip = CreateWindowExW(0, kStripClass, L"", WS_CHILD, 0, 0, 0, 0, hwnd, nullptr, g.inst, nullptr);
+        g.sideTree = CreateWindowExW(0, WC_TREEVIEWW, L"",
+                                     WS_CHILD | WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
+                                         TVS_SHOWSELALWAYS | TVS_EDITLABELS | TVS_INFOTIP,
+                                     0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)1, g.inst, nullptr);
+        TreeView_SetExtendedStyle(g.sideTree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
+        g.sidePreview = CreateWindowExW(0, kPreviewClass, L"", WS_CHILD | WS_VSCROLL, 0, 0, 0, 0, hwnd, nullptr, g.inst, nullptr);
         return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: paintStatus(hwnd); return 0;
@@ -4683,6 +5574,9 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         return 0;
     case WM_APP_VCS: onVcsResult((unsigned)wp, (VcsInfo*)lp); return 0;
+    case WM_NOTIFY:
+        if (((NMHDR*)lp)->hwndFrom == g.sideTree) return onTreeNotify((NMHDR*)lp);
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_APP_P4ASK: onP4Ask(); return 0;
     case WM_APP_P4EDITED: onP4Edited((unsigned)wp, (RunResult*)lp); return 0;
     case WM_UPDATE_STATUS:
@@ -4700,6 +5594,11 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_UPDATE_READY: onUpdateReady((wchar_t*)lp); return 0;
     case WM_TIMER:
+        if (wp == kTimerSide) {
+            KillTimer(hwnd, kTimerSide);
+            updateSidePane();
+            return 0;
+        }
         if (wp == kTimerSession) {
             autosaveSession();
             return 0;
@@ -4744,7 +5643,7 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g.inst = inst;
     loadSettings();
-    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES | ICC_LINK_CLASS};
+    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES | ICC_LINK_CLASS | ICC_TREEVIEW_CLASSES};
     InitCommonControlsEx(&icc);
     themeInit();
     gdiplusStart();
@@ -4779,6 +5678,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     RegisterClassExW(&dcl);
     dcl.lpfnWndProc = stripProc;
     dcl.lpszClassName = kStripClass;
+    RegisterClassExW(&dcl);
+    dcl.lpfnWndProc = previewProc;
+    dcl.lpszClassName = kPreviewClass;
     RegisterClassExW(&dcl);
 
     g.menu = buildMenu();
@@ -4817,6 +5719,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        // While a tree value is being edited its text box gets every key
+        // (Ctrl+V, Ctrl+Z ... must not reach the editor behind it).
+        if (g.sideTree && GetParent(msg.hwnd) == g.sideTree) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            continue;
+        }
         if (g.findDlg && IsDialogMessageW(g.findDlg, &msg)) continue;
         if (TranslateAcceleratorW(g.frame, g.accel, &msg)) continue;
         TranslateMessage(&msg);
