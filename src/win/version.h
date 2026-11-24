@@ -1,7 +1,7 @@
 #pragma once
 // Rewritten by publish.ps1 for each release.
-#define APP_VERSION_STRING "2.261123.6"
+#define APP_VERSION_STRING "2.261124.1"
 #define APP_VERSION_MAJOR 2
 #define APP_VERSION_MINOR 26
-#define APP_VERSION_PATCH 1123
-#define APP_VERSION_BUILD 6
+#define APP_VERSION_PATCH 1124
+#define APP_VERSION_BUILD 1
