@@ -1,4 +1,4 @@
-# Publishes a release: refreshes the website from README.md, works out the
+# Publishes a release: refreshes the website from docs/site.md, works out the
 # version, stamps it, builds, tests, zips, commits the version bump, tags,
 # pushes, and creates the GitHub release.
 #
@@ -39,14 +39,15 @@ try {
     }
 
     # ----------------------------------------------------------------------
-    # 0. Website: copy README.md into docs/index.html (the page renders it
+    # 0. Website: copy docs/site.md into docs/index.html (the page renders it
     #    with marked), so najjak.com/JustNotepad matches the release.
+    #    README.md stays the full document for developers.
     # ----------------------------------------------------------------------
-    Write-Host "Step 0: Updating docs/index.html from README.md..." -ForegroundColor Cyan
+    Write-Host "Step 0: Updating docs/index.html from docs/site.md..." -ForegroundColor Cyan
     $HtmlPath = Join-Path $Root 'docs\index.html'
     if (Test-Path $HtmlPath) {
         $bt = [string][char]0x60
-        $Readme = Get-Content -Path (Join-Path $Root 'README.md') -Raw -Encoding UTF8
+        $Readme = Get-Content -Path (Join-Path $Root 'docs\site.md') -Raw -Encoding UTF8
         # Inside a JavaScript template string, ` and ${ must be escaped.
         $Escaped = $Readme.Replace($bt, ('\' + $bt)).Replace('${', '\${')
         $Html = Get-Content -Path $HtmlPath -Raw -Encoding UTF8
@@ -63,7 +64,7 @@ try {
                 Write-Host "Updated docs/index.html"
                 if (-not $DryRun) {
                     git add -- 'docs/index.html'
-                    git commit -m "Update docs/index.html from README.md" | Out-Null
+                    git commit -m "Update docs/index.html from docs/site.md" | Out-Null
                     if ($LASTEXITCODE -ne 0) { throw "Failed to commit docs/index.html." }
                 }
             }

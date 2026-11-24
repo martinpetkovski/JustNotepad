@@ -68,7 +68,7 @@ Requires Visual Studio 2022 (or the standalone Build Tools) with the C++ workloa
 .\publish.ps1 -DryRun   # everything up to the zip; nothing committed or pushed
 ```
 
-Versions are `<major>.<yyMMdd>.<n>`, where n counts releases on the same day. `publish.ps1` also copies this README into `docs/index.html`, so the website always matches the release. The zip attached to the GitHub release is what the in-app updater (Help > Check for Updates) downloads, so publishing needs the GitHub CLI (`gh`).
+Versions are `<major>.<yyMMdd>.<n>`, where n counts releases on the same day. `publish.ps1` also copies `docs/site.md` (the short page for users) into `docs/index.html`, so the website always matches the release. The zip attached to the GitHub release is what the in-app updater (Help > Check for Updates) downloads, so publishing needs the GitHub CLI (`gh`).
 
 ## Source layout
 
@@ -78,7 +78,7 @@ Versions are `<major>.<yyMMdd>.<n>`, where n counts releases on the same day. `p
 | `src/win/` | Win32 front end: window, painting, input, tabs, session, theme, dialogs, version control, updater |
 | `src/setup/` | The installer / uninstaller (carries `JustNotepad.exe` inside it) |
 | `tests/` | Differential tests and benchmark for the core |
-| `docs/` | The website (generated from this README) and the icon |
+| `docs/` | The website (`site.md` is its text; `index.html` is generated from it) and the icon |
 
 ## Known limits
 
