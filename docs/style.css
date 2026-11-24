@@ -13,17 +13,56 @@ body {
     margin: 0 auto;
 }
 
+/* Plain links: text, underlined, blue on hover. */
 a {
-    color: #FFF;
-    text-decoration: none;
-    background-color: #000;
-    padding: 10px;
-    margin-top: 10px;
-    display: inline-block;
+    color: #000;
+    text-decoration: underline;
+    text-underline-offset: 3px;
 }
 
 a:hover {
-    background-color: #09F;
+    color: #09F;
+}
+
+/* Line icons drawn in the text colour. */
+.i {
+    width: 16px;
+    height: 16px;
+    margin-right: 8px;
+    vertical-align: -3px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: square;
+    stroke-linejoin: miter;
+}
+
+.dl {
+    font-weight: 600;
+}
+
+.meta {
+    color: #666;
+    margin-left: 12px;
+}
+
+ul.f {
+    list-style: none;
+    padding: 0;
+    margin: 2em 0;
+}
+
+ul.f li {
+    margin: 0.5em 0;
+}
+
+.foot {
+    margin-top: 3em;
+    color: #666;
+}
+
+.foot a {
+    margin-right: 16px;
 }
 
 h1, h2, h3 {
@@ -42,21 +81,3 @@ pre {
     padding: 15px;
     overflow-x: auto;
 }
-
-table {
-    border-collapse: collapse;
-    width: 100%;
-    margin-bottom: 1em;
-}
-
-th, td {
-    border: 1px solid #ddd;
-    padding: 8px;
-    text-align: left;
-}
-
-th {
-    background-color: #f8f8f8;
-}
-
-
