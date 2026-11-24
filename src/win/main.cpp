@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <functional>
 #include <cmath>
+#include <ctime>
 #include <ctype.h>
 #include <memory>
 #include <string>
@@ -61,6 +62,7 @@ const wchar_t* const kViewClass = L"JustNotepadView";
 const wchar_t* const kDiffClass = L"JustNotepadDiff";
 const wchar_t* const kStripClass = L"JustNotepadDiffStrip";
 const wchar_t* const kPreviewClass = L"JustNotepadPreview";
+const wchar_t* const kSplitClass = L"JustNotepadSplitter";
 
 #define JN_WIDEN2(x) L##x
 #define JN_WIDEN(x) JN_WIDEN2(x)
@@ -79,7 +81,7 @@ const u64 kDiffMax = 16ull << 20;
 const u64 kDiffInstant = 256u << 10;
 
 const UINT WM_APP_INDEX = WM_APP + 1, WM_APP_VCS = WM_APP + 2, WM_APP_P4ASK = WM_APP + 3,
-           WM_APP_P4EDITED = WM_APP + 4;
+           WM_APP_P4EDITED = WM_APP + 4, WM_APP_BLAME = WM_APP + 5;
 const UINT_PTR kTimerBlink = 1, kTimerIndex = 2, kTimerDrag = 3, kTimerDiff = 4, kTimerSession = 5, kTimerSide = 6;
 
 const COLORREF kAdded = RGB(40, 160, 70), kChanged = RGB(40, 110, 220), kRemoved = RGB(210, 60, 60);
@@ -169,6 +171,19 @@ struct DocState {
     const Lang* lang = nullptr;
     HlCache hl, hlBase;
 
+    // Who changed what: blame of the latest revision (fetched when the diff
+    // opens), and how the edited text differs from that revision.
+    Blame blame;
+    bool blameLoaded = false, blamePending = false;
+    std::wstring blameError;
+    unsigned blameGen = 0;
+    std::vector<u64> headHash;   // per line of the blamed revision
+    std::vector<Hunk> localHunks; // blamed revision -> current text
+    u64 localVersion = NPOS;
+
+    // Diff against a chosen revision (File History) instead of #have / HEAD.
+    std::wstring baseSpec, baseLabel;
+
     // Session backup of unsaved text (see saveSession).
     std::wstring backupName;
     u64 backupVersion = NPOS;
@@ -242,6 +257,12 @@ struct App {
     int mdScroll = 0;
     u64 mdSyncedTop = NPOS;
     bool sideShown = false;          // what layoutFrame last laid out
+    // Movable dividers: share of the width for the diff's left side and for
+    // the side pane; dragging one (1 = diff strip, 2 = side divider).
+    double diffSplit = 0.5, sideSplit = 0.42;
+    int dragSplit = 0, dragOffset = 0;
+    RECT sideSplitRect = {};
+    HWND sideSplitter = nullptr;
     struct IconHit { RECT rc; int hunk, choice; };
     std::vector<IconHit> icons;      // choice buttons as last painted in the strip
     int hoverHunk = -1, hoverChoice = -1;
@@ -262,6 +283,8 @@ unsigned g_gen = 0;  // source of unique ids for background work replies
 
 INT_PTR dialogTheme(HWND dlg, UINT msg, WPARAM wp, LPARAM lp);
 void scrollRows(int n);
+void saveSettings();
+std::wstring formatTime(long long t);
 bool findBarOpen();
 void updateFindStatus(u64 hit);
 void paintRowMatches(HDC dc, const Row& r, int y, const LayoutCfg& c);
@@ -1042,6 +1065,123 @@ void drawRowText(HDC dc, const Doc& doc, const Row& row, int x0, int xMax, int y
     SetTextColor(dc, plain);
 }
 
+// ---- blame: who made each change
+
+void startBlame() {
+    DocState* t = g.d;
+    if (!g.diffOn || t->blameLoaded || t->blamePending || t->path.empty() || t->vcs.kind == VcsKind::None ||
+        t->vcs.toolMissing || !t->vcs.tracked)
+        return;
+    t->blamePending = true;
+    unsigned gen = t->blameGen = ++g_gen;
+    std::wstring path = t->path;
+    VcsKind kind = t->vcs.kind;
+    HWND frame = g.frame;
+    std::thread([path, kind, gen, frame]() {
+        Blame* b = new Blame();
+        std::wstring err;
+        if (!blameFile(path, kind, *b, err)) {
+            b->line.clear();
+            b->infos.clear();
+            BlameInfo e;
+            e.summary = err.empty() ? L"blame failed" : err;  // carried to the UI in the first info
+            b->infos.push_back(e);
+        }
+        if (!PostMessageW(frame, WM_APP_BLAME, (WPARAM)gen, (LPARAM)b)) delete b;
+    }).detach();
+}
+
+void onBlame(unsigned gen, Blame* raw) {
+    std::unique_ptr<Blame> b(raw);
+    for (auto& tp : g.tabs) {
+        DocState* t = tp.get();
+        if (t->blameGen != gen) continue;
+        t->blamePending = false;
+        t->blameLoaded = true;
+        t->blame = std::move(*b);
+        t->blameError = t->blame.line.empty() && !t->blame.infos.empty() ? t->blame.infos[0].summary : L"";
+        LineHasher h;
+        h.feed((const u8*)t->blame.text.data(), t->blame.text.size());
+        h.finish();
+        t->headHash.swap(h.lines);
+        t->localVersion = NPOS;
+        if (t == g.d) InvalidateRect(g.view, nullptr, FALSE);
+        return;
+    }
+}
+
+std::wstring ago(long long t) {
+    if (t <= 0) return L"";
+    long long now = (long long)time(nullptr), d = now - t;
+    wchar_t b[48];
+    if (d < 3600) swprintf(b, 48, L"%lld min ago", std::max(1LL, d / 60));
+    else if (d < 86400) swprintf(b, 48, L"%lld hour%ls ago", d / 3600, d / 3600 == 1 ? L"" : L"s");
+    else if (d < 86400 * 45) swprintf(b, 48, L"%lld day%ls ago", d / 86400, d / 86400 == 1 ? L"" : L"s");
+    else return formatTime(t).substr(0, 10);
+    return b;
+}
+
+// Who made a change: name on one line, "change 1234 · 3 days ago" on the next.
+struct Owner {
+    std::wstring who, detail;
+};
+
+Owner changeOwner(const Hunk& h) {
+    const bool p4 = g.d->vcs.kind == VcsKind::Perforce;
+    const Owner yours = {L"You", p4 ? L"not submitted" : L"not committed"};
+    // Against the latest revision every difference is your own edit.
+    if (g.d->baseSpec.empty()) return yours;
+    if (h.bCount == 0) return {L"Removed", L"after that revision"};
+    if (!g.d->blameLoaded) return {L"\x2026", L""};
+    if (g.d->blame.line.empty()) {  // say why, rather than nothing
+        std::wstring e = g.d->blameError;
+        size_t nl = e.find_first_of(L"\r\n");
+        return {L"Unknown", nl == std::wstring::npos ? e : e.substr(0, nl)};
+    }
+    if (g.d->localVersion != g.d->doc.version() && g.d->diffDocVersion == g.d->doc.version()) {
+        g.d->localHunks = diffLines(g.d->headHash, g.d->curHash);  // what you changed since the latest revision
+        g.d->localVersion = g.d->doc.version();
+    }
+    // Count owners over the change's lines (a few thousand at most).
+    std::vector<int> count(g.d->blame.infos.size() + 1, 0);  // last slot: you
+    const u32 n = std::min<u32>(h.bCount, 4000);
+    for (u32 k = 0; k < n; k++) {
+        const u32 line = h.bStart + k;
+        int hi = hunkAtB(g.d->localHunks, line);
+        if (hi >= 0 && g.d->localHunks[(size_t)hi].bCount > 0) {
+            count.back()++;
+            continue;
+        }
+        i64 headLine = mapBtoA(g.d->localHunks, line);
+        if (headLine >= 0 && (u64)headLine < g.d->blame.line.size()) {
+            int who = g.d->blame.line[(size_t)headLine];
+            if (who >= 0) count[(size_t)who]++;
+        }
+    }
+    int best = -1, owners = 0;
+    for (size_t i = 0; i < count.size(); i++) {
+        if (!count[i]) continue;
+        owners++;
+        if (best < 0 || count[i] > count[(size_t)best]) best = (int)i;
+    }
+    if (best < 0) return {L"", L""};
+    Owner o;
+    if ((size_t)best == count.size() - 1) {
+        o = yours;
+    } else {
+        const BlameInfo& bi = g.d->blame.infos[(size_t)best];
+        o.who = (p4 ? L"#" + bi.change : bi.change.substr(0, 7)) + L" " + (bi.who.empty() ? L"?" : bi.who);
+        o.detail = ago(bi.time);
+    }
+    if (owners > 1) {
+        wchar_t b[32];
+        swprintf(b, 32, L" +%d", owners - 1);
+        o.who += b;
+    }
+    return o;
+}
+
+
 void paintView(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC wdc = BeginPaint(hwnd, &ps);
@@ -1061,6 +1201,7 @@ void paintView(HWND hwnd) {
 
     const u64 s = selMin(), e = selMax();
     const bool linesOk = g.d->doc.linesKnown();
+    if (g.diffOn) startBlame();
     HlPainter hp;
     if (hlOn() && linesOk) {
         hlSync(g.d->doc, g.d->hl);
@@ -1088,6 +1229,7 @@ void paintView(HWND hwnd) {
                 RECT e = {0, y, g.cliW, y + edgeW()};
                 SetBkColor(dc, edgeOf(fc));
                 ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &e, L"", 0, nullptr);
+
             }
             continue;
         }
@@ -1187,7 +1329,8 @@ void paintView(HWND hwnd) {
 
 int headerH() { return g.diffOn ? g.statusH + MulDiv(6, g.dpi, 96) : 0; }
 int tabBarH() { return g.statusH + MulDiv(8, g.dpi, 96); }
-int stripW() { return MulDiv(78, g.dpi, 96); }
+int stripW() { return MulDiv(112, g.dpi, 96); }
+int splitW() { return MulDiv(8, g.dpi, 96); }
 
 struct Slot {
     u32 aStart, aCount, bStart, bCount;
@@ -1322,7 +1465,15 @@ const wchar_t* diffNote() {
 void paintHeader(HDC dc) {
     RECT rc;
     GetClientRect(g.frame, &rc);
-    const int H = headerH(), sw = stripW(), left = std::max(0, ((int)rc.right - sw) / 2);
+    // Follow the strip where it really is (the middle can be dragged).
+    RECT strip;
+    GetWindowRect(g.strip, &strip);
+    MapWindowPoints(nullptr, g.frame, (POINT*)&strip, 2);
+    RECT viewR;
+    GetWindowRect(g.view, &viewR);
+    MapWindowPoints(nullptr, g.frame, (POINT*)&viewR, 2);
+    const int H = headerH(), sw = stripW(), left = std::max(0, (int)strip.left);
+    const int editorRight = viewR.right;  // the side pane may follow the editor
     const COLORREF face = g.pal.face, text = g.pal.faceText;
     fillRect(dc, 0, 0, rc.right, H, face);
     fillRect(dc, 0, H - 1, rc.right, H, blend(text, face, 20));
@@ -1337,11 +1488,12 @@ void paintHeader(HDC dc) {
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_PATH_ELLIPSIS);
     };
     std::wstring base;
-    if (g.d->vcs.kind == VcsKind::Perforce) base = L"Depot  " + (g.d->vcs.baseFrom.empty() ? g.d->vcs.label : g.d->vcs.baseFrom);
+    if (!g.d->baseLabel.empty()) base = g.d->baseLabel;  // a revision picked in File History
+    else if (g.d->vcs.kind == VcsKind::Perforce) base = L"Depot  " + (g.d->vcs.baseFrom.empty() ? g.d->vcs.label : g.d->vcs.baseFrom);
     else if (g.d->vcs.kind == VcsKind::Git) base = L"Committed  HEAD (" + g.d->vcs.label + L")";
     else base = L"Base";
     side(0, left, kDepotCol, base);
-    side(left + sw, rc.right, kYoursCol, std::wstring(L"Yours  ") + (g.d->doc.modified() ? L"(unsaved)  " : L"") + g.d->path);
+    side(left + sw, editorRight, kYoursCol, std::wstring(L"Yours  ") + (g.d->doc.modified() ? L"(unsaved)  " : L"") + g.d->path);
 
     // Previous / next change: two 3D buttons above the strip.
     const int bs = std::min(H - MulDiv(8, g.dpi, 96), MulDiv(20, g.dpi, 96)), gap = MulDiv(4, g.dpi, 96);
@@ -1385,6 +1537,18 @@ void paintStatus(HWND hwnd) {
     DrawTextW(dc, g.statusLeft.c_str(), (int)g.statusLeft.size(), &t,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     paintTabs(dc);
+    if (!IsRectEmpty(&g.sideSplitRect)) {
+        const RECT& sr = g.sideSplitRect;
+        fillRect(dc, sr.left, sr.top, sr.right, sr.bottom, g.pal.face);
+        fillRect(dc, sr.left, sr.top, sr.left + 1, sr.bottom, g.pal.dark ? blend(RGB(255, 255, 255), g.pal.face, 18) : RGB(255, 255, 255));
+        fillRect(dc, sr.right - 1, sr.top, sr.right, sr.bottom, g.pal.border);
+        // A grip in the middle: three small raised squares.
+        const int cx = (sr.left + sr.right) / 2, cy = (sr.top + sr.bottom) / 2, k = std::max(2, MulDiv(2, g.dpi, 96));
+        for (int n = -1; n <= 1; n++) {
+            int y = cy + n * 3 * k;
+            fillRect(dc, cx - k / 2, y, cx - k / 2 + k, y + k, blend(g.pal.faceText, g.pal.face, 45));
+        }
+    }
     if (g.diffOn) {
         // Drawn off-screen at (0, 0), then copied below the tab bar.
         RECT cr;
@@ -1671,10 +1835,27 @@ void startVcsQuery(bool samePath) {
     }
     g.d->vcsPending = !g.d->path.empty();
     if (g.d->path.empty()) return;
-    std::wstring path = g.d->path;
+    std::wstring path = g.d->path, spec = g.d->baseSpec;
     HWND frame = g.frame;
-    std::thread([path, gen, frame]() {
+    std::thread([path, spec, gen, frame]() {
         VcsInfo* r = new VcsInfo(queryVcs(path, (size_t)kDiffMax));
+        if (!spec.empty() && r->kind != VcsKind::None) {
+            // A revision picked in File History is the base instead.
+            std::vector<u8> bytes;
+            std::wstring err;
+            if (fetchRevision(path, r->kind, spec, (size_t)kDiffMax, bytes, err)) {
+                r->base.swap(bytes);
+                r->haveBase = true;
+                r->tracked = true;
+                r->baseError.clear();
+            } else {
+                r->base.clear();
+                r->haveBase = false;
+                r->tracked = true;
+                r->baseError = err;
+            }
+            r->baseFrom = spec;
+        }
         if (!PostMessageW(frame, WM_APP_VCS, (WPARAM)gen, (LPARAM)r)) delete r;
     }).detach();
 }
@@ -1711,6 +1892,9 @@ void onVcsResult(unsigned gen, VcsInfo* raw) {
     }
     // Choices stay until the base revision changes (submit, revert, sync).
     if (g.d->baseText != oldBase) g.d->choices.clear();
+    // The latest revision may have moved (sync, submit): blame it again when needed.
+    g.d->blameLoaded = false;
+    g.d->localVersion = NPOS;
     g.d->hlBase = DocState::HlCache();
     recomputeDiff();
     g.d = active;
@@ -2341,6 +2525,27 @@ void paintStrip(HWND hwnd) {
             if (cy < bs || cy > H - bs) continue;
             const int total = 3 * bs + 2 * bgap;
             int x = (W - total) / 2;
+            // Who made the change, right above its buttons.
+            if (g.d->vcs.kind != VcsKind::None) {
+                const Owner o = changeOwner({sl.aStart, sl.aCount, sl.bStart, sl.bCount});
+                if (!o.who.empty()) {
+                    HGDIOBJ of = SelectObject(dc, g.uiFont);
+                    TEXTMETRICW tm;
+                    GetTextMetricsW(dc, &tm);
+                    const int lh = tm.tmHeight, px = MulDiv(1, g.dpi, 96), lines = o.detail.empty() ? 1 : 2;
+                    int ty = cy - bs / 2 - 3 * px - lines * lh;
+                    SetBkMode(dc, TRANSPARENT);
+                    RECT r1 = {2 * px, ty, W - 2 * px, ty + lh};
+                    SetTextColor(dc, fg);
+                    DrawTextW(dc, o.who.c_str(), -1, &r1, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                    if (lines == 2) {
+                        RECT r2 = {2 * px, ty + lh, W - 2 * px, ty + 2 * lh};
+                        SetTextColor(dc, blend(fg, bg, 60));
+                        DrawTextW(dc, o.detail.c_str(), -1, &r2, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                    }
+                    SelectObject(dc, of);
+                }
+            }
             const int order[3] = {kUseDepot, kUseBoth, kKeepYours};
             const Glyph glyphs[3] = {GLYPH_LEFT, GLYPH_BOTH, GLYPH_RIGHT};
             const COLORREF tints[3] = {kDepotCol, kAdded, kYoursCol};
@@ -2401,6 +2606,17 @@ LRESULT CALLBACK stripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEHWHEEL: return SendMessageW(g.view, msg, wp, lp);
     case WM_MOUSEMOVE: {
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (g.dragSplit == 1) {  // moving the middle: where the strip's left edge goes
+            POINT f = pt;
+            MapWindowPoints(hwnd, g.frame, &f, 1);
+            RECT rc;
+            GetClientRect(g.frame, &rc);
+            const int avail = (IsRectEmpty(&g.sideSplitRect) ? (int)rc.right : (int)g.sideSplitRect.left) - stripW();
+            if (avail > 0) g.diffSplit = std::clamp((double)(f.x - g.dragOffset) / avail, 0.05, 0.95);
+            layoutFrame();
+            UpdateWindow(g.frame);
+            return 0;
+        }
         int hunk, choice;
         hit(pt, hunk, choice);
         setHover(hunk, choice);
@@ -2416,7 +2632,9 @@ LRESULT CALLBACK stripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
-        break;
+        // Anywhere else the strip is the divider between the two sides.
+        SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+        return TRUE;
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
         // Pushed in while held; the choice applies on release, over the same button.
@@ -2425,13 +2643,26 @@ LRESULT CALLBACK stripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.pressChoice = g.hoverChoice;
             SetCapture(hwnd);
             InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (msg == WM_LBUTTONDBLCLK) {  // double click: both sides equal again
+            g.diffSplit = 0.5;
+            layoutFrame();
+            saveSettings();
         } else {
-            SetFocus(g.view);
+            g.dragSplit = 1;
+            g.dragOffset = GET_X_LPARAM(lp);
+            SetCapture(hwnd);
         }
         return 0;
     }
     case WM_LBUTTONUP: {
         if (GetCapture() != hwnd) return 0;
+        if (g.dragSplit == 1) {
+            g.dragSplit = 0;
+            ReleaseCapture();
+            saveSettings();
+            SetFocus(g.view);
+            return 0;
+        }
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         int hunk, choice;
         hit(pt, hunk, choice);
@@ -2444,6 +2675,7 @@ LRESULT CALLBACK stripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_CAPTURECHANGED:
+        if (g.dragSplit == 1) g.dragSplit = 0;
         if (g.pressHunk >= 0) {
             g.pressHunk = g.pressChoice = -1;
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -2688,6 +2920,23 @@ void gitChanges(std::vector<std::wstring>& shown, std::vector<std::wstring>& pat
 
 // Perforce: submit the changelist this file is open in (every file in it).
 // Git: commit every changed tracked file in the repository.
+// After a submit, commit or revert: every open tab asks again (the other
+// files of the changelist are no longer checked out, revisions moved on).
+void refreshAllTabsVcs() {
+    DocState* keep = g.d;
+    for (auto& t : g.tabs) {
+        if (t->path.empty()) continue;
+        g.d = t.get();
+        g.d->baseSpec.clear();  // "diff against #3" made sense before the submit, not after
+        g.d->baseLabel.clear();
+        g.d->p4Asked = false;
+        startVcsQuery(true);
+    }
+    g.d = keep;
+    refresh(false);
+    invalidateTabs();
+}
+
 void vcsCommit() {
     const bool git = g.d->vcs.kind == VcsKind::Git;
     if (!vcsReady(true)) return;
@@ -2724,7 +2973,7 @@ void vcsCommit() {
             return;
         }
         g.d->choices.clear();
-        startVcsQuery(true);
+        refreshAllTabsVcs();
         return;
     }
 
@@ -2794,6 +3043,210 @@ void vcsCommit() {
     g.d->choices.clear();
     // Submitting makes the file read-only again and may rewrite keywords.
     openPath(g.d->path, true);
+    refreshAllTabsVcs();  // the other files of the changelist, too
+}
+
+// ---- File History: every revision, diff against any, get any
+
+std::vector<Revision> g_history;
+
+std::wstring formatTime(long long t) {
+    if (t <= 0) return L"";
+    ULARGE_INTEGER u;
+    u.QuadPart = (ULONGLONG)t * 10000000ULL + 116444736000000000ULL;
+    FILETIME ft = {u.LowPart, u.HighPart};
+    SYSTEMTIME utc, local;
+    FileTimeToSystemTime(&ft, &utc);
+    SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
+    wchar_t b[32];
+    swprintf(b, 32, L"%04u-%02u-%02u %02u:%02u", local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute);
+    return b;
+}
+
+std::wstring firstLine(const std::wstring& s) {
+    size_t n = s.find_first_of(L"\r\n");
+    return n == std::wstring::npos ? s : s.substr(0, n);
+}
+
+int historySelection(HWND dlg) { return ListView_GetNextItem(GetDlgItem(dlg, IDC_H_LIST), -1, LVNI_SELECTED); }
+
+void diffAgainstRevision(const Revision& r) {
+    const bool p4 = g.d->vcs.kind == VcsKind::Perforce;
+    g.d->baseSpec = r.spec;
+    g.d->baseLabel = p4 ? L"Depot  #" + r.rev + L"  (change " + r.change + L", " + r.user + L", " + formatTime(r.time) + L")"
+                        : L"Commit  " + r.rev + L"  " + firstLine(r.desc) + L"  (" + r.user + L", " + formatTime(r.time) + L")";
+    startVcsQuery(true);
+    if (!g.diffOn) toggleDiff();
+    invalidateTabs();
+}
+
+void diffAgainstLatest() {
+    g.d->baseSpec.clear();
+    g.d->baseLabel.clear();
+    startVcsQuery(true);
+    if (!g.diffOn) toggleDiff();
+    invalidateTabs();
+}
+
+// Puts revision `r` of the file on disk and reopens it.
+// Perforce: p4 sync file#N (your workspace then has #N). Git: the file's
+// content at that commit is written over the working file.
+bool getRevision(HWND owner, const Revision& r) {
+    const bool p4 = g.d->vcs.kind == VcsKind::Perforce;
+    const std::wstring name = fileNameOf(g.d->path);
+    std::wstring what = p4 ? L"#" + r.rev + L" (change " + r.change + L")" : L"commit " + r.rev;
+    std::wstring msg = L"Replace " + name + L" with " + what + L"?";
+    const bool localChanges = g.d->doc.modified() || (p4 ? g.d->vcs.opened : !g.d->hunks.empty() && g.d->baseSpec.empty());
+    if (p4 && g.d->vcs.opened)
+        msg += L"\n\nThe file is checked out: it is reverted first, so your changes to it are lost.";
+    else if (localChanges)
+        msg += L"\n\nYour changes to it are lost.";
+    if (MessageBoxW(owner, msg.c_str(), L"Get Revision", MB_OKCANCEL | (localChanges ? MB_ICONWARNING : MB_ICONQUESTION)) != IDOK)
+        return false;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    bool ok = true;
+    if (p4) {
+        if (g.d->vcs.opened) ok = runVcs(p4Cmd() + L" revert " + quoted(g.d->path));
+        if (ok) ok = runVcs(p4Cmd() + L" sync " + quoted(g.d->path + L"#" + r.rev));
+    } else {
+        std::vector<u8> bytes;
+        std::wstring err;
+        ok = fetchRevision(g.d->path, VcsKind::Git, r.spec, 1u << 30, bytes, err);
+        if (ok) {
+            HANDLE h = CreateFileW((g.d->path + L".jn-tmp").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            DWORD put = 0;
+            ok = h != INVALID_HANDLE_VALUE && WriteFile(h, bytes.data(), (DWORD)bytes.size(), &put, nullptr) && put == bytes.size();
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            DWORD e2 = 0;
+            ok = ok && replaceFile(g.d->path + L".jn-tmp", g.d->path, e2);
+            if (!ok) DeleteFileW((g.d->path + L".jn-tmp").c_str());
+        }
+        if (!ok) MessageBoxW(owner, (L"Could not get " + what + L".\n\n" + err).c_str(), kAppName, MB_OK | MB_ICONERROR);
+    }
+    SetCursor(old);
+    if (!ok) return false;
+    g.d->choices.clear();
+    g.d->baseSpec.clear();
+    g.d->baseLabel.clear();
+    openPath(g.d->path, true);
+    return true;
+}
+
+INT_PTR CALLBACK historyProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
+    if (INT_PTR br = dialogTheme(dlg, msg, wp, lp)) return br;
+    switch (msg) {
+    case WM_INITDIALOG: {
+        const bool p4 = g.d->vcs.kind == VcsKind::Perforce;
+        SetDlgItemTextW(dlg, IDC_H_TITLE, g.d->path.c_str());
+        HWND lv = GetDlgItem(dlg, IDC_H_LIST);
+        ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        RECT rc;
+        GetClientRect(lv, &rc);
+        const int w = rc.right - GetSystemMetrics(SM_CXVSCROLL);
+        struct Col { const wchar_t* name; int pct; };
+        const Col cols[] = {{p4 ? L"Rev" : L"Commit", 9}, {p4 ? L"Change" : L"Author", p4 ? 9 : 16}, {L"Date", 17},
+                            {p4 ? L"User" : L"", p4 ? 12 : 0}, {L"Action", 9}, {L"Description", p4 ? 44 : 49}};
+        int ci = 0;
+        for (const Col& c : cols) {
+            if (!c.pct) continue;
+            LVCOLUMNW col = {};
+            col.mask = LVCF_TEXT | LVCF_WIDTH;
+            col.pszText = (LPWSTR)c.name;
+            col.cx = w * c.pct / 100;
+            ListView_InsertColumn(lv, ci++, &col);
+        }
+        int sel = 0;
+        for (size_t i = 0; i < g_history.size(); i++) {
+            const Revision& r = g_history[i];
+            std::wstring cells[] = {p4 ? L"#" + r.rev : r.rev, p4 ? r.change : r.user, formatTime(r.time), r.user, r.action,
+                                    firstLine(r.desc)};
+            LVITEMW it = {};
+            it.mask = LVIF_TEXT;
+            it.iItem = (int)i;
+            it.pszText = (LPWSTR)cells[0].c_str();
+            ListView_InsertItem(lv, &it);
+            int sub = 1;
+            for (int k = 1; k < 6; k++) {
+                if (!p4 && k == 3) continue;  // Git: the author is already in column 2
+                ListView_SetItemText(lv, (int)i, sub++, (LPWSTR)cells[k].c_str());
+            }
+            if (r.spec == g.d->baseSpec) sel = (int)i;  // the one being diffed against
+        }
+        if (!g_history.empty()) {
+            ListView_SetItemState(lv, sel, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(lv, sel, FALSE);
+        }
+        EnableWindow(GetDlgItem(dlg, IDC_H_LATEST), !g.d->baseSpec.empty());
+        SetFocus(lv);
+        return FALSE;
+    }
+    case WM_NOTIFY: {
+        NMHDR* nm = (NMHDR*)lp;
+        if (nm->idFrom != IDC_H_LIST) break;
+        if (nm->code == LVN_ITEMCHANGED) {
+            int i = historySelection(dlg);
+            std::wstring d;
+            if (i >= 0 && (size_t)i < g_history.size()) {
+                const Revision& r = g_history[(size_t)i];
+                d = r.desc;
+                // Edit controls need \r\n line breaks.
+                std::wstring out;
+                for (wchar_t c : d) {
+                    if (c == L'\n') out += L'\r';
+                    out += c;
+                }
+                d = out;
+            }
+            SetDlgItemTextW(dlg, IDC_H_DESC, d.c_str());
+        } else if (nm->code == NM_DBLCLK || nm->code == LVN_ITEMACTIVATE) {
+            PostMessageW(dlg, WM_COMMAND, IDC_H_DIFF, 0);
+        }
+        break;
+    }
+    case WM_COMMAND: {
+        int i = historySelection(dlg);
+        const bool have = i >= 0 && (size_t)i < g_history.size();
+        switch (LOWORD(wp)) {
+        case IDC_H_DIFF:
+            if (have) {
+                Revision r = g_history[(size_t)i];
+                EndDialog(dlg, 1);
+                diffAgainstRevision(r);
+            }
+            return TRUE;
+        case IDC_H_GET:
+            if (have && getRevision(dlg, g_history[(size_t)i])) EndDialog(dlg, 1);
+            return TRUE;
+        case IDC_H_LATEST:
+            EndDialog(dlg, 1);
+            diffAgainstLatest();
+            return TRUE;
+        case IDOK:
+            PostMessageW(dlg, WM_COMMAND, IDC_H_DIFF, 0);
+            return TRUE;
+        case IDCANCEL: EndDialog(dlg, 0); return TRUE;
+        }
+        break;
+    }
+    }
+    return FALSE;
+}
+
+void cmdHistory() {
+    if (g.d->vcs.kind == VcsKind::None || g.d->vcs.toolMissing || g.d->path.empty()) {
+        MessageBeep(MB_OK);
+        return;
+    }
+    std::wstring err;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    const bool ok = fileHistory(g.d->path, g.d->vcs.kind, g_history, err);
+    SetCursor(old);
+    if (!ok) {
+        MessageBoxW(g.frame, (L"No history for " + fileNameOf(g.d->path) + L".\n\n" + err).c_str(), kAppName,
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    DialogBoxParamW(g.inst, MAKEINTRESOURCEW(IDD_HISTORY), g.frame, historyProc, 0);
 }
 
 // Lists every file in the changelist of the open file (Git: every changed
@@ -2844,6 +3297,7 @@ void vcsRevertFile() {
     if (ok) {
         g.d->choices.clear();
         openPath(g.d->path, true);
+        refreshAllTabsVcs();
     }
 }
 
@@ -3636,6 +4090,8 @@ void loadSettings() {
     g.themeMode = (int)GetPrivateProfileIntW(L"view", L"theme", 0, f);
     g.highlight = GetPrivateProfileIntW(L"view", L"highlight", 1, f) != 0;
     g.sideOn = GetPrivateProfileIntW(L"view", L"sidePane", 1, f) != 0;
+    g.diffSplit = std::clamp((int)GetPrivateProfileIntW(L"view", L"diffSplit", 500, f), 50, 950) / 1000.0;
+    g.sideSplit = std::clamp((int)GetPrivateProfileIntW(L"view", L"sideSplit", 420, f), 100, 900) / 1000.0;
     if (g.themeMode < 0 || g.themeMode > 2) g.themeMode = 0;
     int w = (int)GetPrivateProfileIntW(L"window", L"w", 0, f);
     int h = (int)GetPrivateProfileIntW(L"window", L"h", 0, f);
@@ -3681,6 +4137,8 @@ void saveSettings() {
     putInt(L"view", L"theme", g.themeMode, f);
     putInt(L"view", L"highlight", g.highlight ? 1 : 0, f);
     putInt(L"view", L"sidePane", g.sideOn ? 1 : 0, f);
+    putInt(L"view", L"diffSplit", (int)(g.diffSplit * 1000 + 0.5), f);
+    putInt(L"view", L"sideSplit", (int)(g.sideSplit * 1000 + 0.5), f);
     WINDOWPLACEMENT wp = {};
     wp.length = sizeof(wp);
     if (GetWindowPlacement(g.frame, &wp)) {
@@ -4562,25 +5020,53 @@ void updatePreviewScrollbar() {
 
 // Scrolls the preview to where the editor is: the block holding the editor's
 // top line, plus how far into that block it is.
+// The preview and the editor are tied by blocks: block i covers source lines
+// [line_i, line_(i+1)) and preview rows [top_i, top_(i+1)); inside a block the
+// two are interpolated. Used both ways, so they scroll together like the diff.
+double previewYForLine(double line) {
+    const size_t n = g_mdBlocks.size();
+    if (!n) return 0;
+    for (size_t i = 0; i < n; i++) {
+        const double l0 = g_mdBlocks[i].line, l1 = i + 1 < n ? g_mdBlocks[i + 1].line : std::max<double>(l0 + 1, g_mdBlocks[i].lineEnd);
+        const double y0 = g_md.blockTop[i], y1 = i + 1 < n ? g_md.blockTop[i + 1] : g_md.height;
+        if (line < l0) return i == 0 ? y0 * (line / std::max(1.0, l0)) : y0;  // before the first block
+        if (line < l1) return y0 + (y1 - y0) * (line - l0) / std::max(1.0, l1 - l0);
+    }
+    return g_md.height;
+}
+
+double previewLineForY(double y) {
+    const size_t n = g_mdBlocks.size();
+    if (!n) return 0;
+    for (size_t i = 0; i < n; i++) {
+        const double y0 = g_md.blockTop[i], y1 = i + 1 < n ? g_md.blockTop[i + 1] : g_md.height;
+        const double l0 = g_mdBlocks[i].line, l1 = i + 1 < n ? g_mdBlocks[i + 1].line : std::max<double>(l0 + 1, g_mdBlocks[i].lineEnd);
+        if (y < y0) return i == 0 ? l0 * (y / std::max(1.0, y0)) : l0;
+        if (y < y1) return l0 + (l1 - l0) * (y - y0) / std::max(1.0, y1 - y0);
+    }
+    return g_mdBlocks.back().lineEnd;
+}
+
+// Editor moved: the preview follows.
 void syncPreviewToEditor() {
     if (!g.sidePreview || !IsWindowVisible(g.sidePreview) || !g.d->doc.linesKnown() || g_md.blockTop.empty()) return;
     const u64 top = g.d->doc.lineOf(g.d->top);
-    if (top == g.mdSyncedTop) return;  // the editor did not move: leave the preview where you put it
+    if (top == g.mdSyncedTop) return;  // already level (or the preview just moved the editor here)
     g.mdSyncedTop = top;
-    int y = 0;
-    for (size_t i = 0; i < g_mdBlocks.size(); i++) {
-        const MdBlock& b = g_mdBlocks[i];
-        if (b.line > top) break;
-        y = g_md.blockTop[i];
-        if (top < b.lineEnd && b.lineEnd > b.line) {
-            int next = i + 1 < g_md.blockTop.size() ? g_md.blockTop[i + 1] : g_md.height;
-            y += (int)((next - g_md.blockTop[i]) * (double)(top - b.line) / (b.lineEnd - b.line));
-            break;
-        }
-    }
-    g.mdScroll = std::max(0, y - MulDiv(18, g.dpi, 96));
+    g.mdScroll = std::max(0, (int)std::lround(previewYForLine((double)top)));
     updatePreviewScrollbar();
     InvalidateRect(g.sidePreview, nullptr, FALSE);
+}
+
+// Preview moved (wheel, scroll bar): the editor follows.
+void syncEditorToPreview() {
+    if (!g.d->doc.linesKnown() || g_md.blockTop.empty()) return;
+    const u64 last = g.d->doc.newlineCount();
+    const u64 line = std::min<u64>((u64)std::max(0.0, previewLineForY(g.mdScroll)), last);
+    g.mdSyncedTop = line;  // so the editor does not push the preview back
+    g.d->top = g.d->doc.lineStart(line);
+    g.d->topFill = 0;
+    refresh(false);
 }
 
 void paintPreview(HWND hwnd) {
@@ -4677,6 +5163,61 @@ void openLink(const std::string& url) {
     if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) openInTab(path);
 }
 
+// The divider between the editor and the side pane: drag it, double-click to reset.
+LRESULT CALLBACK splitProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        fillRect(dc, 0, 0, rc.right, rc.bottom, g.pal.face);
+        fillRect(dc, 0, 0, 1, rc.bottom, g.pal.dark ? blend(RGB(255, 255, 255), g.pal.face, 18) : RGB(255, 255, 255));
+        fillRect(dc, rc.right - 1, 0, rc.right, rc.bottom, g.pal.border);
+        // Grip: three small squares in the middle.
+        const int cx = rc.right / 2, cy = rc.bottom / 2, k = std::max(2, MulDiv(2, g.dpi, 96));
+        for (int n = -1; n <= 1; n++) fillRect(dc, cx - k / 2, cy + n * 3 * k, cx - k / 2 + k, cy + n * 3 * k + k, blend(g.pal.faceText, g.pal.face, 45));
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_SETCURSOR: SetCursor(LoadCursorW(nullptr, IDC_SIZEWE)); return TRUE;
+    case WM_LBUTTONDBLCLK:
+        g.sideSplit = 0.42;
+        layoutFrame();
+        saveSettings();
+        return 0;
+    case WM_LBUTTONDOWN:
+        g.dragSplit = 2;
+        g.dragOffset = GET_X_LPARAM(lp);
+        SetCapture(hwnd);
+        return 0;
+    case WM_MOUSEMOVE:
+        if (g.dragSplit == 2 && GetCapture() == hwnd) {
+            POINT f = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            MapWindowPoints(hwnd, g.frame, &f, 1);
+            RECT rc;
+            GetClientRect(g.frame, &rc);
+            // Where the divider's left edge goes; the pane gets everything right of it.
+            const int x = f.x - g.dragOffset;
+            if (rc.right > 0) g.sideSplit = std::clamp((double)(rc.right - x - splitW()) / rc.right, 0.1, 0.9);
+            layoutFrame();
+            UpdateWindow(g.frame);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (GetCapture() == hwnd) {
+            ReleaseCapture();
+            saveSettings();
+            SetFocus(g.view);
+        }
+        g.dragSplit = 0;
+        return 0;
+    case WM_CAPTURECHANGED: g.dragSplit = 0; return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
 LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_ERASEBKGND: return 1;
@@ -4692,6 +5233,7 @@ LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g.mdScroll -= GET_WHEEL_DELTA_WPARAM(wp) * step / WHEEL_DELTA;
         updatePreviewScrollbar();
         InvalidateRect(hwnd, nullptr, FALSE);
+        syncEditorToPreview();
         return 0;
     }
     case WM_VSCROLL: {
@@ -4708,9 +5250,12 @@ LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case SB_THUMBPOSITION: g.mdScroll = si.nTrackPos; break;
         case SB_TOP: g.mdScroll = 0; break;
         case SB_BOTTOM: g.mdScroll = g_md.height; break;
+        default: return 0;
         }
         updatePreviewScrollbar();
         InvalidateRect(hwnd, nullptr, FALSE);
+        syncEditorToPreview();
+        UpdateWindow(g.view);  // both move in the same frame while the thumb is dragged
         return 0;
     }
     case WM_SETCURSOR: {
@@ -5144,6 +5689,7 @@ HMENU buildMenu() {
     HMENU sc = CreatePopupMenu();
     AppendMenuW(sc, MF_STRING, IDM_DIFF, L"&Diff\tF8");
     AppendMenuW(sc, MF_STRING, IDM_VCS_FILES, L"&Open Changelist Files\tCtrl+Shift+O");
+    AppendMenuW(sc, MF_STRING, IDM_VCS_HISTORY, L"File &History...\tCtrl+Shift+H");
     AppendMenuW(sc, MF_STRING, IDM_VCS_COMMIT, L"&Submit Current Changelist...");
     AppendMenuW(sc, MF_STRING, IDM_VCS_REVERTFILE, L"&Revert Changes...");
     AppendMenuW(sc, MF_SEPARATOR, 0, nullptr);
@@ -5170,6 +5716,7 @@ HACCEL buildAccelerators() {
         {FVIRTKEY | FCONTROL | FSHIFT, VK_TAB, IDM_PREVTAB},
         {FVIRTKEY | FCONTROL | FSHIFT, 'O', IDM_VCS_FILES},
         {FVIRTKEY | FCONTROL | FSHIFT, 'V', IDM_SIDEVIEW},
+        {FVIRTKEY | FCONTROL | FSHIFT, 'H', IDM_VCS_HISTORY},
         {FVIRTKEY | FCONTROL, 'S', IDM_SAVE},
         {FVIRTKEY | FCONTROL | FSHIFT, 'S', IDM_SAVEAS},
         {FVIRTKEY | FCONTROL, 'Z', IDM_UNDO},
@@ -5238,24 +5785,34 @@ void layoutFrame() {
     if (g_findBar.wnd && fb) MoveWindow(g_findBar.wnd, 0, headerTop, rc.right, fb, TRUE);
     const int top = headerTop + fb;
     int left = 0;
+    int right = rc.right;
+    SetRectEmpty(&g.sideSplitRect);
+    if (g.sideSplitter && !sideVisible()) ShowWindow(g.sideSplitter, SW_HIDE);
+    if (sideVisible()) {
+        // The data view / preview on the right, after a divider you can drag.
+        const int min = MulDiv(160, g.dpi, 96), gap = splitW();
+        int sw = (int)(rc.right * g.sideSplit);
+        sw = std::clamp(sw, std::min(min, (int)rc.right / 2), std::max(0, (int)rc.right - min - gap));
+        right = rc.right - sw - gap;
+        g.sideSplitRect = {right, top, right + gap, h};
+        if (g.sideSplitter) {
+            MoveWindow(g.sideSplitter, right, top, gap, h - top, TRUE);
+            ShowWindow(g.sideSplitter, SW_SHOW);
+        }
+        // The data view's search box on top of its tree.
+        const int sb = barRowH();
+        if (g_dataBar.wnd) MoveWindow(g_dataBar.wnd, right + gap, top, sw, sb, TRUE);
+        MoveWindow(g.sideTree, right + gap, top + sb, sw, std::max(0, h - top - sb), TRUE);
+        MoveWindow(g.sidePreview, right + gap, top, sw, h - top, TRUE);
+    }
     if (g.diffOn) {
+        // The strip in the middle can be dragged: the left side gets diffSplit of the rest.
         int sw = stripW();
-        left = std::max(0, ((int)rc.right - sw) / 2);
+        const int avail = std::max(0, right - sw), min = MulDiv(120, g.dpi, 96);
+        left = std::clamp((int)(avail * g.diffSplit), std::min(min, avail / 2), std::max(0, avail - min));
         MoveWindow(g.diffPane, 0, top, left, h - top, TRUE);
         MoveWindow(g.strip, left, top, sw, h - top, TRUE);
         left += sw;
-    }
-    int right = rc.right;
-    if (sideVisible()) {
-        // The data view / preview takes about two fifths, on the right.
-        const int min = MulDiv(220, g.dpi, 96);
-        int sw = std::clamp((int)rc.right * 42 / 100, std::min(min, (int)rc.right / 2), std::max(0, (int)rc.right - min));
-        right = rc.right - sw;
-        // The data view's search box on top of its tree.
-        const int sb = barRowH();
-        if (g_dataBar.wnd) MoveWindow(g_dataBar.wnd, right, top, sw, sb, TRUE);
-        MoveWindow(g.sideTree, right, top + sb, sw, std::max(0, h - top - sb), TRUE);
-        MoveWindow(g.sidePreview, right, top, sw, h - top, TRUE);
     }
     g.sideShown = sideVisible();
     MoveWindow(g.view, left, top, right - left, h - top, TRUE);
@@ -5263,6 +5820,7 @@ void layoutFrame() {
     InvalidateRect(g.frame, &s, FALSE);
     RECT hd = {0, 0, rc.right, headerTop};
     InvalidateRect(g.frame, &hd, FALSE);
+    if (!IsRectEmpty(&g.sideSplitRect)) InvalidateRect(g.frame, &g.sideSplitRect, FALSE);
 }
 
 // ====================================================================== tabs
@@ -5585,6 +6143,7 @@ void showEditorMenu(POINT screen) {
     if (vcs || sideKind() != SIDE_NONE) sep(m);
     if (vcs) {
         item(m, IDM_DIFF, g.diffOn ? L"Hide &Diff\tF8" : L"Show &Diff\tF8");
+        item(m, IDM_VCS_HISTORY, L"File &History...\tCtrl+Shift+H", g.d->vcs.tracked);
         if (g.diffOn) item(m, IDM_REVERTCHANGE, L"Use Depot &Version of This Change\tCtrl+R", !g.d->hunks.empty());
     }
     if (sideKind() == SIDE_MD) item(m, IDM_SIDEVIEW, sideVisible() ? L"Hide Markdown &Preview\tCtrl+Shift+V" : L"Markdown &Preview\tCtrl+Shift+V");
@@ -5742,6 +6301,7 @@ void onCommand(int id) {
         saveSettings();
         break;
     case IDM_VCS_FILES: cmdChangelistFiles(); break;
+    case IDM_VCS_HISTORY: cmdHistory(); break;
     case IDM_ABOUT: DialogBoxParamW(g.inst, MAKEINTRESOURCEW(IDD_ABOUT), g.frame, aboutProc, 0); break;
     }
 }
@@ -5774,6 +6334,7 @@ void updateMenu() {
     en(IDM_VCS_REVERTFILE, vcs && g.d->vcs.tracked);
     en(IDM_VCS_REFRESH, !g.d->path.empty());
     en(IDM_VCS_FILES, vcs);
+    en(IDM_VCS_HISTORY, vcs && g.d->vcs.tracked);
     for (int k = 0; k < 3; k++)
         CheckMenuItem(g.menu, IDM_THEME_SYSTEM + k, MF_BYCOMMAND | (g.themeMode == k ? MF_CHECKED : MF_UNCHECKED));
 }
@@ -6082,6 +6643,7 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TreeView_SetExtendedStyle(g.sideTree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
         setupFindBar();
         setupDataBar();
+        g.sideSplitter = CreateWindowExW(0, kSplitClass, L"", WS_CHILD, 0, 0, 0, 0, hwnd, nullptr, g.inst, nullptr);
         g.sidePreview = CreateWindowExW(0, kPreviewClass, L"", WS_CHILD | WS_VSCROLL, 0, 0, 0, 0, hwnd, nullptr, g.inst, nullptr);
         return 0;
     case WM_ERASEBKGND: return 1;
@@ -6103,6 +6665,17 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_INITMENUPOPUP: updateMenu(); return 0;
+    case WM_SETCURSOR:
+        if ((HWND)wp == hwnd && LOWORD(lp) == HTCLIENT) {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            if (PtInRect(&g.sideSplitRect, pt) || g.dragSplit == 2) {
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                return TRUE;
+            }
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_MBUTTONUP: {
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         int i = tabAt(pt, nullptr);
@@ -6111,6 +6684,14 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MOUSEMOVE: {
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (g.dragSplit == 2) {  // moving the side divider
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            if (rc.right > 0) g.sideSplit = std::clamp((double)(rc.right - pt.x - splitW() / 2) / rc.right, 0.1, 0.9);
+            layoutFrame();
+            UpdateWindow(hwnd);
+            return 0;
+        }
         bool onX = false;
         int i = tabAt(pt, &onX);
         int x = onX ? i : -1;
@@ -6138,6 +6719,17 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (PtInRect(&g.sideSplitRect, pt)) {
+            if (msg == WM_LBUTTONDBLCLK) {  // double click: back to the usual width
+                g.sideSplit = 0.42;
+                layoutFrame();
+                saveSettings();
+            } else {
+                g.dragSplit = 2;
+                SetCapture(hwnd);
+            }
+            return 0;
+        }
         bool onX = false;
         int ti = tabAt(pt, &onX);
         if (ti >= 0 && !onX) {
@@ -6159,6 +6751,13 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_LBUTTONUP: {
         if (GetCapture() != hwnd) return 0;
+        if (g.dragSplit == 2) {
+            g.dragSplit = 0;
+            ReleaseCapture();
+            saveSettings();
+            SetFocus(g.view);
+            return 0;
+        }
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         const int closeTabIdx = g.tabClosePress, nav = g.navPress;
         g.tabClosePress = -1;
@@ -6175,6 +6774,7 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_CAPTURECHANGED:
+        if (g.dragSplit == 2) g.dragSplit = 0;
         if (g.tabClosePress >= 0 || g.navPress) {
             g.tabClosePress = -1;
             g.navPress = 0;
@@ -6209,6 +6809,7 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         return 0;
     case WM_APP_VCS: onVcsResult((unsigned)wp, (VcsInfo*)lp); return 0;
+    case WM_APP_BLAME: onBlame((unsigned)wp, (Blame*)lp); return 0;
     case WM_COPYDATA:
         onOpenFromOtherCopy((const COPYDATASTRUCT*)lp);
         return TRUE;
@@ -6339,6 +6940,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     WNDCLASSEXW fc = {};
     fc.cbSize = sizeof(fc);
     fc.lpfnWndProc = frameProc;
+    fc.style = CS_DBLCLKS;
     fc.hInstance = inst;
     fc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(IDI_APP));
     fc.hIconSm = fc.hIcon;
@@ -6364,10 +6966,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     RegisterClassExW(&dcl);
     dcl.lpfnWndProc = stripProc;
     dcl.lpszClassName = kStripClass;
+    dcl.style = CS_DBLCLKS;
     RegisterClassExW(&dcl);
+    dcl.style = 0;
     dcl.lpfnWndProc = previewProc;
     dcl.lpszClassName = kPreviewClass;
     RegisterClassExW(&dcl);
+    dcl.lpfnWndProc = splitProc;
+    dcl.lpszClassName = kSplitClass;
+    dcl.style = CS_DBLCLKS;
+    RegisterClassExW(&dcl);
+    dcl.style = 0;
     dcl.lpfnWndProc = barProc;
     dcl.lpszClassName = kBarClass;
     dcl.style = CS_DBLCLKS;

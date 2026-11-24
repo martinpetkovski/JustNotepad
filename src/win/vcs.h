@@ -64,6 +64,38 @@ struct VcsInfo {
 // file. Slow (starts processes, may talk to a server): call it off the UI thread.
 VcsInfo queryVcs(const std::wstring& path, size_t maxBase);
 
+// One revision of a file, for File History.
+struct Revision {
+    std::wstring rev;      // Perforce: "5"; Git: short hash
+    std::wstring change;   // Perforce changelist; Git: full hash
+    std::wstring user;
+    long long time = 0;    // seconds since 1970 (UTC)
+    std::wstring action;   // edit, add, delete, integrate ... / M, A, D, R
+    std::wstring desc;     // full description / commit message
+    std::wstring spec;     // what to fetch: "//depot/a.txt#5" or "<hash>:<path in repo>"
+};
+
+// Newest first. Runs git / p4: call off the UI thread for very long histories.
+bool fileHistory(const std::wstring& path, VcsKind kind, std::vector<Revision>& out, std::wstring& err, int max = 500);
+// The bytes of one revision (spec from fileHistory).
+bool fetchRevision(const std::wstring& path, VcsKind kind, const std::wstring& spec, size_t maxBytes,
+                   std::vector<jnp::u8>& out, std::wstring& err);
+
+// Who last changed each line of the latest revision (git blame HEAD / p4
+// annotate #have), with that revision's text so it can be matched against
+// what is being edited.
+struct BlameInfo {
+    std::wstring who, change;  // user; changelist number / short commit hash
+    long long time = 0;        // seconds since 1970 (UTC); 0 if unknown
+    std::wstring summary;      // first line of the description, when known
+};
+struct Blame {
+    std::vector<BlameInfo> infos;  // one per change / commit
+    std::vector<int> line;         // per line of the revision: index into infos
+    std::string text;              // the revision's text ('\n' line ends)
+};
+bool blameFile(const std::wstring& path, VcsKind kind, Blame& out, std::wstring& err);
+
 // Every value of `key` in `p4 -ztag` output, in order.
 std::vector<std::string> ztagAll(const std::string& out, const char* key);
 

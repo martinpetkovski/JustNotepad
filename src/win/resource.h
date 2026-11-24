@@ -93,3 +93,11 @@
 #define IDM_VCS_REFRESH 1408
 #define IDM_VCS_CONNECT 1409
 #define IDM_VCS_FILES 1410
+#define IDM_VCS_HISTORY 1411
+#define IDD_HISTORY 150
+#define IDC_H_LIST 151
+#define IDC_H_DESC 152
+#define IDC_H_DIFF 153
+#define IDC_H_GET 154
+#define IDC_H_LATEST 155
+#define IDC_H_TITLE 156
