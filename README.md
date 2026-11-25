@@ -33,6 +33,11 @@ Prefer no installer? [Download the zip](https://github.com/martinpetkovski/JustN
 - **Light and dark**, following Windows or chosen in View > Theme. Square, late-90s bevels with a modern palette. No rounded corners. Anywhere.
 - **Visual Studio keys**: Ctrl+X / Ctrl+C on nothing takes the whole line, Alt+Up / Down moves lines, Ctrl+D duplicates, Ctrl+L / Ctrl+Shift+L cut / delete a line, Ctrl+Enter / Ctrl+Shift+Enter open a line above / below, Tab / Shift+Tab indent, Ctrl+U / Ctrl+Shift+U change case, Ctrl+] matching bracket, Ctrl+F3 next occurrence.
 - UTF-8, UTF-16 and ANSI files, binary data preserved byte for byte, CRLF / LF kept as found, unlimited undo, find and replace, go to line, word wrap, zoom, any font.
+- **Multiple carets**: Ctrl+Alt+click adds one, Shift+Alt+. adds the next match, Shift+Alt+; every match. Alt+drag or Shift+Alt+arrows select a column. Typing, Backspace, Delete, arrows, Home / End, copy, cut and paste work on all of them; Esc goes back to one.
+- **Brackets and indent**: the bracket at the caret and its partner are boxed. Enter after `{`, `[`, `(` (or `:` in Python) indents one level and puts a closing bracket on its own line; typing a closing bracket on a blank line lines it up with its opening one.
+- **Reloads files changed on disk** (sync, checkout, another editor); asks first if you have unsaved edits.
+- **Encoding and line endings**: click the status bar or use File > Encoding / Line Endings to save as UTF-8, UTF-8 with BOM, UTF-16 LE / BE or ANSI, reinterpret a misdetected file, or convert CRLF / LF.
+- File > Open Recent, File > Print (Ctrl+P, also to PDF), View > Show Whitespace, Edit > Line > Sort Lines / Remove Duplicate Lines / Trim Trailing Whitespace.
 
 ## Version control
 

@@ -77,6 +77,11 @@ public:
     bool redo(u64& caret);
 
     bool modified() const;
+
+    // Called after every change to the text (typing, undo, redo), with the
+    // offset, the bytes removed and the bytes inserted there. Lets the editor
+    // keep extra carets and folded regions in place.
+    std::function<void(u64 pos, u64 removed, u64 inserted)> onEdit;
     void markSaved();
 
     // ---- search (bytes; case-insensitivity is ASCII only) ----

@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "../core/diff.h"
+#include "../core/csv.h"
 #include "../core/datatree.h"
 #include "../core/highlight.h"
 #include "../core/markdown.h"
@@ -63,6 +64,8 @@ const wchar_t* const kDiffClass = L"JustNotepadDiff";
 const wchar_t* const kStripClass = L"JustNotepadDiffStrip";
 const wchar_t* const kPreviewClass = L"JustNotepadPreview";
 const wchar_t* const kSplitClass = L"JustNotepadSplitter";
+const wchar_t* const kHexClass = L"JustNotepadHex";
+const wchar_t* const kCsvClass = L"JustNotepadTable";
 
 #define JN_WIDEN2(x) L##x
 #define JN_WIDEN(x) JN_WIDEN2(x)
@@ -81,8 +84,9 @@ const u64 kDiffMax = 16ull << 20;
 const u64 kDiffInstant = 256u << 10;
 
 const UINT WM_APP_INDEX = WM_APP + 1, WM_APP_VCS = WM_APP + 2, WM_APP_P4ASK = WM_APP + 3,
-           WM_APP_P4EDITED = WM_APP + 4, WM_APP_BLAME = WM_APP + 5;
-const UINT_PTR kTimerBlink = 1, kTimerIndex = 2, kTimerDrag = 3, kTimerDiff = 4, kTimerSession = 5, kTimerSide = 6;
+           WM_APP_P4EDITED = WM_APP + 4, WM_APP_BLAME = WM_APP + 5, WM_APP_DISKCHECK = WM_APP + 6;
+const UINT_PTR kTimerBlink = 1, kTimerIndex = 2, kTimerDrag = 3, kTimerDiff = 4, kTimerSession = 5, kTimerSide = 6,
+                kTimerDisk = 7;
 
 const COLORREF kAdded = RGB(40, 160, 70), kChanged = RGB(40, 110, 220), kRemoved = RGB(210, 60, 60);
 // The two sides of the diff, as in P4Merge: the depot / committed version on
@@ -184,9 +188,36 @@ struct DocState {
     // Diff against a chosen revision (File History) instead of #have / HEAD.
     std::wstring baseSpec, baseLabel;
 
+    bool binary = false;    // looks like binary data: the hex view opens with it
+    bool forceHex = false;  // View > Show as Hex
+
     // Session backup of unsaved text (see saveSession).
     std::wstring backupName;
     u64 backupVersion = NPOS;
+
+    // Extra carets / selections (Ctrl+Alt+click, Shift+Alt+., Alt+drag). The
+    // main one stays in caret/anchor.
+    // `pad`: the caret sits that many columns past the end of its line
+    // (column selection over short lines); typing there fills in spaces first.
+    struct Sel { u64 caret, anchor; int pad = 0; };
+    std::vector<Sel> extra;
+    int caretPad = 0;  // the same for the main caret
+
+    // The file on disk as we last read or wrote it, to notice outside changes.
+    FILETIME diskTime = {};
+    u64 diskSize = 0;
+    bool diskKnown = false;
+
+    DocState() {
+        // Keep extra carets on the same text while it changes.
+        doc.onEdit = [this](u64 pos, u64 removed, u64 inserted) {
+            auto map = [&](u64 x) { return x < pos ? x : x < pos + removed ? pos : x - removed + inserted; };
+            for (Sel& e : extra) {
+                e.caret = map(e.caret);
+                e.anchor = map(e.anchor);
+            }
+        };
+    }
 };
 
 struct ClosedTab {
@@ -263,6 +294,8 @@ struct App {
     int dragSplit = 0, dragOffset = 0;
     RECT sideSplitRect = {};
     HWND sideSplitter = nullptr;
+    HWND sideHex = nullptr, sideCsv = nullptr;
+    int hexShift = 0;
     struct IconHit { RECT rc; int hunk, choice; };
     std::vector<IconHit> icons;      // choice buttons as last painted in the strip
     int hoverHunk = -1, hoverChoice = -1;
@@ -274,6 +307,14 @@ struct App {
     bool diffOn = false, wrapBeforeDiff = false;
     int updatePct = -1;        // update download progress, -1 when none
 
+    // editor extras
+    bool showWs = false;             // View > Show Whitespace
+    bool boxActive = false, boxDrag = false, altClicked = false;
+    u64 boxL0 = 0, boxL1 = 0;        // column (box) selection: lines and columns of its corners
+    int boxC0 = 0, boxC1 = 0;
+    std::vector<std::wstring> recent;  // File > Open Recent, newest first
+    HMENU recentMenu = nullptr, encMenu = nullptr, eolMenu = nullptr;
+
     std::wstring statusLeft, statusRight, title;
     u64 gotoLine = 0;
 };
@@ -283,6 +324,9 @@ unsigned g_gen = 0;  // source of unique ids for background work replies
 
 INT_PTR dialogTheme(HWND dlg, UINT msg, WPARAM wp, LPARAM lp);
 void scrollRows(int n);
+void syncHexToEditor();
+void hexScrollbar();
+void syncCsvToEditor();
 void saveSettings();
 std::wstring formatTime(long long t);
 bool findBarOpen();
@@ -317,6 +361,27 @@ COLORREF fillTintOf(COLORREF c);
 COLORREF edgeOf(COLORREF c);
 COLORREF fillerColorB(u64 line);
 void cmdChangelistFiles();
+bool multi();
+void clearExtras();
+void multiInsert(const std::string& t);
+bool multiKey(WPARAM vk, bool ctrl, bool shift);
+bool multiCopy();
+void multiPaste(std::string s);
+std::vector<std::pair<u64, u64>> selRanges();
+void editEach(const std::function<void(DocState::Sel&, size_t)>& f);
+void eraseSel(DocState::Sel& s);
+std::string newlineText(u64 at, size_t& caretOff);
+bool outdentCloser(u32 cp);
+bool bracketPair(u64& a, u64& b);
+void noteDiskState();
+void addRecent(const std::wstring& path);
+void rebuildRecentMenu();
+void checkDisk(bool mayAsk);
+void addCaretAt(u64 p);
+void boxRebuild();
+bool boxPoint(int x, int y, u64& line, int& col);
+void showEncodingMenu(POINT screen);
+void detectLang();
 bool isWordByte(u8 b);
 bool findNext(bool down);
 
@@ -664,7 +729,10 @@ void updateStatus() {
         swprintf(b, 256, L"Col %d    Counting lines\x2026 %d%%", col, pct);
         left = b;
     }
-    if (hasSel()) {
+    if (multi()) {
+        swprintf(b, 256, L"    %llu carets", (unsigned long long)g.d->extra.size() + 1);
+        left += b;
+    } else if (hasSel()) {
         swprintf(b, 256, L"    %llu bytes selected", (unsigned long long)(selMax() - selMin()));
         left += b;
     }
@@ -677,7 +745,12 @@ void updateStatus() {
     }
     std::wstring langText;
     if (g.highlight && g.d->lang) langText = widenUtf8(langName(g.d->lang)) + L"      ";
-    std::wstring right = upd + vcsText() + langText + humanSize(g.d->doc.size()) + L"      " + encNames[g.d->enc] + L"      " +
+    std::wstring zoom;
+    if (g.fontPt != 11) {
+        swprintf(b, 256, L"%d%%      ", (g.fontPt * 100 + 5) / 11);
+        zoom = b;
+    }
+    std::wstring right = upd + vcsText() + langText + zoom + humanSize(g.d->doc.size()) + L"      " + encNames[g.d->enc] + L"      " +
                          (g.d->crlf ? L"Windows (CRLF)" : L"Unix (LF)");
     if (left != g.statusLeft || right != g.statusRight) {
         g.statusLeft = left;
@@ -788,6 +861,15 @@ void refresh(bool followCaret) {
     if (g.sideShown && g.sidePreview && IsWindowVisible(g.sidePreview)) {
         InvalidateRect(g.sidePreview, nullptr, FALSE);  // laid out again if the text changed
         syncPreviewToEditor();
+    }
+    if (g.sideShown && g.sideHex && IsWindowVisible(g.sideHex)) {
+        syncHexToEditor();
+        hexScrollbar();
+        InvalidateRect(g.sideHex, nullptr, FALSE);
+    }
+    if (g.sideShown && g.sideCsv && IsWindowVisible(g.sideCsv)) {
+        syncCsvToEditor();
+        InvalidateRect(g.sideCsv, nullptr, FALSE);  // re-read if the text changed
     }
 }
 
@@ -1182,6 +1264,29 @@ Owner changeOwner(const Hunk& h) {
 }
 
 
+// View > Show Whitespace: a dot for each space, an arrow for each tab.
+void paintWhitespace(HDC dc, const Row& r, int y, const LayoutCfg& c) {
+    const u64 n = std::min<u64>(r.end - r.start, 16384);
+    const std::string b = g.d->doc.text(r.start, n);
+    SetTextColor(dc, blend(g.pal.fg, g.pal.bg, 30));
+    const int maxCol = g.d->hcol + g.visCols + 1;
+    int col = 0;
+    u64 i = 0;
+    while (i < n && col < maxCol) {
+        u32 cp;
+        const int len = decodeChar((const u8*)b.data() + i, n - i, c.ansi, cp);
+        const int w = cellsFor(cp, col, c.tabw);
+        if ((cp == ' ' || cp == '\t') && col >= g.d->hcol) {
+            const int x = g.gutterPx + (col - g.d->hcol) * g.cw;
+            RECT rc = {x, y, x + (cp == ' ' ? g.cw : std::max(g.cw, w * g.cw)), y + g.ch};
+            DrawTextW(dc, cp == ' ' ? L"\x00B7" : L"\x2192", 1, &rc,
+                      (cp == ' ' ? DT_CENTER : DT_LEFT) | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_NOCLIP);
+        }
+        col += w;
+        i += (u64)std::max(1, len);
+    }
+}
+
 void paintView(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC wdc = BeginPaint(hwnd, &ps);
@@ -1199,8 +1304,13 @@ void paintView(HWND hwnd) {
     HGDIOBJ oldFont = SelectObject(dc, g.font);
     SetBkMode(dc, TRANSPARENT);
 
-    const u64 s = selMin(), e = selMax();
     const bool linesOk = g.d->doc.linesKnown();
+    // Every selection and caret (more than one with multiple carets).
+    std::vector<std::pair<u64, u64>> selList = multi() ? selRanges() : std::vector<std::pair<u64, u64>>{{selMin(), selMax()}};
+    std::vector<std::pair<u64, int>> caretList{{g.d->caret, g.d->caretPad}};
+    for (auto& x : g.d->extra) caretList.push_back({x.caret, x.pad});
+    u64 brA = NPOS, brB = NPOS;  // the bracket at the caret and its partner
+    if (!hasSel() && !multi() && !bracketPair(brA, brB)) brA = brB = NPOS;
     if (g.diffOn) startBlame();
     HlPainter hp;
     if (hlOn() && linesOk) {
@@ -1283,10 +1393,10 @@ void paintView(HWND hwnd) {
             SetTextColor(dc, dim);
             DrawTextW(dc, nb, k, &grc, DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
         }
-        // What the next row is: a new line (number it) or a wrap continuation.
-
         paintRowMatches(dc, r, y, c);
-        if (s < e && e > r.start && s < r.next) {
+        for (const auto& se : selList) {
+            const u64 s = se.first, e = se.second;
+            if (!(s < e && e > r.start && s < r.next)) continue;
             int c0 = s <= r.start ? 0 : colOf(g.d->doc, r, s, c);
             int c1 = e > r.end ? colOf(g.d->doc, r, r.end, c) + 1 : colOf(g.d->doc, r, e, c);
             int x0 = g.gutterPx + (c0 - g.d->hcol) * g.cw;
@@ -1299,12 +1409,36 @@ void paintView(HWND hwnd) {
                 ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &src, L"", 0, nullptr);
             }
         }
+        // Column selection: the whole rectangle, the empty space past short lines included.
+        if (g.boxActive && g.boxC0 != g.boxC1 && startsLine && linesOk) {
+            const u64 ln = lineNo - 1;
+            if (ln >= std::min(g.boxL0, g.boxL1) && ln <= std::max(g.boxL0, g.boxL1)) {
+                const int x0 = std::max(g.gutterPx, g.gutterPx + (std::min(g.boxC0, g.boxC1) - g.d->hcol) * g.cw);
+                const int x1 = std::min(g.cliW, g.gutterPx + (std::max(g.boxC0, g.boxC1) - g.d->hcol) * g.cw);
+                if (x1 > x0) fillRect(dc, x0, y, x1, y + g.ch, selBg);
+            }
+        }
+        // Matching brackets: a light square around each.
+        for (u64 bp : {brA, brB}) {
+            if (bp == NPOS || bp < r.start || bp >= r.end) continue;
+            const int x = g.gutterPx + (colOf(g.d->doc, r, bp, c) - g.d->hcol) * g.cw;
+            if (x < g.gutterPx || x >= g.cliW) continue;
+            const COLORREF edge = blend(fg, bg, 45);
+            fillRect(dc, x, y, x + g.cw, y + g.ch, blend(fg, bg, 12));
+            fillRect(dc, x, y, x + g.cw, y + 1, edge);
+            fillRect(dc, x, y + g.ch - 1, x + g.cw, y + g.ch, edge);
+            fillRect(dc, x, y, x + 1, y + g.ch, edge);
+            fillRect(dc, x + g.cw - 1, y, x + g.cw, y + g.ch, edge);
+        }
         SetTextColor(dc, fg);
         drawRowText(dc, g.d->doc, r, g.gutterPx, g.cliW, y, g.d->hcol, g.visCols, c,
                     hlOn() && linesOk ? hp.row(lineNo - 1, r.start, r.end) : nullptr);
+        if (g.showWs && r.end > r.start) paintWhitespace(dc, r, y, c);
 
-        if (g.focused && g.caretOn && rowHas(g.d->doc, r, g.d->caret)) {
-            int col = colOf(g.d->doc, r, g.d->caret, c);
+        for (const auto& cp : caretList) {
+            const u64 cpos = cp.first;
+            if (!(g.focused && g.caretOn && rowHas(g.d->doc, r, cpos))) continue;
+            int col = colOf(g.d->doc, r, cpos, c) + cp.second;
             int x = g.gutterPx + (col - g.d->hcol) * g.cw;
             if (x >= g.gutterPx && x < g.cliW) {
                 RECT crc = {x, y, x + std::max(1, MulDiv(2, g.dpi, 96)), y + g.ch};
@@ -1579,6 +1713,7 @@ void paintStatus(HWND hwnd) {
 // ====================================================================== caret and editing
 
 void moveCaret(u64 pos, bool extend, bool keepWantCol = false) {
+    g.boxActive = false;
     g.d->caret = std::min(pos, g.d->doc.size());
     if (!extend) g.d->anchor = g.d->caret;
     if (!keepWantCol) g.d->wantCol = -1;
@@ -1631,18 +1766,17 @@ void moveVertical(int rowsDelta, bool extend, bool scrollToo) {
     moveCaret(posOfCol(g.d->doc, r, g.d->wantCol, c), extend, true);
 }
 
+// Enter: a line break with the indent (see newlineText), at every caret.
 void typeNewline() {
-    LayoutCfg c = cfg();
-    std::string s = g.d->crlf ? "\r\n" : "\n";
-    // Auto-indent: repeat the leading whitespace of the current line.
-    u64 at = selMin();
-    u64 ls = lineStartBefore(g.d->doc, at, c);
-    u8 lead[256];
-    u64 n = g.d->doc.copy(ls, lead, std::min<u64>(sizeof(lead), at - ls));
-    for (u64 i = 0; i < n && (lead[i] == ' ' || lead[i] == '\t'); i++) s += (char)lead[i];
-    g.d->doc.breakCoalesce();
-    replaceSel((const u8*)s.data(), s.size(), false);
-    g.d->doc.breakCoalesce();
+    editEach([](DocState::Sel& s, size_t) {
+        s.pad = 0;
+        eraseSel(s);
+        const u64 at = s.caret;
+        size_t off = 0;
+        const std::string t = newlineText(at, off);
+        g.d->doc.insert(at, (const u8*)t.data(), t.size());
+        s.caret = s.anchor = at + off;
+    });
 }
 
 void typeChar(u32 cp) {
@@ -1664,10 +1798,19 @@ void typeChar(u32 cp) {
     } else {
         n = (u64)utf8Encode(cp, b);
     }
+    if (multi()) {
+        multiInsert(std::string((const char*)b, (size_t)n));
+        return;
+    }
+    if (outdentCloser(cp)) return;
     replaceSel(b, n, true);
 }
 
 void deleteSel() {
+    if (multi()) {
+        multiInsert("");
+        return;
+    }
     if (!hasSel()) return;
     u64 a = selMin();
     g.d->doc.erase(a, selMax() - a);
@@ -1744,6 +1887,7 @@ void copyLines(bool cut) {
 }
 
 void doCopy() {
+    if (multi() && multiCopy()) return;
     if (!hasSel()) {  // no selection: copy the whole line, like Visual Studio
         copyLines(false);
         return;
@@ -1771,6 +1915,10 @@ void doPaste() {
     const bool lines = IsClipboardFormatAvailable(lineClipFormat()) != 0;
     CloseClipboard();
     if (s.empty()) return;
+    if (multi()) {
+        multiPaste(s);
+        return;
+    }
     normalizeEol(s, g.d->crlf);
     if (lines && !hasSel() && g.d->doc.linesKnown()) {
         // A whole-line copy pastes above the caret's line; the caret keeps its column.
@@ -2007,6 +2155,11 @@ bool openPath(const std::wstring& path, bool keepView) {
     g.d->enc = enc;
     g.d->crlf = crlf;
     if (!keepView) resetViewState();
+    // Binary: a NUL byte near the start (text files do not have them).
+    g.d->binary = len && memchr(text, 0, (size_t)std::min<u64>(len, 64u << 10)) != nullptr;
+    g.d->extra.clear();
+    g.boxActive = false;
+    noteDiskState();
     detectLang();
     startVcsQuery(samePath);
     refresh(false);
@@ -2022,6 +2175,8 @@ void newDocument() {
     g.d->path.clear();
     g.d->enc = FE_UTF8;
     g.d->crlf = true;
+    g.d->extra.clear();
+    g.d->diskKnown = false;
     resetViewState();
     startVcsQuery(false);
     refresh(false);
@@ -2188,6 +2343,8 @@ bool saveTo(const std::wstring& path) {
         g.d->doc.markSaved();
         startVcsQuery(samePath);
     }
+    noteDiskState();
+    addRecent(path);
     SetCursor(oldCur);
     refresh(false);
     return true;
@@ -4090,6 +4247,14 @@ void loadSettings() {
     g.themeMode = (int)GetPrivateProfileIntW(L"view", L"theme", 0, f);
     g.highlight = GetPrivateProfileIntW(L"view", L"highlight", 1, f) != 0;
     g.sideOn = GetPrivateProfileIntW(L"view", L"sidePane", 1, f) != 0;
+    g.showWs = GetPrivateProfileIntW(L"view", L"whitespace", 0, f) != 0;
+    g.recent.clear();
+    for (int i = 0; i < 12; i++) {
+        wchar_t key[16], val[MAX_PATH * 4];
+        swprintf(key, 16, L"f%d", i);
+        GetPrivateProfileStringW(L"recent", key, L"", val, MAX_PATH * 4, f);
+        if (val[0]) g.recent.push_back(val);
+    }
     g.diffSplit = std::clamp((int)GetPrivateProfileIntW(L"view", L"diffSplit", 500, f), 50, 950) / 1000.0;
     g.sideSplit = std::clamp((int)GetPrivateProfileIntW(L"view", L"sideSplit", 420, f), 100, 900) / 1000.0;
     if (g.themeMode < 0 || g.themeMode > 2) g.themeMode = 0;
@@ -4137,6 +4302,8 @@ void saveSettings() {
     putInt(L"view", L"theme", g.themeMode, f);
     putInt(L"view", L"highlight", g.highlight ? 1 : 0, f);
     putInt(L"view", L"sidePane", g.sideOn ? 1 : 0, f);
+    putInt(L"view", L"whitespace", g.showWs ? 1 : 0, f);
+
     putInt(L"view", L"diffSplit", (int)(g.diffSplit * 1000 + 0.5), f);
     putInt(L"view", L"sideSplit", (int)(g.sideSplit * 1000 + 0.5), f);
     WINDOWPLACEMENT wp = {};
@@ -4366,6 +4533,966 @@ void gotoBracket(bool select) {
     refresh(true);
 }
 
+// ====================================================================== multiple carets
+//
+// The main caret is g.d->caret / anchor; any others are in g.d->extra. Edits
+// apply to every one of them as a single undo step; the document's edit hook
+// keeps all of them on the same text as it changes.
+
+bool multi() { return !g.d->extra.empty(); }
+
+void clearExtras() {
+    g.boxActive = false;
+    g.d->caretPad = 0;
+    if (g.d->extra.empty()) return;
+    g.d->extra.clear();
+    InvalidateRect(g.view, nullptr, FALSE);
+}
+
+// Sorts the carets and merges ones that touch; the main caret stays main.
+void normalizeSels() {
+    if (g.d->extra.empty()) return;
+    struct S { u64 caret, anchor; bool main; int pad; };
+    std::vector<S> v;
+    v.push_back({g.d->caret, g.d->anchor, true, g.d->caretPad});
+    for (auto& e : g.d->extra) v.push_back({e.caret, e.anchor, false, e.pad});
+    auto lo = [](const S& x) { return std::min(x.caret, x.anchor); };
+    auto hi = [](const S& x) { return std::max(x.caret, x.anchor); };
+    std::sort(v.begin(), v.end(), [&](const S& a, const S& b) { return lo(a) < lo(b); });
+    std::vector<S> out;
+    for (const S& x : v) {
+        if (!out.empty() && (lo(x) < hi(out.back()) || (lo(x) == hi(out.back()) && (x.caret == x.anchor || out.back().caret == out.back().anchor)))) {
+            S& m = out.back();
+            const u64 a = std::min(lo(m), lo(x)), b = std::max(hi(m), hi(x));
+            const bool fwd = m.caret >= m.anchor;
+            m.anchor = fwd ? a : b;
+            m.caret = fwd ? b : a;
+            m.main = m.main || x.main;
+            continue;
+        }
+        out.push_back(x);
+    }
+    g.d->extra.clear();
+    for (const S& x : out) {
+        if (x.main) {
+            g.d->caret = x.caret;
+            g.d->anchor = x.anchor;
+            g.d->caretPad = x.pad;
+        } else {
+            g.d->extra.push_back({x.caret, x.anchor, x.pad});
+        }
+    }
+}
+
+// Runs `f` on every caret (the main one included), from the last in the text
+// to the first, as one undo step. `f` gets the caret and its index in text
+// order; it edits the document around it and may set where it ends up.
+void editEach(const std::function<void(DocState::Sel&, size_t)>& f) {
+    auto& ex = g.d->extra;
+    ex.push_back({g.d->caret, g.d->anchor, g.d->caretPad});
+    const size_t mainIdx = ex.size() - 1;
+    std::vector<size_t> order(ex.size());
+    for (size_t i = 0; i < order.size(); i++) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return std::min(ex[a].caret, ex[a].anchor) < std::min(ex[b].caret, ex[b].anchor);
+    });
+    g.d->doc.breakCoalesce();
+    g.d->doc.beginGroup();
+    for (size_t k = order.size(); k-- > 0;) f(ex[order[k]], k);
+    g.d->doc.endGroup();
+    g.d->doc.breakCoalesce();
+    g.d->caret = ex[mainIdx].caret;
+    g.d->anchor = ex[mainIdx].anchor;
+    g.d->caretPad = ex[mainIdx].pad;
+    ex.erase(ex.begin() + (std::ptrdiff_t)mainIdx);
+    g.boxActive = false;  // the text moved under the box
+    normalizeSels();
+    g.d->wantCol = -1;
+    g.caretOn = true;
+    refresh(true);
+}
+
+// Moves every caret; `to` maps one caret to its new place.
+void moveEach(bool extend, const std::function<u64(const DocState::Sel&)>& to) {
+    auto one = [&](u64& caret, u64& anchor) {
+        DocState::Sel s{caret, anchor};
+        caret = std::min(to(s), g.d->doc.size());
+        if (!extend) anchor = caret;
+    };
+    one(g.d->caret, g.d->anchor);
+    for (auto& e : g.d->extra) {
+        one(e.caret, e.anchor);
+        e.pad = 0;
+    }
+    g.d->caretPad = 0;
+    g.boxActive = false;
+    normalizeSels();
+    g.d->wantCol = -1;
+    g.caretOn = true;
+    g.d->doc.breakCoalesce();
+    refresh(true);
+}
+
+void eraseSel(DocState::Sel& s) {
+    const u64 a = std::min(s.caret, s.anchor), b = std::max(s.caret, s.anchor);
+    if (b > a) g.d->doc.erase(a, b - a);
+}
+
+// Text for a caret: spaces first when it sits past the end of its line.
+std::string padded(DocState::Sel& s, const std::string& t) {
+    const int pad = s.caret == s.anchor ? s.pad : 0;
+    s.pad = 0;
+    if (t.empty() || pad <= 0) return t;
+    return std::string((size_t)pad, ' ') + t;
+}
+
+void multiInsert(const std::string& t) {
+    editEach([&](DocState::Sel& s, size_t) {
+        const std::string u = padded(s, t);
+        eraseSel(s);
+        if (!u.empty()) g.d->doc.insert(s.caret, (const u8*)u.data(), u.size());
+    });
+}
+
+// The arrow keys, Home, End, Backspace and Delete with several carets.
+bool multiKey(WPARAM vk, bool ctrl, bool shift) {
+    LayoutCfg c = cfg();
+    Doc& d = g.d->doc;
+    auto selLo = [](const DocState::Sel& s) { return std::min(s.caret, s.anchor); };
+    auto selHi = [](const DocState::Sel& s) { return std::max(s.caret, s.anchor); };
+    switch (vk) {
+    case VK_LEFT:
+        moveEach(shift, [&](const DocState::Sel& s) {
+            if (s.caret != s.anchor && !shift && !ctrl) return selLo(s);
+            return ctrl ? wordLeft(d, s.caret, c) : prevChar(d, s.caret, c);
+        });
+        return true;
+    case VK_RIGHT:
+        moveEach(shift, [&](const DocState::Sel& s) {
+            if (s.caret != s.anchor && !shift && !ctrl) return selHi(s);
+            return ctrl ? wordRight(d, s.caret, c) : nextChar(d, s.caret, c);
+        });
+        return true;
+    case VK_UP:
+    case VK_DOWN:
+        if (ctrl) return false;
+        moveEach(shift, [&](const DocState::Sel& s) {
+            Row r = rowContaining(d, s.caret, c), o;
+            const int col = colOf(d, r, s.caret, c);
+            const bool ok = vk == VK_UP ? prevRow(d, r.start, c, o) : nextRow(d, r, c, o);
+            return ok ? posOfCol(d, o, col, c) : s.caret;
+        });
+        return true;
+    case VK_HOME:
+        if (ctrl) return false;
+        moveEach(shift, [&](const DocState::Sel& s) {
+            Row r = rowContaining(d, s.caret, c);
+            u64 p = r.start;
+            while (p < r.end && (d.at(p) == ' ' || d.at(p) == '\t')) p++;
+            return s.caret == p ? r.start : p;
+        });
+        return true;
+    case VK_END:
+        if (ctrl) return false;
+        moveEach(shift, [&](const DocState::Sel& s) { return rowContaining(d, s.caret, c).end; });
+        return true;
+    case VK_BACK:
+        editEach([&](DocState::Sel& s, size_t) {
+            if (s.caret == s.anchor && s.pad > 0) {  // in the empty space past the line: just move back
+                s.pad--;
+                return;
+            }
+            if (s.caret != s.anchor) return eraseSel(s);
+            if (s.caret == 0) return;
+            const u64 p = ctrl ? wordLeft(d, s.caret, c) : prevChar(d, s.caret, c);
+            d.erase(p, s.caret - p);
+        });
+        return true;
+    case VK_DELETE:
+        editEach([&](DocState::Sel& s, size_t) {
+            if (s.caret == s.anchor && s.pad > 0) return;  // nothing to the right
+            s.pad = 0;
+            if (s.caret != s.anchor) return eraseSel(s);
+            if (s.caret >= d.size()) return;
+            const u64 p = ctrl ? wordRight(d, s.caret, c) : nextChar(d, s.caret, c);
+            d.erase(s.caret, p - s.caret);
+        });
+        return true;
+    }
+    return false;
+}
+
+// All carets in text order, as [lo, hi) ranges.
+std::vector<std::pair<u64, u64>> selRanges() {
+    std::vector<std::pair<u64, u64>> v;
+    v.push_back({selMin(), selMax()});
+    for (auto& e : g.d->extra) v.push_back({std::min(e.caret, e.anchor), std::max(e.caret, e.anchor)});
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+// Copy with several carets: each selection on its own line.
+bool multiCopy() {
+    auto v = selRanges();
+    std::string t;
+    bool any = false;
+    for (size_t i = 0; i < v.size(); i++) {
+        if (i) t += eolStr();
+        t += g.d->doc.text(v[i].first, v[i].second - v[i].first);
+        any = any || v[i].second > v[i].first;
+    }
+    if (!any) return false;
+    setClipboard(fromDocBytes(t), false);
+    return true;
+}
+
+// Paste with several carets: one line each when the clipboard has exactly as
+// many lines as there are carets, otherwise everything at every caret.
+void multiPaste(std::string s) {
+    normalizeEol(s, g.d->crlf);
+    const std::string eol = eolStr();
+    std::vector<std::string> parts;
+    size_t at = 0;
+    while (true) {
+        size_t k = s.find(eol, at);
+        if (k == std::string::npos) {
+            parts.push_back(s.substr(at));
+            break;
+        }
+        parts.push_back(s.substr(at, k - at));
+        at = k + eol.size();
+    }
+    if (parts.size() > 1 && parts.back().empty()) parts.pop_back();
+    const size_t n = g.d->extra.size() + 1;
+    const bool spread = parts.size() == n;
+    editEach([&](DocState::Sel& sel, size_t i) {
+        const std::string t = padded(sel, spread ? parts[i] : s);
+        eraseSel(sel);
+        if (!t.empty()) g.d->doc.insert(sel.caret, (const u8*)t.data(), t.size());
+    });
+}
+
+// Ctrl+Alt+click: another caret.
+void addCaretAt(u64 p) {
+    g.d->extra.push_back({g.d->caret, g.d->anchor, g.d->caretPad});
+    g.d->caret = g.d->anchor = p;
+    g.d->caretPad = 0;
+    g.boxActive = false;
+    normalizeSels();
+    g.caretOn = true;
+    g.d->doc.breakCoalesce();
+    refresh(false);
+}
+
+// Shift+Alt+.: the next match of the selection gets a caret too (the first
+// press selects the word at the caret). Shift+Alt+;: every match.
+void addNextMatch(bool all) {
+    Doc& d = g.d->doc;
+    if (!hasSel()) {
+        u64 a, b;
+        wordAt(d, g.d->caret, a, b);
+        if (a == b) {
+            MessageBeep(MB_OK);
+            return;
+        }
+        g.d->anchor = a;
+        g.d->caret = b;
+        if (!all) {
+            refresh(true);
+            return;
+        }
+    }
+    const u64 len = selMax() - selMin();
+    if (len > 4096) {
+        MessageBeep(MB_OK);
+        return;
+    }
+    const std::string needle = d.text(selMin(), len);
+    if (all) {
+        const u64 keepA = g.d->anchor, keepC = g.d->caret;
+        g.d->extra.clear();
+        u64 p = 0;
+        for (int n = 0; n < 20000; n++) {
+            u64 hit = d.searchFwd(needle, p, d.size(), true);
+            if (hit == NPOS) break;
+            if (hit != std::min(keepA, keepC)) g.d->extra.push_back({hit + len, hit});
+            p = hit + std::max<u64>(len, 1);
+        }
+    } else {
+        u64 from = selMax();
+        for (auto& e : g.d->extra) from = std::max(from, std::max(e.caret, e.anchor));
+        u64 hit = d.searchFwd(needle, from, d.size(), true);
+        if (hit == NPOS) hit = d.searchFwd(needle, 0, d.size(), true);
+        auto taken = [&](u64 h) {
+            if (selMin() == h) return true;
+            for (auto& e : g.d->extra)
+                if (std::min(e.caret, e.anchor) == h) return true;
+            return false;
+        };
+        if (hit == NPOS || taken(hit)) {
+            MessageBeep(MB_OK);
+            return;
+        }
+        g.d->extra.push_back({g.d->caret, g.d->anchor});
+        g.d->anchor = hit;
+        g.d->caret = hit + len;
+    }
+    g.boxActive = false;
+    normalizeSels();
+    g.d->doc.breakCoalesce();
+    refresh(true);
+}
+
+// ---- column (box) selection: Alt+drag, Shift+Alt+arrows
+
+void boxRebuild() {
+    if (!g.d->doc.linesKnown()) return;
+    LayoutCfg c = cfg();
+    Doc& d = g.d->doc;
+    const u64 last = d.newlineCount();
+    g.boxL0 = std::min(g.boxL0, last);
+    g.boxL1 = std::min(g.boxL1, last);
+    const u64 l0 = std::min(g.boxL0, g.boxL1), l1 = std::max(g.boxL0, g.boxL1);
+    g.d->extra.clear();
+    const int cLo = std::min(g.boxC0, g.boxC1);
+    for (u64 l = l0; l <= l1 && l - l0 < 20000; l++) {
+        Row r = rowAt(d, d.lineStart(l), c);
+        const int len = colOf(d, r, r.end, c);  // the line's width in columns
+        const u64 a = posOfCol(d, r, g.boxC0, c), b = posOfCol(d, r, g.boxC1, c);
+        // A box entirely past the end of this line: an empty caret in the
+        // space after it, at the box's left edge.
+        const int pad = cLo > len ? cLo - len : 0;
+        if (l == g.boxL1) {
+            g.d->anchor = a;
+            g.d->caret = b;
+            g.d->caretPad = pad;
+        } else {
+            g.d->extra.push_back({b, a, pad});
+        }
+    }
+    g.boxActive = true;
+    g.caretOn = true;
+    g.d->doc.breakCoalesce();
+}
+
+// The box starts from the current selection: anchor and caret are its corners.
+void boxStartAtCaret() {
+    if (g.boxActive || !g.d->doc.linesKnown()) return;
+    LayoutCfg c = cfg();
+    Doc& d = g.d->doc;
+    g.d->extra.clear();
+    g.boxL0 = d.lineOf(g.d->anchor);
+    g.boxL1 = d.lineOf(g.d->caret);
+    g.boxC0 = colOf(d, rowContaining(d, g.d->anchor, c), g.d->anchor, c);
+    g.boxC1 = colOf(d, rowContaining(d, g.d->caret, c), g.d->caret, c) + g.d->caretPad;
+}
+
+void boxMove(int dl, int dc) {
+    if (!g.d->doc.linesKnown()) return;
+    boxStartAtCaret();
+    if (dl < 0 && g.boxL1 == 0) dl = 0;
+    g.boxL1 = (u64)((i64)g.boxL1 + dl);
+    g.boxC1 = std::max(0, g.boxC1 + dc);
+    boxRebuild();
+    refresh(true);
+}
+
+// Line and visual column under a point (the column may be past the line end).
+bool boxPoint(int x, int y, u64& line, int& col) {
+    if (g.rows.empty() || !g.d->doc.linesKnown()) return false;
+    line = g.d->doc.lineOf(posFromPoint(x, y));
+    col = g.d->hcol + std::max(0, (x - g.gutterPx + g.cw / 2) / g.cw);
+    return true;
+}
+
+// ====================================================================== brackets and indentation
+
+// The bracket at (or just before) the caret and its partner.
+bool bracketPair(u64& a, u64& b) {
+    static const char open[] = "([{", close[] = ")]}";
+    Doc& d = g.d->doc;
+    const u64 n = d.size();
+    u64 at = NPOS;
+    auto isBr = [&](u64 p) { u8 ch = d.at(p); return ch && strchr("()[]{}", ch) != nullptr; };
+    if (g.d->caret < n && isBr(g.d->caret)) at = g.d->caret;
+    else if (g.d->caret > 0 && isBr(g.d->caret - 1)) at = g.d->caret - 1;
+    if (at == NPOS) return false;
+    const char ch = (char)d.at(at);
+    const char* o = strchr(open, ch);
+    const int idx = o ? (int)(o - open) : (int)(strchr(close, ch) - close);
+    const u8 me = (u8)open[idx], other = (u8)close[idx];
+    const bool fwd = o != nullptr;
+    int depth = 0;
+    u64 p = at;
+    const u64 limit = 1ull << 20;  // enough for any block on screen
+    for (u64 steps = 0; steps < limit; steps++) {
+        const u8 x = d.at(p);
+        if (x == me) depth += fwd ? 1 : -1;
+        else if (x == other) depth += fwd ? -1 : 1;
+        if (depth == 0) {
+            a = at;
+            b = p;
+            return true;
+        }
+        if (fwd ? ++p >= n : p-- == 0) return false;
+    }
+    return false;
+}
+
+// The file's indent: a tab, or the number of spaces most lines use.
+std::string indentUnit() {
+    Doc& d = g.d->doc;
+    const u64 lim = std::min<u64>(d.size(), 256u << 10);
+    std::string t = d.text(0, lim);
+    int tabs = 0, spaces = 0, minSp = 99;
+    bool atStart = true;
+    for (size_t i = 0; i < t.size(); i++) {
+        if (atStart) {
+            if (t[i] == '\t') tabs++;
+            else if (t[i] == ' ') {
+                int k = 0;
+                while (i + k < t.size() && t[i + k] == ' ') k++;
+                if (k >= 2 && i + k < t.size() && t[i + k] != '\r' && t[i + k] != '\n') {
+                    spaces++;
+                    minSp = std::min(minSp, k);
+                }
+            }
+        }
+        atStart = t[i] == '\n';
+    }
+    if (spaces > tabs) return std::string((size_t)std::clamp(minSp, 2, 8), ' ');
+    return "\t";
+}
+
+// What Enter inserts at `at`: a line break and the indent, one level deeper
+// after an opening bracket (or a colon in Python); between a pair of brackets
+// the closing one moves to a line of its own. `caretOff` is where the caret
+// goes in it.
+std::string newlineText(u64 at, size_t& caretOff) {
+    LayoutCfg c = cfg();
+    Doc& d = g.d->doc;
+    const u64 ls = lineStartBefore(d, at, c);
+    std::string lead;
+    for (u64 p = ls; p < at && lead.size() < 256; p++) {
+        const u8 ch = d.at(p);
+        if (ch != ' ' && ch != '\t') break;
+        lead += (char)ch;
+    }
+    const std::string eol = eolStr();
+    u64 p = at;
+    while (p > ls && (d.at(p - 1) == ' ' || d.at(p - 1) == '\t')) p--;
+    const u8 before = p > ls ? d.at(p - 1) : 0;
+    const u8 after = at < d.size() ? d.at(at) : 0;
+    const bool python = g.d->lang && std::string(langName(g.d->lang)) == "Python";
+    const bool opens = before == '{' || before == '[' || before == '(' || (python && before == ':');
+    if (!opens) {
+        caretOff = eol.size() + lead.size();
+        return eol + lead;
+    }
+    const std::string inner = eol + lead + indentUnit();
+    caretOff = inner.size();
+    const bool pair = (before == '{' && after == '}') || (before == '[' && after == ']') || (before == '(' && after == ')');
+    return pair ? inner + eol + lead : inner;
+}
+
+// Typing a closing bracket on a line that is blank so far lines it up with
+// the line of its opening bracket.
+bool outdentCloser(u32 cp) {
+    if ((cp != '}' && cp != ']' && cp != ')') || hasSel() || multi()) return false;
+    LayoutCfg c = cfg();
+    Doc& d = g.d->doc;
+    const u64 at = g.d->caret, ls = lineStartBefore(d, at, c);
+    if (at == ls) return false;
+    for (u64 p = ls; p < at; p++)
+        if (d.at(p) != ' ' && d.at(p) != '\t') return false;
+    const u8 me = (u8)cp, open = cp == '}' ? '{' : cp == ']' ? '[' : '(';
+    int depth = 1;
+    u64 p = ls;
+    for (u64 steps = 0; p > 0 && steps < (1u << 20); steps++) {
+        const u8 x = d.at(--p);
+        if (x == me) depth++;
+        else if (x == open && --depth == 0) break;
+    }
+    if (depth != 0) return false;
+    const u64 ols = lineStartBefore(d, p, c);
+    std::string lead;
+    for (u64 q = ols; q < p; q++) {
+        const u8 ch = d.at(q);
+        if (ch != ' ' && ch != '\t') break;
+        lead += (char)ch;
+    }
+    lead += (char)cp;
+    replaceRange(ls, at, lead, ls + lead.size(), ls + lead.size());
+    return true;
+}
+
+// ====================================================================== whole-file edits
+
+// Replaces the whole text as one undo step; the caret keeps its line.
+void replaceWhole(const std::string& t) {
+    Doc& d = g.d->doc;
+    const u64 line = d.linesKnown() ? d.lineOf(g.d->caret) : 0;
+    clearExtras();
+    d.breakCoalesce();
+    d.beginGroup();
+    if (d.size()) d.erase(0, d.size());
+    if (!t.empty()) d.insert(0, (const u8*)t.data(), t.size());
+    d.endGroup();
+    d.breakCoalesce();
+    u64 p = d.linesKnown() ? d.lineStart(std::min(line, d.newlineCount())) : 0;
+    afterEdit(p);
+}
+
+// Marks the file as changed without changing the text (the encoding or line
+// endings changed, which only shows when it is saved).
+void markChanged() {
+    Doc& d = g.d->doc;
+    d.breakCoalesce();
+    d.beginGroup();
+    const u8 x = ' ';
+    d.insert(0, &x, 1);
+    d.erase(0, 1);
+    d.endGroup();
+    d.breakCoalesce();
+}
+
+const u64 kWholeFileMax = 256ull << 20;
+
+bool wholeFileOk() {
+    if (g.d->doc.size() <= kWholeFileMax) return true;
+    MessageBoxW(g.frame, L"This file is too large to convert (limit 256 MB).", kAppName, MB_OK | MB_ICONINFORMATION);
+    return false;
+}
+
+// Encoding the file is saved with. Between ANSI and the Unicode ones the text
+// is converted; the Unicode ones share the same text and differ only on disk.
+void setEncoding(FileEnc e) {
+    const FileEnc old = g.d->enc;
+    if (e == old) return;
+    const bool wasAnsi = old == FE_ANSI, toAnsi = e == FE_ANSI;
+    if (wasAnsi != toAnsi) {
+        if (!wholeFileOk()) return;
+        ensureAnsiTable();
+        const std::string t = g.d->doc.text(0, g.d->doc.size());
+        std::wstring w;
+        const UINT from = wasAnsi ? g.ansiCp : CP_UTF8, to = toAnsi ? g.ansiCp : CP_UTF8;
+        int k = t.empty() ? 0 : MultiByteToWideChar(from, 0, t.data(), (int)t.size(), nullptr, 0);
+        w.resize((size_t)k);
+        if (k) MultiByteToWideChar(from, 0, t.data(), (int)t.size(), &w[0], k);
+        BOOL lossy = FALSE;
+        int m = w.empty() ? 0 : WideCharToMultiByte(to, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, toAnsi ? &lossy : nullptr);
+        std::string out((size_t)m, '\0');
+        if (m) WideCharToMultiByte(to, 0, w.data(), (int)w.size(), &out[0], m, nullptr, toAnsi ? &lossy : nullptr);
+        if (lossy && MessageBoxW(g.frame,
+                                 L"Some characters in this file have no ANSI equivalent and will become \"?\".\n\nConvert anyway?",
+                                 kAppName, MB_OKCANCEL | MB_ICONWARNING) != IDOK)
+            return;
+        g.d->enc = e;  // first, so the new text is laid out with the right decoding
+        if (out != t) replaceWhole(out);
+        else markChanged();
+    } else {
+        g.d->enc = e;
+        markChanged();
+    }
+    detectLang();
+    refresh(true);
+}
+
+// Reads the same bytes as UTF-8 or as ANSI (for a file detected wrongly).
+void reinterpretAs(FileEnc e) {
+    if (g.d->enc == FE_UTF16LE || g.d->enc == FE_UTF16BE || g.d->enc == e) return;
+    if (e == FE_ANSI) ensureAnsiTable();
+    g.d->enc = e;
+    clearExtras();
+    refresh(true);
+    InvalidateRect(g.view, nullptr, FALSE);
+}
+
+void setLineEndings(bool crlf) {
+    if (!wholeFileOk()) return;
+    const std::string t = g.d->doc.text(0, g.d->doc.size());
+    std::string s = t;
+    normalizeEol(s, crlf);
+    const bool was = g.d->crlf;
+    g.d->crlf = crlf;
+    if (s != t) replaceWhole(s);
+    else if (was != crlf) markChanged();
+    refresh(true);
+}
+
+// Lines the line commands work on: the selected ones, or every line.
+bool targetLines(u64& l0, u64& l1, bool& whole) {
+    if (!g.d->doc.linesKnown()) return false;
+    whole = !(hasSel() && selLines(l0, l1) && l1 > l0);
+    if (whole) {
+        l0 = 0;
+        l1 = lastLine();
+        // A final line break leaves an empty last line: not one to sort.
+        if (l1 > 0 && g.d->doc.lineStart(l1) == g.d->doc.size()) l1--;
+    }
+    return true;
+}
+
+std::vector<std::string> splitLines(const std::string& t) {
+    std::vector<std::string> v;
+    size_t at = 0;
+    while (at < t.size()) {
+        size_t k = t.find('\n', at);
+        if (k == std::string::npos) k = t.size();
+        size_t e = k;
+        if (e > at && t[e - 1] == '\r') e--;
+        v.push_back(t.substr(at, e - at));
+        at = k + 1;
+    }
+    return v;
+}
+
+// mode 0: sort A-Z, 1: sort Z-A, 2: remove duplicates (keeps the first).
+void sortLines(int mode) {
+    u64 l0, l1;
+    bool whole;
+    if (!targetLines(l0, l1, whole)) return;
+    Doc& d = g.d->doc;
+    const u64 a = d.lineStart(l0), b = d.lineStart(l1 + 1);
+    if (b - a > kWholeFileMax) {
+        wholeFileOk();
+        return;
+    }
+    const std::string orig = d.text(a, b - a);
+    const bool hadEol = !orig.empty() && orig.back() == '\n';
+    std::vector<std::string> v = splitLines(orig);
+    if (mode == 2) {
+        std::vector<std::string> out;
+        std::vector<size_t> idx(v.size());
+        for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+        std::sort(idx.begin(), idx.end(), [&](size_t x, size_t y) { return v[x] != v[y] ? v[x] < v[y] : x < y; });
+        std::vector<bool> keep(v.size(), true);
+        for (size_t i = 1; i < idx.size(); i++)
+            if (v[idx[i]] == v[idx[i - 1]]) keep[idx[i]] = false;
+        for (size_t i = 0; i < v.size(); i++)
+            if (keep[i]) out.push_back(std::move(v[i]));
+        v.swap(out);
+    } else {
+        auto lower = [](const std::string& s) {
+            std::string r = s;
+            for (char& ch : r) ch = (char)tolower((unsigned char)ch);
+            return r;
+        };
+        std::vector<std::pair<std::string, size_t>> keys;
+        for (size_t i = 0; i < v.size(); i++) keys.push_back({lower(v[i]), i});
+        std::stable_sort(keys.begin(), keys.end(), [&](const auto& x, const auto& y) {
+            if (x.first != y.first) return mode == 0 ? x.first < y.first : x.first > y.first;
+            return mode == 0 ? v[x.second] < v[y.second] : v[x.second] > v[y.second];
+        });
+        std::vector<std::string> out;
+        for (auto& k : keys) out.push_back(v[k.second]);
+        v.swap(out);
+    }
+    std::string t;
+    for (size_t i = 0; i < v.size(); i++) {
+        t += v[i];
+        if (i + 1 < v.size() || hadEol) t += eolStr();
+    }
+    if (t == orig) return;
+    clearExtras();
+    if (whole) replaceRange(a, b, t, std::min(g.d->caret, a + t.size()), std::min(g.d->caret, a + t.size()));
+    else replaceRange(a, b, t, a, a + t.size());
+}
+
+// Spaces and tabs at the ends of lines (selected lines, or all of them).
+void trimTrailing() {
+    u64 l0, l1;
+    bool whole;
+    if (!targetLines(l0, l1, whole)) return;
+    Doc& d = g.d->doc;
+    if (whole) l1 = lastLine();
+    clearExtras();
+    // The main caret rides along with the edit hook like an extra one.
+    g.d->extra.push_back({g.d->caret, g.d->anchor});
+    d.breakCoalesce();
+    d.beginGroup();
+    bool any = false;
+    for (u64 l = l1 + 1; l-- > l0;) {
+        const u64 ls = d.lineStart(l);
+        u64 e = l < lastLine() ? d.lineStart(l + 1) : d.size();
+        if (e > ls && d.at(e - 1) == '\n') e--;
+        if (e > ls && d.at(e - 1) == '\r') e--;
+        u64 p = e;
+        while (p > ls && (d.at(p - 1) == ' ' || d.at(p - 1) == '\t')) p--;
+        if (p < e) {
+            d.erase(p, e - p);
+            any = true;
+        }
+    }
+    d.endGroup();
+    d.breakCoalesce();
+    g.d->caret = g.d->extra.back().caret;
+    g.d->anchor = g.d->extra.back().anchor;
+    g.d->extra.clear();
+    if (!any) MessageBeep(MB_OK);
+    refresh(true);
+}
+
+// ====================================================================== outside changes to open files
+
+bool statPath(const std::wstring& path, FILETIME& t, u64& size) {
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (path.empty() || !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return false;
+    t = a.ftLastWriteTime;
+    size = ((u64)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+    return true;
+}
+
+void noteDiskState() {
+    g.d->diskKnown = statPath(g.d->path, g.d->diskTime, g.d->diskSize);
+}
+
+// The open file changed on disk (sync, checkout, another editor): reload it,
+// asking first when it has unsaved edits here. Only the tab in front is
+// checked; the others are when they come to the front.
+void checkDisk(bool mayAsk) {
+    static bool busy = false;
+    if (busy || !g.d || g.d->path.empty() || !g.d->diskKnown) return;
+    FILETIME t;
+    u64 size;
+    if (!statPath(g.d->path, t, size)) return;  // gone or locked for now
+    if (CompareFileTime(&t, &g.d->diskTime) == 0 && size == g.d->diskSize) return;
+    if (g.d->doc.modified()) {
+        if (!mayAsk) return;
+        busy = true;
+        std::wstring msg = fileNameOf(g.d->path) +
+                           L"\n\nThis file was changed outside JustNotepad. Reload it and lose the changes made here?";
+        DocState* asked = g.d;
+        int r = MessageBoxW(g.frame, msg.c_str(), kAppName, MB_YESNO | MB_ICONWARNING);
+        busy = false;
+        if (g.d != asked) return;
+        if (r != IDYES) {
+            g.d->diskTime = t;  // keep ours; ask again only if it changes again
+            g.d->diskSize = size;
+            return;
+        }
+    }
+    const u64 caret = g.d->caret, top = g.d->top;
+    const int hcol = g.d->hcol;
+    if (openPath(g.d->path, true)) {
+        g.d->caret = g.d->anchor = std::min(caret, g.d->doc.size());
+        g.d->top = std::min(top, g.d->doc.size());
+        g.d->hcol = hcol;
+        refresh(false);
+        updateSidePane();
+    } else {
+        noteDiskState();  // could not read it: do not keep trying
+    }
+}
+
+// ====================================================================== recent files
+
+bool g_restoring = false;  // reopening the last session: not "recent" opens
+
+void saveRecent() {
+    std::wstring p = settingsPath(true);
+    if (p.empty()) return;
+    const wchar_t* f = p.c_str();
+    WritePrivateProfileStringW(L"recent", nullptr, nullptr, f);
+    for (size_t i = 0; i < g.recent.size(); i++) {
+        wchar_t key[16];
+        swprintf(key, 16, L"f%d", (int)i);
+        WritePrivateProfileStringW(L"recent", key, g.recent[i].c_str(), f);
+    }
+}
+
+void addRecent(const std::wstring& path) {
+    if (path.empty() || g_restoring) return;
+    auto& r = g.recent;
+    r.erase(std::remove_if(r.begin(), r.end(), [&](const std::wstring& x) { return _wcsicmp(x.c_str(), path.c_str()) == 0; }), r.end());
+    r.insert(r.begin(), path);
+    if (r.size() > 12) r.resize(12);
+    saveRecent();
+}
+
+void rebuildRecentMenu() {
+    HMENU m = g.recentMenu;
+    if (!m) return;
+    themeReleasePopup(m);
+    while (GetMenuItemCount(m) > 0) DeleteMenu(m, 0, MF_BYPOSITION);
+    if (g.recent.empty()) {
+        AppendMenuW(m, MF_STRING | MF_GRAYED, IDM_RECENT0, L"No recent files");
+    } else {
+        for (size_t i = 0; i < g.recent.size(); i++) {
+            std::wstring label = (i < 9 ? L"&" + std::to_wstring(i + 1) : std::wstring(L"1&") + std::to_wstring(i - 9)) + L"  ";
+            std::wstring p = g.recent[i];
+            if (p.size() > 90) p = p.substr(0, 30) + L"\x2026" + p.substr(p.size() - 58);
+            for (wchar_t ch : p) {
+                if (ch == L'&') label += L'&';  // not a mnemonic
+                label += ch;
+            }
+            AppendMenuW(m, MF_STRING, IDM_RECENT0 + (UINT)i, label.c_str());
+        }
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, IDM_RECENTCLEAR, L"&Clear Recent Files");
+    }
+    themeOwnerDrawPopup(m);
+    themePopupColors(m, g.pal);
+}
+
+void openRecent(size_t i) {
+    if (i >= g.recent.size()) return;
+    const std::wstring p = g.recent[i];
+    if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        std::wstring msg = p + L"\n\nThis file no longer exists. Remove it from the list?";
+        if (MessageBoxW(g.frame, msg.c_str(), kAppName, MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            g.recent.erase(g.recent.begin() + (std::ptrdiff_t)i);
+            saveRecent();
+        }
+        return;
+    }
+    openInTab(p);
+}
+
+// ====================================================================== printing
+
+void cmdPrint() {
+    PRINTDLGW pd = {};
+    pd.lStructSize = sizeof(pd);
+    pd.hwndOwner = g.frame;
+    pd.Flags = PD_RETURNDC | PD_NOPAGENUMS | PD_USEDEVMODECOPIESANDCOLLATE | (hasSel() ? 0 : PD_NOSELECTION);
+    if (!PrintDlgW(&pd)) return;
+    HDC dc = pd.hDC;
+    const bool selOnly = (pd.Flags & PD_SELECTION) != 0;
+    if (pd.hDevMode) GlobalFree(pd.hDevMode);
+    if (pd.hDevNames) GlobalFree(pd.hDevNames);
+    if (!dc) return;
+    HCURSOR oldCur = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+
+    Doc& d = g.d->doc;
+    const u64 a = selOnly ? selMin() : 0, b = selOnly ? selMax() : d.size();
+    const std::wstring text = fromDocBytes(d.text(a, std::min<u64>(b - a, kWholeFileMax)));
+
+    const int dpiY = GetDeviceCaps(dc, LOGPIXELSY), dpiX = GetDeviceCaps(dc, LOGPIXELSX);
+    const int pageW = GetDeviceCaps(dc, HORZRES), pageH = GetDeviceCaps(dc, VERTRES);
+    const int mx = dpiX * 6 / 10, my = dpiY * 6 / 10;  // 15 mm margins
+    LOGFONTW lf = {};
+    lf.lfHeight = -MulDiv(10, dpiY, 72);
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lf.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
+    lstrcpynW(lf.lfFaceName, g.fontFace.c_str(), LF_FACESIZE);
+    HFONT font = CreateFontIndirectW(&lf);
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    TEXTMETRICW tm = {};
+    GetTextMetricsW(dc, &tm);
+    const int lh = tm.tmHeight + tm.tmExternalLeading, cw = std::max(1, (int)tm.tmAveCharWidth);
+    const int cols = std::max(10, (pageW - 2 * mx) / cw);
+    const int rows = std::max(5, (pageH - 2 * my) / lh - 3);  // header and footer lines
+
+    // Lines with tabs expanded, cut to the page width.
+    std::vector<std::wstring> out;
+    std::wstring cur;
+    auto flush = [&]() {
+        out.push_back(cur);
+        cur.clear();
+    };
+    for (size_t i = 0; i <= text.size(); i++) {
+        if (i == text.size() || text[i] == L'\n') {
+            if (!cur.empty() && cur.back() == L'\r') cur.pop_back();
+            if (i < text.size() || !cur.empty()) flush();
+            continue;
+        }
+        if (text[i] == L'\t') {
+            do cur += L' ';
+            while (cur.size() % 4);
+        } else {
+            cur += text[i];
+        }
+        if ((int)cur.size() >= cols) flush();
+    }
+    if (out.empty()) out.push_back(L"");
+
+    const std::wstring name = g.d->path.empty() ? L"Untitled" : g.d->path;
+    DOCINFOW di = {};
+    di.cbSize = sizeof(di);
+    const std::wstring title = fileNameOf(g.d->path);
+    di.lpszDocName = title.c_str();
+    bool ok = StartDocW(dc, &di) > 0;
+    const int pages = (int)((out.size() + rows - 1) / rows);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(0, 0, 0));
+    for (int pg = 0; ok && pg < pages; pg++) {
+        if (StartPage(dc) <= 0) {
+            ok = false;
+            break;
+        }
+        SelectObject(dc, font);
+        TextOutW(dc, mx, my, name.c_str(), (int)std::min<size_t>(name.size(), (size_t)cols));
+        RECT rule = {mx, my + lh + lh / 3, pageW - mx, my + lh + lh / 3 + std::max(1, dpiY / 150)};
+        FillRect(dc, &rule, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        for (int r = 0; r < rows; r++) {
+            size_t i = (size_t)pg * rows + r;
+            if (i >= out.size()) break;
+            TextOutW(dc, mx, my + (r + 2) * lh, out[i].c_str(), (int)out[i].size());
+        }
+        wchar_t foot[64];
+        int fn = swprintf(foot, 64, L"%d / %d", pg + 1, pages);
+        SIZE fs;
+        GetTextExtentPoint32W(dc, foot, fn, &fs);
+        TextOutW(dc, (pageW - fs.cx) / 2, pageH - my - lh, foot, fn);
+        if (EndPage(dc) <= 0) ok = false;
+    }
+    if (ok) EndDoc(dc);
+    else AbortDoc(dc);
+    SelectObject(dc, oldFont);
+    DeleteObject(font);
+    DeleteDC(dc);
+    SetCursor(oldCur);
+    if (!ok) MessageBoxW(g.frame, L"Printing failed.", kAppName, MB_OK | MB_ICONWARNING);
+}
+
+// ====================================================================== encoding menu (File > Encoding, status bar)
+
+void addEncodingItems(HMENU enc, HMENU eol) {
+    AppendMenuW(enc, MF_STRING, IDM_ENC_UTF8, L"Save as &UTF-8");
+    AppendMenuW(enc, MF_STRING, IDM_ENC_UTF8BOM, L"Save as UTF-8 with &BOM");
+    AppendMenuW(enc, MF_STRING, IDM_ENC_UTF16LE, L"Save as UTF-16 &LE");
+    AppendMenuW(enc, MF_STRING, IDM_ENC_UTF16BE, L"Save as UTF-16 B&E");
+    AppendMenuW(enc, MF_STRING, IDM_ENC_ANSI, L"Save as &ANSI");
+    AppendMenuW(enc, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(enc, MF_STRING, IDM_REINTERP_UTF8, L"Reinterpret as U&TF-8");
+    AppendMenuW(enc, MF_STRING, IDM_REINTERP_ANSI, L"Reinterpret as A&NSI");
+    AppendMenuW(eol, MF_STRING, IDM_EOL_CRLF, L"&Windows (CRLF)");
+    AppendMenuW(eol, MF_STRING, IDM_EOL_LF, L"&Unix (LF)");
+}
+
+void checkEncodingItems(HMENU m) {
+    for (int k = 0; k < 5; k++)
+        CheckMenuItem(m, IDM_ENC_UTF8 + k, MF_BYCOMMAND | (g.d->enc == (FileEnc)k ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(m, IDM_EOL_CRLF, MF_BYCOMMAND | (g.d->crlf ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(m, IDM_EOL_LF, MF_BYCOMMAND | (!g.d->crlf ? MF_CHECKED : MF_UNCHECKED));
+    const bool raw = g.d->enc != FE_UTF16LE && g.d->enc != FE_UTF16BE;
+    EnableMenuItem(m, IDM_REINTERP_UTF8, MF_BYCOMMAND | (raw && g.d->enc == FE_ANSI ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(m, IDM_REINTERP_ANSI, MF_BYCOMMAND | (raw && g.d->enc != FE_ANSI ? MF_ENABLED : MF_GRAYED));
+}
+
+void markEncodingRadios(HMENU m) {
+    for (int k = 0; k < 5; k++) themeSetMenuRadio(m, IDM_ENC_UTF8 + k);
+    themeSetMenuRadio(m, IDM_EOL_CRLF);
+    themeSetMenuRadio(m, IDM_EOL_LF);
+}
+
+// A click on the status bar: encoding and line endings.
+void showEncodingMenu(POINT screen) {
+    HMENU m = CreatePopupMenu(), enc = CreatePopupMenu(), eol = CreatePopupMenu();
+    addEncodingItems(enc, eol);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)enc, L"&Encoding");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)eol, L"&Line Endings");
+    checkEncodingItems(m);
+    themeOwnerDrawPopup(m);
+    markEncodingRadios(m);
+    themePopupColors(m, g.pal);
+    UINT cmd = (UINT)TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_BOTTOMALIGN, screen.x, screen.y, g.frame, nullptr);
+    themeReleasePopup(m);
+    DestroyMenu(m);
+    if (cmd) onCommand((int)cmd);
+}
+
 // ====================================================================== side pane: data view and Markdown preview
 //
 // One pane to the right of the editor (View > Data View / Preview,
@@ -4373,12 +5500,20 @@ void gotoBracket(bool select) {
 // node selects it in the editor, F2 or a double click edits a value in place.
 // Markdown shows rendered, following the editor as you scroll and type.
 
-enum SideKind { SIDE_NONE, SIDE_JSON, SIDE_XML, SIDE_MD };
+enum SideKind { SIDE_NONE, SIDE_JSON, SIDE_XML, SIDE_MD, SIDE_HEX, SIDE_CSV };
 
 const u64 kSideMax = 64ull << 20;  // larger files: no tree / preview
 
 int sideKind() {
-    if (!g.d || !g.d->lang) return SIDE_NONE;
+    if (!g.d) return SIDE_NONE;
+    if (g.d->forceHex || g.d->binary) return SIDE_HEX;
+    const std::wstring& p = g.d->path;
+    auto ext = [&](const wchar_t* e) {
+        size_t n = wcslen(e);
+        return p.size() > n && _wcsicmp(p.c_str() + p.size() - n, e) == 0;
+    };
+    if (ext(L".csv") || ext(L".tsv")) return SIDE_CSV;
+    if (!g.d->lang) return SIDE_NONE;
     const char* n = langName(g.d->lang);
     if (strcmp(n, "JSON") == 0) return SIDE_JSON;
     if (strcmp(n, "XML") == 0) return SIDE_XML;
@@ -5275,6 +6410,795 @@ LRESULT CALLBACK previewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// ---- hex view (binary files, or View > Show as Hex)
+//
+// Offset | 16 bytes in hex | the same bytes as text. Reads only the rows on
+// screen, so it works on files of any size. Typing hex digits (or text in the
+// right column) overwrites bytes; Delete removes one; Save writes the bytes.
+
+struct HexState {
+    u64 top = 0;          // first row shown
+    u64 caret = 0;        // byte under the caret
+    int nibble = 0;       // 0: high digit next, 1: low digit
+    bool ascii = false;   // caret in the text column
+    u64 syncedTop = NPOS; // editor top line the view last followed
+};
+HexState g_hex;
+
+u64 hexRows() { return g.d->doc.size() / 16 + 1; }  // +1: room to type after the end
+int hexOffDigits() { return g.d->doc.size() > 0xFFFFFFFFull ? 16 : 8; }
+int hexX(int i, bool ascii) {
+    const int pad = g.cw, hexStart = pad + (hexOffDigits() + 2) * g.cw;
+    if (!ascii) return hexStart + (i * 3 + (i >= 8 ? 1 : 0)) * g.cw;
+    return hexStart + (16 * 3 + 3) * g.cw + i * g.cw;
+}
+int hexVisibleRows() {
+    if (g.ch <= 0) return 1;
+    RECT rc;
+    GetClientRect(g.sideHex, &rc);
+    return std::max(1, (int)rc.bottom / g.ch);
+}
+
+void hexScrollbar() {
+    if (!g.d || !g.sideHex || g.ch <= 0) return;  // not ready during window creation
+    SCROLLINFO si = {sizeof(si), SIF_RANGE | SIF_PAGE | SIF_POS};
+    const u64 rows = hexRows();
+    int sh = 0;
+    while ((rows >> sh) > 0x3FFFFFFFull) sh++;
+    g.hexShift = sh;
+    si.nMax = (int)(rows >> sh);
+    si.nPage = (UINT)std::max(1, hexVisibleRows() >> sh);
+    si.nPos = (int)(g_hex.top >> sh);
+    SetScrollInfo(g.sideHex, SB_VERT, &si, TRUE);
+}
+
+void hexEnsureCaretVisible() {
+    const u64 row = g_hex.caret / 16, vis = (u64)hexVisibleRows();
+    if (row < g_hex.top) g_hex.top = row;
+    else if (row >= g_hex.top + vis) g_hex.top = row - vis + 1;
+}
+
+// The hex view moved: the editor goes to the same bytes.
+void hexSyncEditor(bool caretToo) {
+    if (caretToo) {
+        g.d->caret = g.d->anchor = std::min(g_hex.caret, g.d->doc.size());
+        g.d->wantCol = -1;
+    }
+    g.d->top = std::min(g_hex.top * 16, g.d->doc.size());
+    g.d->topFill = 0;
+    g_hex.syncedTop = g.d->doc.linesKnown() ? g.d->doc.lineOf(g.d->top) : NPOS;
+    refresh(false);
+}
+
+// The editor moved: the hex view follows.
+void syncHexToEditor() {
+    if (!g.sideHex || !IsWindowVisible(g.sideHex) || !g.d->doc.linesKnown()) return;
+    const u64 line = g.d->doc.lineOf(g.d->top);
+    if (line == g_hex.syncedTop) return;
+    g_hex.syncedTop = line;
+    g_hex.top = std::min(g.d->top / 16, hexRows() - 1);
+    hexScrollbar();
+    InvalidateRect(g.sideHex, nullptr, FALSE);
+}
+
+void paintHex(HWND hwnd) {
+    PAINTSTRUCT ps;
+    HDC wdc = BeginPaint(hwnd, &ps);
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    const int W = rc.right, H = rc.bottom;
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, std::max(1, W), std::max(1, H));
+    HGDIOBJ ob = SelectObject(dc, bmp);
+    const COLORREF bg = g.pal.bg, fg = g.pal.fg, dim = blend(fg, bg, 40), sel = g.pal.selection;
+    fillRect(dc, 0, 0, W, H, bg);
+    HGDIOBJ of = SelectObject(dc, g.font);
+    SetBkMode(dc, TRANSPARENT);
+    const u64 size = g.d->doc.size(), s0 = selMin(), s1 = selMax();
+    const bool focused = GetFocus() == hwnd;
+    u8 buf[16];
+    for (int r = 0; r * g.ch < H; r++) {
+        const u64 row = g_hex.top + (u64)r;
+        const u64 off = row * 16;
+        if (off > size) break;
+        const int y = r * g.ch;
+        const u64 n = std::min<u64>(16, size - off);
+        g.d->doc.copy(off, buf, n);
+        wchar_t t[24];
+        swprintf(t, 24, hexOffDigits() == 16 ? L"%016llX" : L"%08llX", (unsigned long long)off);
+        SetTextColor(dc, dim);
+        TextOutW(dc, g.cw, y, t, hexOffDigits());
+        for (int i = 0; i < 16; i++) {
+            const u64 at = off + (u64)i;
+            const bool isCaret = at == g_hex.caret;
+            const bool inSel = at >= s0 && at < s1;
+            if ((u64)i >= n && !isCaret) continue;
+            const int xh = hexX(i, false), xa = hexX(i, true);
+            if (inSel) {
+                fillRect(dc, xh, y, xh + 2 * g.cw, y + g.ch, sel);
+                fillRect(dc, xa, y, xa + g.cw, y + g.ch, sel);
+            }
+            if (isCaret) {
+                // The active column gets a filled caret cell; the other one an outline.
+                const COLORREF cc = focused ? g.pal.accent : blend(g.pal.accent, bg, 50);
+                const int ax = g_hex.ascii ? xa : xh + g_hex.nibble * g.cw, aw = g.cw;
+                fillRect(dc, ax, y, ax + aw, y + g.ch, blend(cc, bg, 45));
+                fillRect(dc, ax, y + g.ch - 2, ax + aw, y + g.ch, cc);
+                const int ox = g_hex.ascii ? xh : xa, ow = g_hex.ascii ? 2 * g.cw : g.cw;
+                fillRect(dc, ox, y, ox + ow, y + 1, cc);
+                fillRect(dc, ox, y + g.ch - 1, ox + ow, y + g.ch, cc);
+            }
+            if ((u64)i >= n) continue;
+            const u8 b = buf[i];
+            swprintf(t, 4, L"%02X", b);
+            SetTextColor(dc, b == 0 ? dim : fg);
+            TextOutW(dc, xh, y, t, 2);
+            wchar_t ch = (b >= 0x20 && b < 0x7F) ? (wchar_t)b : L'\x00B7';
+            SetTextColor(dc, (b >= 0x20 && b < 0x7F) ? fg : dim);
+            TextOutW(dc, xa, y, &ch, 1);
+        }
+    }
+    // Column separators.
+    const int sx = hexX(0, false) - g.cw, ax = hexX(0, true) - g.cw;
+    fillRect(dc, sx, 0, sx + 1, H, g.pal.border);
+    fillRect(dc, ax, 0, ax + 1, H, g.pal.border);
+    fillRect(dc, 0, 0, edgeW(), H, g.pal.border);
+    SelectObject(dc, of);
+    BitBlt(wdc, 0, 0, W, H, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, ob);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+// Writes one byte at `at` (appends at the end), as its own undo step.
+void hexPutByte(u64 at, u8 b) {
+    const u64 size = g.d->doc.size();
+    g.d->doc.breakCoalesce();
+    g.d->doc.beginGroup();
+    if (at < size) g.d->doc.erase(at, 1);
+    g.d->doc.insert(std::min(at, size), &b, 1);
+    g.d->doc.endGroup();
+}
+
+void hexMove(i64 delta, bool toAscii = false) {
+    (void)toAscii;
+    const i64 c = (i64)g_hex.caret + delta;
+    g_hex.caret = (u64)std::clamp<i64>(c, 0, (i64)g.d->doc.size());
+    g_hex.nibble = 0;
+    hexEnsureCaretVisible();
+    hexScrollbar();
+    hexSyncEditor(true);
+    InvalidateRect(g.sideHex, nullptr, FALSE);
+}
+
+int hexDigit(wchar_t c) {
+    if (c >= L'0' && c <= L'9') return c - L'0';
+    if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+    if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+    return -1;
+}
+
+LRESULT CALLBACK hexProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: paintHex(hwnd); return 0;
+    case WM_SIZE: hexScrollbar(); return 0;
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS: InvalidateRect(hwnd, nullptr, FALSE); return 0;
+    case WM_GETDLGCODE: return DLGC_WANTALLKEYS | DLGC_WANTCHARS;
+    case WM_MOUSEWHEEL: {
+        int lines = 3;
+        SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+        i64 t = (i64)g_hex.top - (i64)GET_WHEEL_DELTA_WPARAM(wp) * lines / WHEEL_DELTA;
+        g_hex.top = (u64)std::clamp<i64>(t, 0, (i64)hexRows() - 1);
+        hexScrollbar();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        hexSyncEditor(false);
+        return 0;
+    }
+    case WM_VSCROLL: {
+        SCROLLINFO si = {sizeof(si), SIF_ALL};
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        i64 t = (i64)g_hex.top, page = std::max(1, hexVisibleRows() - 1);
+        switch (LOWORD(wp)) {
+        case SB_LINEUP: t--; break;
+        case SB_LINEDOWN: t++; break;
+        case SB_PAGEUP: t -= page; break;
+        case SB_PAGEDOWN: t += page; break;
+        case SB_TOP: t = 0; break;
+        case SB_BOTTOM: t = (i64)hexRows(); break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: t = (i64)((u64)(unsigned)si.nTrackPos << g.hexShift); break;
+        default: return 0;
+        }
+        g_hex.top = (u64)std::clamp<i64>(t, 0, (i64)hexRows() - 1);
+        hexScrollbar();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        hexSyncEditor(false);
+        UpdateWindow(g.view);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        SetFocus(hwnd);
+        const int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        const u64 row = g_hex.top + (u64)std::max(0, y / g.ch);
+        int best = -1;
+        bool ascii = x >= hexX(0, true) - g.cw / 2;
+        for (int i = 0; i < 16; i++) {
+            const int x0 = hexX(i, ascii), w = ascii ? g.cw : 3 * g.cw;
+            if (x >= x0 - (ascii ? 0 : g.cw / 2) && x < x0 + w) best = i;
+        }
+        if (best < 0) best = x < hexX(0, ascii) ? 0 : 15;
+        g_hex.ascii = ascii;
+        g_hex.caret = std::min(row * 16 + (u64)best, g.d->doc.size());
+        g_hex.nibble = (!ascii && x >= hexX(best, false) + g.cw) ? 1 : 0;
+        hexSyncEditor(true);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    case WM_KEYDOWN: {
+        const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+        const i64 page = (i64)std::max(1, hexVisibleRows() - 1) * 16;
+        switch (wp) {
+        case VK_LEFT: hexMove(-1); return 0;
+        case VK_RIGHT: hexMove(1); return 0;
+        case VK_UP: hexMove(-16); return 0;
+        case VK_DOWN: hexMove(16); return 0;
+        case VK_PRIOR: hexMove(-page); return 0;
+        case VK_NEXT: hexMove(page); return 0;
+        case VK_HOME: hexMove(ctrl ? -(i64)g_hex.caret : -(i64)(g_hex.caret % 16)); return 0;
+        case VK_END: hexMove(ctrl ? (i64)(g.d->doc.size() - g_hex.caret) : (i64)(15 - g_hex.caret % 16)); return 0;
+        case VK_TAB:
+            g_hex.ascii = !g_hex.ascii;
+            g_hex.nibble = 0;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        case VK_BACK: hexMove(-1); return 0;
+        case VK_DELETE:
+            if (g_hex.caret < g.d->doc.size()) {
+                g.d->doc.breakCoalesce();
+                g.d->doc.erase(g_hex.caret, 1);
+                hexSyncEditor(true);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+        return 0;
+    }
+    case WM_CHAR: {
+        const wchar_t c = (wchar_t)wp;
+        if (c < 0x20) return 0;
+        if (g_hex.ascii) {
+            if (c > 0xFF) {
+                MessageBeep(MB_OK);
+                return 0;
+            }
+            hexPutByte(g_hex.caret, (u8)c);
+            hexMove(1);
+            return 0;
+        }
+        const int d = hexDigit(c);
+        if (d < 0) {
+            MessageBeep(MB_OK);
+            return 0;
+        }
+        u8 b = 0;
+        if (g_hex.caret < g.d->doc.size()) g.d->doc.copy(g_hex.caret, &b, 1);
+        b = g_hex.nibble == 0 ? (u8)((d << 4) | (b & 0x0F)) : (u8)((b & 0xF0) | d);
+        hexPutByte(g_hex.caret, b);
+        if (g_hex.nibble == 0) {
+            g_hex.nibble = 1;
+            hexSyncEditor(true);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        } else {
+            hexMove(1);
+        }
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ---- CSV / TSV table
+
+struct CsvState {
+    std::vector<u64> rows;       // row starts + end
+    std::vector<int> widths;     // column widths in pixels
+    char delim = ',';
+    bool truncated = false;
+    u64 version = NPOS;
+    const DocState* doc = nullptr;
+    u64 top = 1;                 // first body row shown (row 0 is the header)
+    int scrollX = 0;
+    u64 row = 1;                 // selected cell
+    int col = 0;
+    HWND edit = nullptr;         // in-place cell editor
+    u64 syncedTop = NPOS;
+    int dragCol = -1, dragX = 0, dragW = 0;  // resizing a column
+};
+CsvState g_csv;
+
+bool isTsvPath() {
+    const std::wstring& p = g.d->path;
+    return p.size() > 4 && _wcsicmp(p.c_str() + p.size() - 4, L".tsv") == 0;
+}
+
+// Row r's text, without its line break.
+std::string csvRowText(u64 r) {
+    if (r + 1 >= g_csv.rows.size()) return std::string();
+    u64 a = g_csv.rows[(size_t)r], b = std::min(g_csv.rows[(size_t)r + 1], g.d->doc.size());
+    if (b <= a) return std::string();
+    std::string t = g.d->doc.text(a, std::min<u64>(b - a, 1u << 20));
+    while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+    return t;
+}
+
+std::vector<CsvField> csvRowFields(u64 r, std::string& text) {
+    text = csvRowText(r);
+    std::vector<CsvField> f;
+    csvFields(text.data(), text.size(), 0, g_csv.delim, f);
+    return f;
+}
+
+std::wstring csvCell(const std::string& text, const CsvField& f) {
+    std::wstring w = fromDocBytes(csvValue(text.data() + f.start, (size_t)(f.end - f.start)));
+    for (wchar_t& c : w)
+        if (c == L'\n') c = L'\x21B5';  // line breaks inside a cell: shown as ↵
+    w.erase(std::remove(w.begin(), w.end(), L'\r'), w.end());
+    return w;
+}
+
+int csvRowH() { return g.ch + MulDiv(6, g.dpi, 96); }
+int csvGutterW() {
+    wchar_t b[32];
+    int n = swprintf(b, 32, L"%llu", (unsigned long long)std::max<size_t>(1, g_csv.rows.size()));
+    return (n + 2) * g.cw;
+}
+
+void rebuildCsv() {
+    g_csv.doc = g.d;
+    g_csv.version = g.d->doc.version();
+    g_csv.rows.clear();
+    if (g.d->doc.size() > kSideMax) return;
+    std::string text = g.d->doc.text(0, g.d->doc.size());
+    g_csv.delim = csvSniff(text.data(), text.size(), isTsvPath());
+    g_csv.rows = csvRows(text.data(), text.size(), 5000000, g_csv.truncated);
+    // Column widths from the header and the first rows, kept if already set.
+    HDC dc = GetDC(g.sideCsv);
+    HGDIOBJ of = SelectObject(dc, g.font);
+    std::vector<int> w;
+    const u64 sample = std::min<u64>(g_csv.rows.size() ? g_csv.rows.size() - 1 : 0, 300);
+    for (u64 r = 0; r < sample; r++) {
+        std::string t;
+        std::vector<CsvField> f = csvRowFields(r, t);
+        if (w.size() < f.size()) w.resize(f.size(), 0);
+        for (size_t c = 0; c < f.size(); c++) {
+            std::wstring v = csvCell(t, f[c]);
+            SIZE sz = {};
+            GetTextExtentPoint32W(dc, v.c_str(), (int)std::min<size_t>(v.size(), 60), &sz);
+            w[c] = std::max(w[c], (int)sz.cx);
+        }
+    }
+    SelectObject(dc, of);
+    ReleaseDC(g.sideCsv, dc);
+    const int pad = 2 * g.cw;
+    for (size_t c = 0; c < w.size(); c++) {
+        int v = std::clamp(w[c] + pad, 5 * g.cw, 40 * g.cw);
+        if (c < g_csv.widths.size() && g_csv.widths[c] > 0) v = g_csv.widths[c];  // the user resized it
+        w[c] = v;
+    }
+    g_csv.widths = w;
+    if (g_csv.widths.empty()) g_csv.widths.push_back(10 * g.cw);
+    const u64 body = g_csv.rows.size() > 2 ? g_csv.rows.size() - 2 : 0;  // rows minus header, minus the end entry
+    g_csv.top = std::clamp<u64>(g_csv.top, 1, std::max<u64>(1, body));
+    g_csv.row = std::clamp<u64>(g_csv.row, 1, std::max<u64>(1, body));
+    g_csv.col = std::clamp(g_csv.col, 0, (int)g_csv.widths.size() - 1);
+}
+
+u64 csvBodyRows() { return g_csv.rows.size() > 2 ? g_csv.rows.size() - 2 : 0; }
+int csvVisibleRows() {
+    RECT rc;
+    GetClientRect(g.sideCsv, &rc);
+    if (csvRowH() <= 0) return 1;
+    return std::max(1, ((int)rc.bottom - csvRowH()) / csvRowH());
+}
+int csvColX(int c) {
+    int x = csvGutterW() - g_csv.scrollX;
+    for (int k = 0; k < c && k < (int)g_csv.widths.size(); k++) x += g_csv.widths[(size_t)k];
+    return x;
+}
+int csvTotalW() {
+    int w = csvGutterW();
+    for (int v : g_csv.widths) w += v;
+    return w;
+}
+
+void csvScrollbars() {
+    if (!g.d || !g.sideCsv || g.ch <= 0) return;  // not ready during window creation
+    RECT rc;
+    GetClientRect(g.sideCsv, &rc);
+    SCROLLINFO si = {sizeof(si), SIF_RANGE | SIF_PAGE | SIF_POS};
+    si.nMin = 1;
+    si.nMax = (int)std::min<u64>(std::max<u64>(1, csvBodyRows()), 0x7FFFFFFF);
+    si.nPage = (UINT)csvVisibleRows();
+    si.nPos = (int)g_csv.top;
+    SetScrollInfo(g.sideCsv, SB_VERT, &si, TRUE);
+    si.nMin = 0;
+    si.nMax = csvTotalW();
+    si.nPage = (UINT)rc.right;
+    g_csv.scrollX = std::clamp(g_csv.scrollX, 0, std::max(0, csvTotalW() - (int)rc.right));
+    si.nPos = g_csv.scrollX;
+    SetScrollInfo(g.sideCsv, SB_HORZ, &si, TRUE);
+}
+
+void paintCsv(HWND hwnd) {
+    if (g_csv.doc != g.d || g_csv.version != g.d->doc.version()) rebuildCsv();
+    PAINTSTRUCT ps;
+    HDC wdc = BeginPaint(hwnd, &ps);
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    const int W = rc.right, H = rc.bottom, rh = csvRowH(), gut = csvGutterW(), px = MulDiv(1, g.dpi, 96);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, std::max(1, W), std::max(1, H));
+    HGDIOBJ ob = SelectObject(dc, bmp);
+    const COLORREF bg = g.pal.bg, fg = g.pal.fg, grid = g.pal.border, head = g.pal.face, dim = blend(fg, bg, 45);
+    fillRect(dc, 0, 0, W, H, bg);
+    HGDIOBJ of = SelectObject(dc, g.font);
+    SetBkMode(dc, TRANSPARENT);
+    const bool focused = GetFocus() == hwnd || (g_csv.edit && GetFocus() == g_csv.edit);
+    auto drawRow = [&](u64 r, int y, bool header) {
+        std::string t;
+        std::vector<CsvField> f = csvRowFields(r, t);
+        if (header) fillRect(dc, 0, y, W, y + rh, head);
+        else if (r % 2 == 0) fillRect(dc, gut, y, W, y + rh, blend(fg, bg, g.pal.dark ? 4 : 3));  // zebra rows
+        // Row number.
+        wchar_t b[32];
+        int k = header ? 0 : swprintf(b, 32, L"%llu", (unsigned long long)r);
+        RECT nr = {0, y, gut - g.cw / 2, y + rh};
+        fillRect(dc, 0, y, gut, y + rh, head);
+        SetTextColor(dc, dim);
+        if (k) DrawTextW(dc, b, k, &nr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        for (size_t c = 0; c < g_csv.widths.size(); c++) {
+            const int x = csvColX((int)c), w = g_csv.widths[c];
+            if (x > W) break;
+            if (x + w < gut) continue;
+            RECT cr = {std::max(x, gut), y, x + w, y + rh};
+            const bool isSel = !header && r == g_csv.row && (int)c == g_csv.col;
+            if (isSel) fillRect(dc, cr.left, cr.top, cr.right, cr.bottom, focused ? blend(g.pal.accent, bg, 30) : g.pal.selection);
+            if (c < f.size()) {
+                std::wstring v = csvCell(t, f[c]);
+                RECT tr = {x + g.cw, y, x + w - g.cw / 2, y + rh};
+                IntersectClipRect(dc, cr.left, cr.top, cr.right, cr.bottom);
+                SetTextColor(dc, fg);
+                HGDIOBJ hf = nullptr;
+                DrawTextW(dc, v.c_str(), (int)v.size(), &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                SelectClipRgn(dc, nullptr);
+                (void)hf;
+            }
+            fillRect(dc, x + w - 1, y, x + w, y + rh, grid);  // column line
+            if (isSel) {  // a square frame around the selected cell
+                HBRUSH fb = CreateSolidBrush(g.pal.accent);
+                RECT fr = {x, y, x + w, y + rh};
+                FrameRect(dc, &fr, fb);
+                InflateRect(&fr, -px, -px);
+                FrameRect(dc, &fr, fb);
+                DeleteObject(fb);
+            }
+        }
+        fillRect(dc, 0, y + rh - 1, W, y + rh, grid);  // row line
+        fillRect(dc, gut - 1, y, gut, y + rh, grid);
+    };
+    if (g_csv.rows.size() >= 2) {
+        drawRow(0, 0, true);  // the header stays on top
+        int y = rh;
+        for (u64 r = g_csv.top; r + 1 < g_csv.rows.size() && y < H; r++, y += rh) drawRow(r, y, false);
+    } else {
+        RECT t = rc;
+        SetTextColor(dc, dim);
+        DrawTextW(dc, g.d->doc.size() > kSideMax ? L"The file is too large for the table (limit 64 MB)." : L"Empty",
+                  -1, &t, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    fillRect(dc, 0, 0, edgeW(), H, grid);
+    SelectObject(dc, of);
+    BitBlt(wdc, 0, 0, W, H, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, ob);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+// Selects the current cell's text in the editor (keeps the focus in the table).
+void csvShowInEditor() {
+    if (g_csv.row + 1 >= g_csv.rows.size()) return;
+    std::string t;
+    std::vector<CsvField> f = csvRowFields(g_csv.row, t);
+    const u64 base = g_csv.rows[(size_t)g_csv.row];
+    u64 a = base, b = base;
+    if (g_csv.col < (int)f.size()) {
+        a = base + f[(size_t)g_csv.col].start;
+        b = base + f[(size_t)g_csv.col].end;
+    }
+    g.d->caret = std::min(a, g.d->doc.size());
+    g.d->anchor = std::min(b, g.d->doc.size());
+    g.d->wantCol = -1;
+    g_csv.syncedTop = NPOS;
+    refresh(true);
+}
+
+void csvEnsureVisible() {
+    const u64 vis = (u64)csvVisibleRows();
+    if (g_csv.row < g_csv.top) g_csv.top = g_csv.row;
+    else if (g_csv.row >= g_csv.top + vis) g_csv.top = g_csv.row - vis + 1;
+    RECT rc;
+    GetClientRect(g.sideCsv, &rc);
+    const int x = csvColX(g_csv.col) + g_csv.scrollX, w = g_csv.widths[(size_t)g_csv.col], gut = csvGutterW();
+    if (x - g_csv.scrollX < gut) g_csv.scrollX = std::max(0, x - gut);
+    else if (x + w - g_csv.scrollX > rc.right) g_csv.scrollX = x + w - (int)rc.right;
+}
+
+void csvMove(i64 dr, int dc) {
+    const u64 body = csvBodyRows();
+    if (!body) return;
+    g_csv.row = (u64)std::clamp<i64>((i64)g_csv.row + dr, 1, (i64)body);
+    g_csv.col = std::clamp(g_csv.col + dc, 0, (int)g_csv.widths.size() - 1);
+    csvEnsureVisible();
+    csvScrollbars();
+    InvalidateRect(g.sideCsv, nullptr, FALSE);
+    csvShowInEditor();
+}
+
+// The editor moved: the table follows (the row holding the editor's top line).
+void syncCsvToEditor() {
+    if (!g.sideCsv || !IsWindowVisible(g.sideCsv) || !g.d->doc.linesKnown() || g_csv.rows.size() < 3) return;
+    const u64 line = g.d->doc.lineOf(g.d->top);
+    if (line == g_csv.syncedTop) return;
+    g_csv.syncedTop = line;
+    const u64 off = g.d->top;
+    auto it = std::upper_bound(g_csv.rows.begin(), g_csv.rows.end() - 1, off);
+    u64 r = (u64)(it - g_csv.rows.begin());
+    r = r ? r - 1 : 0;
+    g_csv.top = std::clamp<u64>(r, 1, std::max<u64>(1, csvBodyRows()));
+    csvScrollbars();
+    InvalidateRect(g.sideCsv, nullptr, FALSE);
+}
+
+// The table moved: the editor follows.
+void csvSyncEditor() {
+    if (g_csv.top + 1 >= g_csv.rows.size()) return;
+    g.d->top = std::min(g_csv.rows[(size_t)g_csv.top], g.d->doc.size());
+    g.d->topFill = 0;
+    g_csv.syncedTop = g.d->doc.linesKnown() ? g.d->doc.lineOf(g.d->top) : NPOS;
+    refresh(false);
+}
+
+void csvCommitEdit(bool keep) {
+    if (!g_csv.edit) return;
+    HWND e = g_csv.edit;
+    g_csv.edit = nullptr;
+    if (keep) {
+        if (g_csv.version != g.d->doc.version()) rebuildCsv();
+        std::string t;
+        std::vector<CsvField> f = csvRowFields(g_csv.row, t);
+        const u64 base = g_csv.rows[(size_t)g_csv.row];
+        std::wstring w = editText(e);
+        std::replace(w.begin(), w.end(), L'\x21B5', L'\n');  // ↵ back to a line break
+        std::string raw = csvQuote(toDocBytes(w.c_str(), (int)w.size()), g_csv.delim);
+        if (g_csv.col < (int)f.size()) {
+            const u64 a = base + f[(size_t)g_csv.col].start, b = base + f[(size_t)g_csv.col].end;
+            if (g.d->doc.text(a, b - a) != raw) replaceRange(a, b, raw, a, a + raw.size());
+        } else {
+            // A cell past the row's last field: add the missing delimiters.
+            std::string add(1, g_csv.delim);
+            for (int k = (int)f.size(); k < g_csv.col; k++) add += g_csv.delim;
+            const u64 at = base + t.size();
+            replaceRange(at, at, add + raw, at, at + add.size() + raw.size());
+        }
+        rebuildCsv();
+    }
+    DestroyWindow(e);
+    SetFocus(g.sideCsv);
+    InvalidateRect(g.sideCsv, nullptr, FALSE);
+}
+
+LRESULT CALLBACK csvEditProc(HWND e, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_KEYDOWN) {
+        if (wp == VK_RETURN) {
+            csvCommitEdit(true);
+            csvMove(1, 0);
+            return 0;
+        }
+        if (wp == VK_ESCAPE) {
+            csvCommitEdit(false);
+            return 0;
+        }
+        if (wp == VK_TAB) {
+            csvCommitEdit(true);
+            csvMove(0, GetKeyState(VK_SHIFT) < 0 ? -1 : 1);
+            return 0;
+        }
+    }
+    if (msg == WM_CHAR && (wp == L'\r' || wp == 27 || wp == L'\t')) return 0;
+    if (msg == WM_KILLFOCUS && g_csv.edit == e) {
+        csvCommitEdit(true);
+        return 0;
+    }
+    return DefSubclassProc(e, msg, wp, lp);
+}
+
+void csvBeginEdit() {
+    if (g_csv.edit || g_csv.row + 1 >= g_csv.rows.size()) return;
+    csvEnsureVisible();
+    csvScrollbars();
+    std::string t;
+    std::vector<CsvField> f = csvRowFields(g_csv.row, t);
+    std::wstring v = g_csv.col < (int)f.size() ? csvCell(t, f[(size_t)g_csv.col]) : L"";
+    const int rh = csvRowH(), x = csvColX(g_csv.col), y = rh + (int)(g_csv.row - g_csv.top) * rh;
+    g_csv.edit = CreateWindowExW(0, L"EDIT", v.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, x + 1, y + 1,
+                                 g_csv.widths[(size_t)g_csv.col] - 2, rh - 2, g.sideCsv, nullptr, g.inst, nullptr);
+    SendMessageW(g_csv.edit, WM_SETFONT, (WPARAM)g.font, TRUE);
+    SetWindowTheme(g_csv.edit, L"", L"");
+    SetWindowSubclass(g_csv.edit, csvEditProc, 1, 0);
+    SetFocus(g_csv.edit);
+    SendMessageW(g_csv.edit, EM_SETSEL, 0, -1);
+}
+
+bool csvHit(int x, int y, u64& row, int& col, bool& onBorder) {
+    const int rh = csvRowH();
+    onBorder = false;
+    col = -1;
+    for (int c = 0; c < (int)g_csv.widths.size(); c++) {
+        const int x0 = csvColX(c), x1 = x0 + g_csv.widths[(size_t)c];
+        if (y < rh && std::abs(x - x1) <= 3) {  // the header's column edge: resize
+            onBorder = true;
+            col = c;
+            return true;
+        }
+        if (x >= x0 && x < x1) col = c;
+    }
+    if (col < 0 || x < csvGutterW()) return false;
+    if (y < rh) return false;  // header
+    row = g_csv.top + (u64)((y - rh) / rh);
+    return row >= 1 && row <= csvBodyRows();
+}
+
+LRESULT CALLBACK csvProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg >= WM_CTLCOLORMSGBOX && msg <= WM_CTLCOLORSTATIC) return themeCtlColor(msg, wp, g.pal);
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: paintCsv(hwnd); return 0;
+    case WM_SIZE: csvScrollbars(); return 0;
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS: InvalidateRect(hwnd, nullptr, FALSE); return 0;
+    case WM_GETDLGCODE: return DLGC_WANTALLKEYS;
+    case WM_MOUSEWHEEL: {
+        int lines = 3;
+        SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+        csvCommitEdit(true);
+        i64 t = (i64)g_csv.top - (i64)GET_WHEEL_DELTA_WPARAM(wp) * lines / WHEEL_DELTA;
+        g_csv.top = (u64)std::clamp<i64>(t, 1, std::max<i64>(1, (i64)csvBodyRows()));
+        csvScrollbars();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        csvSyncEditor();
+        return 0;
+    }
+    case WM_VSCROLL:
+    case WM_HSCROLL: {
+        csvCommitEdit(true);
+        const bool v = msg == WM_VSCROLL;
+        SCROLLINFO si = {sizeof(si), SIF_ALL};
+        GetScrollInfo(hwnd, v ? SB_VERT : SB_HORZ, &si);
+        i64 pos = v ? (i64)g_csv.top : g_csv.scrollX, page = v ? csvVisibleRows() - 1 : (i64)si.nPage * 9 / 10,
+            line = v ? 1 : g.cw * 4;
+        switch (LOWORD(wp)) {
+        case SB_LINEUP: pos -= line; break;
+        case SB_LINEDOWN: pos += line; break;
+        case SB_PAGEUP: pos -= std::max<i64>(1, page); break;
+        case SB_PAGEDOWN: pos += std::max<i64>(1, page); break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: pos = si.nTrackPos; break;
+        default: return 0;
+        }
+        if (v) g_csv.top = (u64)std::clamp<i64>(pos, 1, std::max<i64>(1, (i64)csvBodyRows()));
+        else g_csv.scrollX = (int)std::max<i64>(0, pos);
+        csvScrollbars();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        if (v) {
+            csvSyncEditor();
+            UpdateWindow(g.view);
+        }
+        return 0;
+    }
+    case WM_SETCURSOR: {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd, &pt);
+        u64 r;
+        int c;
+        bool border;
+        csvHit(pt.x, pt.y, r, c, border);
+        if (border || g_csv.dragCol >= 0) {
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+            return TRUE;
+        }
+        break;
+    }
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: {
+        csvCommitEdit(true);
+        SetFocus(hwnd);
+        u64 r = 0;
+        int c;
+        bool border;
+        const int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        if (csvHit(x, y, r, c, border)) {
+            if (border) {  // drag a column edge
+                g_csv.dragCol = c;
+                g_csv.dragX = x;
+                g_csv.dragW = g_csv.widths[(size_t)c];
+                SetCapture(hwnd);
+                return 0;
+            }
+            g_csv.row = r;
+            g_csv.col = c;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            csvShowInEditor();
+            if (msg == WM_LBUTTONDBLCLK) csvBeginEdit();
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (g_csv.dragCol >= 0 && GetCapture() == hwnd) {
+            g_csv.widths[(size_t)g_csv.dragCol] = std::max(3 * g.cw, g_csv.dragW + GET_X_LPARAM(lp) - g_csv.dragX);
+            csvScrollbars();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (g_csv.dragCol >= 0) {
+            g_csv.dragCol = -1;
+            ReleaseCapture();
+        }
+        return 0;
+    case WM_KEYDOWN: {
+        const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+        switch (wp) {
+        case VK_UP: csvMove(-1, 0); return 0;
+        case VK_DOWN: csvMove(1, 0); return 0;
+        case VK_LEFT: csvMove(0, -1); return 0;
+        case VK_RIGHT: csvMove(0, 1); return 0;
+        case VK_TAB: csvMove(0, shift ? -1 : 1); return 0;
+        case VK_PRIOR: csvMove(-(csvVisibleRows() - 1), 0); return 0;
+        case VK_NEXT: csvMove(csvVisibleRows() - 1, 0); return 0;
+        case VK_HOME: csvMove(ctrl ? -(i64)g_csv.row : 0, -g_csv.col); return 0;
+        case VK_END: csvMove(ctrl ? (i64)csvBodyRows() : 0, (int)g_csv.widths.size()); return 0;
+        case VK_RETURN:
+        case VK_F2: csvBeginEdit(); return 0;
+        case VK_DELETE:  // empties the cell
+            csvBeginEdit();
+            if (g_csv.edit) {
+                SetWindowTextW(g_csv.edit, L"");
+                csvCommitEdit(true);
+            }
+            return 0;
+        }
+        return 0;
+    }
+    case WM_CHAR:
+        // Typing starts editing the cell with that character.
+        if (wp >= 0x20 && !g_csv.edit) {
+            csvBeginEdit();
+            if (g_csv.edit) {
+                wchar_t s[2] = {(wchar_t)wp, 0};
+                SetWindowTextW(g_csv.edit, s);
+                SendMessageW(g_csv.edit, EM_SETSEL, 1, 1);
+            }
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
 // ---- the pane as a whole
 
 void themeSidePane() {
@@ -5285,6 +7209,10 @@ void themeSidePane() {
     TreeView_SetLineColor(g.sideTree, blend(g.pal.fg, g.pal.bg, 35));
     SendMessageW(g.sideTree, WM_SETFONT, (WPARAM)g.font, TRUE);
     SetWindowTheme(g.sidePreview, g.pal.dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+    for (HWND w : {g.sideHex, g.sideCsv}) {
+        SetWindowTheme(w, g.pal.dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+        InvalidateRect(w, nullptr, FALSE);
+    }
     g_md.width = -1;
 }
 
@@ -5297,6 +7225,27 @@ void updateSidePane() {
     ShowWindow(g.sideTree, vis && (kind == SIDE_JSON || kind == SIDE_XML) ? SW_SHOW : SW_HIDE);
     if (g_dataBar.wnd) ShowWindow(g_dataBar.wnd, vis && (kind == SIDE_JSON || kind == SIDE_XML) ? SW_SHOW : SW_HIDE);
     ShowWindow(g.sidePreview, vis && kind == SIDE_MD ? SW_SHOW : SW_HIDE);
+    ShowWindow(g.sideHex, vis && kind == SIDE_HEX ? SW_SHOW : SW_HIDE);
+    ShowWindow(g.sideCsv, vis && kind == SIDE_CSV ? SW_SHOW : SW_HIDE);
+    if (vis && kind == SIDE_HEX) {
+        g_hex.caret = std::min(g.d->caret, g.d->doc.size());
+        g_hex.syncedTop = NPOS;
+        syncHexToEditor();
+        hexScrollbar();
+        InvalidateRect(g.sideHex, nullptr, FALSE);
+        return;
+    }
+    if (vis && kind == SIDE_CSV) {
+        if (g_csv.doc != g.d || g_csv.version != g.d->doc.version()) {
+            if (g_csv.doc != g.d) g_csv = CsvState();  // another file: fresh widths and selection
+            rebuildCsv();
+        }
+        g_csv.syncedTop = NPOS;
+        syncCsvToEditor();
+        csvScrollbars();
+        InvalidateRect(g.sideCsv, nullptr, FALSE);
+        return;
+    }
     if (!vis) return;
     if (kind == SIDE_MD) {
         g.mdSyncedTop = NPOS;
@@ -5615,6 +7564,17 @@ HMENU buildMenu() {
     AppendMenuW(file, MF_STRING, IDM_OPEN, L"&Open...\tCtrl+O");
     AppendMenuW(file, MF_STRING, IDM_SAVE, L"&Save\tCtrl+S");
     AppendMenuW(file, MF_STRING, IDM_SAVEAS, L"Save &As...\tCtrl+Shift+S");
+    g.recentMenu = CreatePopupMenu();
+    AppendMenuW(g.recentMenu, MF_STRING | MF_GRAYED, IDM_RECENT0, L"No recent files");
+    AppendMenuW(file, MF_POPUP, (UINT_PTR)g.recentMenu, L"Open &Recent");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+    g.encMenu = CreatePopupMenu();
+    g.eolMenu = CreatePopupMenu();
+    addEncodingItems(g.encMenu, g.eolMenu);
+    AppendMenuW(file, MF_POPUP, (UINT_PTR)g.encMenu, L"&Encoding");
+    AppendMenuW(file, MF_POPUP, (UINT_PTR)g.eolMenu, L"&Line Endings");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(file, MF_STRING, IDM_PRINT, L"&Print...\tCtrl+P");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     HMENU tabsMenu = CreatePopupMenu();
     AppendMenuW(tabsMenu, MF_STRING, IDM_NEWTAB, L"&New Tab\tCtrl+T");
@@ -5659,7 +7619,21 @@ HMENU buildMenu() {
     AppendMenuW(line, MF_STRING, IDM_LINE_BELOW, L"Insert Line &Below\tCtrl+Shift+Enter");
     AppendMenuW(line, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(line, MF_STRING, IDM_OUTDENT, L"&Outdent\tShift+Tab");
+    AppendMenuW(line, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(line, MF_STRING, IDM_SORT_ASC, L"&Sort Lines");
+    AppendMenuW(line, MF_STRING, IDM_SORT_DESC, L"Sort Lines Des&cending");
+    AppendMenuW(line, MF_STRING, IDM_DEDUPE, L"Remove Duplicate &Lines");
+    AppendMenuW(line, MF_STRING, IDM_TRIM, L"&Trim Trailing Whitespace");
     AppendMenuW(edit, MF_POPUP, (UINT_PTR)line, L"&Line");
+    HMENU carets = CreatePopupMenu();
+    AppendMenuW(carets, MF_STRING, IDM_ADDNEXT, L"Add Caret at &Next Match\tShift+Alt+.");
+    AppendMenuW(carets, MF_STRING, IDM_ADDALL, L"Add Carets at &All Matches\tShift+Alt+;");
+    AppendMenuW(carets, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(carets, MF_STRING, IDM_BOX_UP, L"Column Select &Up\tShift+Alt+Up");
+    AppendMenuW(carets, MF_STRING, IDM_BOX_DOWN, L"Column Select &Down\tShift+Alt+Down");
+    AppendMenuW(carets, MF_STRING, IDM_BOX_LEFT, L"Column Select &Left\tShift+Alt+Left");
+    AppendMenuW(carets, MF_STRING, IDM_BOX_RIGHT, L"Column Select &Right\tShift+Alt+Right");
+    AppendMenuW(edit, MF_POPUP, (UINT_PTR)carets, L"&Multiple Carets");
     HMENU adv = CreatePopupMenu();
     AppendMenuW(adv, MF_STRING, IDM_UPPER, L"Make &Uppercase\tCtrl+Shift+U");
     AppendMenuW(adv, MF_STRING, IDM_LOWER, L"Make &Lowercase\tCtrl+U");
@@ -5674,7 +7648,9 @@ HMENU buildMenu() {
     AppendMenuW(view, MF_STRING, IDM_WRAP, L"&Word Wrap\tAlt+Z");
     AppendMenuW(view, MF_STRING, IDM_LINENUMBERS, L"&Line Numbers");
     AppendMenuW(view, MF_STRING, IDM_HIGHLIGHT, L"Syntax &Highlighting");
+    AppendMenuW(view, MF_STRING, IDM_SHOWWS, L"Show White&space");
     AppendMenuW(view, MF_STRING, IDM_SIDEVIEW, L"Data View / &Preview\tCtrl+Shift+V");
+    AppendMenuW(view, MF_STRING, IDM_HEXVIEW, L"Show as He&x");
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, MF_STRING, IDM_FONT, L"&Font...");
     AppendMenuW(view, MF_STRING, IDM_ZOOMIN, L"Zoom &In\tCtrl+Plus");
@@ -5771,6 +7747,13 @@ HACCEL buildAccelerators() {
         {FVIRTKEY | FSHIFT, VK_F7, IDM_PREVCHANGE},
         {FVIRTKEY | FCONTROL, 'R', IDM_REVERTCHANGE},
         {FVIRTKEY, VK_F5, IDM_VCS_REFRESH},
+        {FVIRTKEY | FCONTROL, 'P', IDM_PRINT},
+        {FVIRTKEY | FALT | FSHIFT, VK_OEM_PERIOD, IDM_ADDNEXT},
+        {FVIRTKEY | FALT | FSHIFT, VK_OEM_1, IDM_ADDALL},
+        {FVIRTKEY | FALT | FSHIFT, VK_UP, IDM_BOX_UP},
+        {FVIRTKEY | FALT | FSHIFT, VK_DOWN, IDM_BOX_DOWN},
+        {FVIRTKEY | FALT | FSHIFT, VK_LEFT, IDM_BOX_LEFT},
+        {FVIRTKEY | FALT | FSHIFT, VK_RIGHT, IDM_BOX_RIGHT},
     };
     return CreateAcceleratorTableW(a, (int)(sizeof(a) / sizeof(a[0])));
 }
@@ -5804,6 +7787,8 @@ void layoutFrame() {
         if (g_dataBar.wnd) MoveWindow(g_dataBar.wnd, right + gap, top, sw, sb, TRUE);
         MoveWindow(g.sideTree, right + gap, top + sb, sw, std::max(0, h - top - sb), TRUE);
         MoveWindow(g.sidePreview, right + gap, top, sw, h - top, TRUE);
+        MoveWindow(g.sideHex, right + gap, top, sw, h - top, TRUE);
+        MoveWindow(g.sideCsv, right + gap, top, sw, h - top, TRUE);
     }
     if (g.diffOn) {
         // The strip in the middle can be dragged: the left side gets diffSplit of the rest.
@@ -5867,6 +7852,7 @@ void activateTab(int i) {
     layoutFrame();
     updateSidePane();
     SetFocus(g.view);
+    PostMessageW(g.frame, WM_APP_DISKCHECK, 0, 0);  // changed on disk while in the background?
 }
 
 // A new empty tab, made active.
@@ -5904,6 +7890,7 @@ bool openInTab(const std::wstring& path) {
         invalidateTabs();
         return false;
     }
+    addRecent(path);
     invalidateTabs();
     InvalidateRect(g.diffPane, nullptr, FALSE);
     return true;
@@ -6159,6 +8146,30 @@ void showEditorMenu(POINT screen) {
 }
 
 void onCommand(int id) {
+    // Commands that work with several carets keep them; the rest go back to one.
+    switch (id) {
+    case IDM_COPY:
+    case IDM_CUT:
+    case IDM_PASTE:
+    case IDM_DELETE:
+    case IDM_ADDNEXT:
+    case IDM_ADDALL:
+    case IDM_BOX_UP:
+    case IDM_BOX_DOWN:
+    case IDM_BOX_LEFT:
+    case IDM_BOX_RIGHT:
+    case IDM_SHOWWS:
+    case IDM_ZOOMIN:
+    case IDM_ZOOMOUT:
+    case IDM_ZOOMRESET: break;
+    default:
+        if (multi()) clearExtras();
+        g.boxActive = false;
+    }
+    if (id >= IDM_RECENT0 && id < IDM_RECENT0 + 12) {
+        openRecent((size_t)(id - IDM_RECENT0));
+        return;
+    }
     if (id >= IDM_TAB1 && id < IDM_TAB1 + 9) {
         // Ctrl+1..8: that tab; Ctrl+9: the last one, as in browsers.
         int i = id - IDM_TAB1;
@@ -6219,6 +8230,10 @@ void onCommand(int id) {
         break;
     }
     case IDM_CUT:
+        if (multi()) {
+            if (multiCopy()) multiInsert("");
+            break;
+        }
         if (!hasSel()) {  // no selection: cut the whole line, like Visual Studio
             copyLines(true);
             break;
@@ -6278,6 +8293,15 @@ void onCommand(int id) {
         if (!g.d->path.empty()) startVcsQuery(true);
         break;
     case IDM_SIDEVIEW: toggleSidePane(); break;
+    case IDM_HEXVIEW:
+        g.d->forceHex = !g.d->forceHex;
+        if (g.d->forceHex) {
+            g.sideOn = true;
+            if (g.diffOn) toggleDiff();
+        }
+        layoutFrame();
+        updateSidePane();
+        break;
     case IDM_HIGHLIGHT:
         g.highlight = !g.highlight;
         saveSettings();
@@ -6303,6 +8327,35 @@ void onCommand(int id) {
     case IDM_VCS_FILES: cmdChangelistFiles(); break;
     case IDM_VCS_HISTORY: cmdHistory(); break;
     case IDM_ABOUT: DialogBoxParamW(g.inst, MAKEINTRESOURCEW(IDD_ABOUT), g.frame, aboutProc, 0); break;
+    case IDM_PRINT: cmdPrint(); break;
+    case IDM_RECENTCLEAR:
+        g.recent.clear();
+        saveRecent();
+        break;
+    case IDM_ENC_UTF8:
+    case IDM_ENC_UTF8BOM:
+    case IDM_ENC_UTF16LE:
+    case IDM_ENC_UTF16BE:
+    case IDM_ENC_ANSI: setEncoding((FileEnc)(id - IDM_ENC_UTF8)); break;
+    case IDM_REINTERP_UTF8: reinterpretAs(FE_UTF8); break;
+    case IDM_REINTERP_ANSI: reinterpretAs(FE_ANSI); break;
+    case IDM_EOL_CRLF: setLineEndings(true); break;
+    case IDM_EOL_LF: setLineEndings(false); break;
+    case IDM_SORT_ASC: sortLines(0); break;
+    case IDM_SORT_DESC: sortLines(1); break;
+    case IDM_DEDUPE: sortLines(2); break;
+    case IDM_TRIM: trimTrailing(); break;
+    case IDM_ADDNEXT: addNextMatch(false); break;
+    case IDM_ADDALL: addNextMatch(true); break;
+    case IDM_BOX_UP: boxMove(-1, 0); break;
+    case IDM_BOX_DOWN: boxMove(1, 0); break;
+    case IDM_BOX_LEFT: boxMove(0, -1); break;
+    case IDM_BOX_RIGHT: boxMove(0, 1); break;
+    case IDM_SHOWWS:
+        g.showWs = !g.showWs;
+        saveSettings();
+        InvalidateRect(g.view, nullptr, FALSE);
+        break;
     }
 }
 
@@ -6321,7 +8374,11 @@ void updateMenu() {
         const int k = sideKind();
         themeSetMenuText(g.menu, IDM_SIDEVIEW, k == SIDE_MD                     ? L"Markdown &Preview\tCtrl+Shift+V"
                                                : k == SIDE_JSON || k == SIDE_XML ? L"&Data View\tCtrl+Shift+V"
+                                               : k == SIDE_HEX                   ? L"&Hex View\tCtrl+Shift+V"
+                                               : k == SIDE_CSV                   ? L"&Table View\tCtrl+Shift+V"
                                                                                  : L"Data View / &Preview\tCtrl+Shift+V");
+        CheckMenuItem(g.menu, IDM_HEXVIEW, MF_BYCOMMAND | (g.d->forceHex || g.d->binary ? MF_CHECKED : MF_UNCHECKED));
+        en(IDM_HEXVIEW, !g.d->binary);
         en(IDM_SIDEVIEW, k != SIDE_NONE);
         CheckMenuItem(g.menu, IDM_SIDEVIEW, MF_BYCOMMAND | (sideVisible() ? MF_CHECKED : MF_UNCHECKED));
     }
@@ -6337,6 +8394,8 @@ void updateMenu() {
     en(IDM_VCS_HISTORY, vcs && g.d->vcs.tracked);
     for (int k = 0; k < 3; k++)
         CheckMenuItem(g.menu, IDM_THEME_SYSTEM + k, MF_BYCOMMAND | (g.themeMode == k ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(g.menu, IDM_SHOWWS, MF_BYCOMMAND | (g.showWs ? MF_CHECKED : MF_UNCHECKED));
+    checkEncodingItems(g.menu);
 }
 
 // ====================================================================== view window
@@ -6345,6 +8404,17 @@ void onKeyDown(WPARAM vk) {
     const bool ctrl = GetKeyState(VK_CONTROL) < 0;
     const bool shift = GetKeyState(VK_SHIFT) < 0;
     LayoutCfg c = cfg();
+    if (multi()) {
+        if (vk == VK_ESCAPE) {
+            clearExtras();
+            refresh(false);
+            return;
+        }
+        if (multiKey(vk, ctrl, shift)) return;
+        // Typed characters arrive as WM_CHAR after this; only moves that
+        // several carets do not do go back to one.
+        if (vk == VK_PRIOR || vk == VK_NEXT || vk == VK_HOME || vk == VK_END || vk == VK_UP || vk == VK_DOWN) clearExtras();
+    }
     switch (vk) {
     case VK_LEFT:
         if (hasSel() && !shift && !ctrl) moveCaret(selMin(), false);
@@ -6420,6 +8490,10 @@ void onChar(wchar_t ch) {
         typeNewline();
         return;
     }
+    if (ch == L'\t' && multi()) {
+        typeChar('\t');
+        return;
+    }
     if (ch == L'\t') {
         // Shift+Tab outdents; Tab with a multi-line selection indents it.
         const bool shift = GetKeyState(VK_SHIFT) < 0;
@@ -6486,7 +8560,29 @@ LRESULT CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CHAR: onChar((wchar_t)wp); return 0;
     case WM_LBUTTONDOWN: {
         SetFocus(hwnd);
-        u64 p = posFromPoint(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        const int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        const bool alt = GetKeyState(VK_MENU) < 0;
+        u64 p = posFromPoint(mx, my);
+        if (alt && (wp & MK_CONTROL)) {  // Ctrl+Alt+click: one more caret
+            g.altClicked = true;
+            addCaretAt(p);
+            return 0;
+        }
+        if (alt) {  // Alt+drag: column selection
+            u64 line;
+            int col;
+            g.altClicked = true;
+            if (boxPoint(mx, my, line, col)) {
+                g.boxL0 = g.boxL1 = line;
+                g.boxC0 = g.boxC1 = col;
+                g.boxDrag = true;
+                SetCapture(hwnd);
+                boxRebuild();
+                refresh(false);
+            }
+            return 0;
+        }
+        clearExtras();
         g.selecting = true;
         SetCapture(hwnd);
         SetTimer(hwnd, kTimerDrag, 50, nullptr);
@@ -6510,6 +8606,7 @@ LRESULT CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONDBLCLK: {
+        clearExtras();
         u64 p = posFromPoint(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         u64 a, b;
         wordAt(g.d->doc, p, a, b);
@@ -6520,10 +8617,40 @@ LRESULT CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEMOVE:
+        if (g.boxDrag && (wp & MK_LBUTTON)) {
+            u64 line;
+            int col;
+            const int my = GET_Y_LPARAM(lp);
+            if (my < 0 || my >= g.visRows * g.ch) {  // past the top or bottom: scroll along
+                scrollRows(my < 0 ? -1 : 1);
+                relayout();
+            }
+            if (boxPoint(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), line, col) && (line != g.boxL1 || col != g.boxC1)) {
+                g.boxL1 = line;
+                g.boxC1 = col;
+                boxRebuild();
+                refresh(false);
+            }
+            return 0;
+        }
         if (g.selecting && (wp & MK_LBUTTON)) dragTo(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         return 0;
+    case WM_SYSKEYUP:
+        // Releasing Alt after Alt+click must not open the menu bar.
+        if (wp == VK_MENU && g.altClicked) {
+            g.altClicked = false;
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    case WM_SYSKEYDOWN:
+        if (wp != VK_MENU) g.altClicked = false;
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_LBUTTONUP:
     case WM_CAPTURECHANGED:
+        if (g.boxDrag) {
+            g.boxDrag = false;
+            if (msg == WM_LBUTTONUP) ReleaseCapture();
+        }
         if (g.selecting) {
             g.selecting = false;
             KillTimer(hwnd, kTimerDrag);
@@ -6643,8 +8770,12 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TreeView_SetExtendedStyle(g.sideTree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
         setupFindBar();
         setupDataBar();
+        g.sideHex = CreateWindowExW(0, kHexClass, L"", WS_CHILD | WS_VSCROLL | WS_TABSTOP, 0, 0, 0, 0, hwnd, nullptr, g.inst, nullptr);
+        g.sideCsv = CreateWindowExW(0, kCsvClass, L"", WS_CHILD | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP | WS_CLIPCHILDREN, 0, 0, 0, 0,
+                                    hwnd, nullptr, g.inst, nullptr);
         g.sideSplitter = CreateWindowExW(0, kSplitClass, L"", WS_CHILD, 0, 0, 0, 0, hwnd, nullptr, g.inst, nullptr);
         g.sidePreview = CreateWindowExW(0, kPreviewClass, L"", WS_CHILD | WS_VSCROLL, 0, 0, 0, 0, hwnd, nullptr, g.inst, nullptr);
+        SetTimer(hwnd, kTimerDisk, 2000, nullptr);
         return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: paintStatus(hwnd); return 0;
@@ -6664,7 +8795,10 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         refresh(true);
         return 0;
     }
-    case WM_INITMENUPOPUP: updateMenu(); return 0;
+    case WM_INITMENUPOPUP:
+        if ((HMENU)wp == g.recentMenu) rebuildRecentMenu();
+        updateMenu();
+        return 0;
     case WM_SETCURSOR:
         if ((HWND)wp == hwnd && LOWORD(lp) == HTCLIENT) {
             POINT pt;
@@ -6741,6 +8875,14 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (g.diffOn && PtInRect(&g.navPrev, pt)) g.navPress = 1;
         else if (g.diffOn && PtInRect(&g.navNext, pt)) g.navPress = 2;
         else {
+            RECT cr;
+            GetClientRect(hwnd, &cr);
+            if (msg == WM_LBUTTONDOWN && pt.y >= cr.bottom - g.statusH) {  // status bar: encoding, line endings
+                POINT sp = pt;
+                ClientToScreen(hwnd, &sp);
+                showEncodingMenu(sp);
+                return 0;
+            }
             SetFocus(g.view);
             return 0;
         }
@@ -6817,6 +8959,10 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (((NMHDR*)lp)->hwndFrom == g.sideTree) return onTreeNotify((NMHDR*)lp);
         return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_APP_P4ASK: onP4Ask(); return 0;
+    case WM_APP_DISKCHECK: checkDisk(IsWindowEnabled(hwnd) != 0); return 0;
+    case WM_ACTIVATEAPP:
+        if (wp) PostMessageW(hwnd, WM_APP_DISKCHECK, 0, 0);
+        return 0;
     case WM_APP_P4EDITED: onP4Edited((unsigned)wp, (RunResult*)lp); return 0;
     case WM_UPDATE_STATUS:
         g.updatePct = (int)(INT_PTR)wp;
@@ -6840,6 +8986,11 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == kTimerSession) {
             autosaveSession();
+            return 0;
+        }
+        if (wp == kTimerDisk) {
+            // Unsaved edits are only asked about while this window is in front.
+            checkDisk(GetForegroundWindow() == hwnd && IsWindowEnabled(hwnd));
             return 0;
         }
         if (wp == kTimerIndex) {
@@ -6976,6 +9127,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     dcl.lpszClassName = kSplitClass;
     dcl.style = CS_DBLCLKS;
     RegisterClassExW(&dcl);
+    dcl.lpfnWndProc = hexProc;
+    dcl.lpszClassName = kHexClass;
+    dcl.hCursor = LoadCursorW(nullptr, IDC_IBEAM);
+    RegisterClassExW(&dcl);
+    dcl.lpfnWndProc = csvProc;
+    dcl.lpszClassName = kCsvClass;
+    dcl.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassExW(&dcl);
     dcl.style = 0;
     dcl.lpfnWndProc = barProc;
     dcl.lpszClassName = kBarClass;
@@ -6984,6 +9143,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     g.menu = buildMenu();
     themeOwnerDrawMenu(g.menu);
+    markEncodingRadios(g.menu);
     for (int k = 0; k < 3; k++) themeSetMenuRadio(g.menu, IDM_THEME_SYSTEM + k);
     g.accel = buildAccelerators();
     g.findMsg = RegisterWindowMessageW(FINDMSGSTRINGW);
@@ -7005,7 +9165,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     // Load the document before the window is shown, so the first frame the
     // user sees already has the text in it.
     addTab();
+    g_restoring = true;
     restoreSession();
+    g_restoring = false;
     for (int i = 1; i < __argc; i++)
         if (__wargv[i][0]) openInTab(__wargv[i]);
 

@@ -416,6 +416,11 @@ void Doc::rawInsert(u64 pos, const Piece* ps, size_t count) {
     }
     root_ = merge(a, b);
     version_++;
+    if (onEdit) {
+        u64 total = 0;
+        for (size_t i = 0; i < count; i++) total += ps[i].len;
+        if (total) onEdit(pos, 0, total);
+    }
 }
 
 void Doc::rawErase(u64 pos, u64 n, std::vector<Piece>* out) {
@@ -427,6 +432,7 @@ void Doc::rawErase(u64 pos, u64 n, std::vector<Piece>* out) {
     freeTree(m);
     root_ = merge(a, c);
     version_++;
+    if (onEdit) onEdit(pos, n, 0);
 }
 
 void Doc::pushEdit(Edit&& e) {
