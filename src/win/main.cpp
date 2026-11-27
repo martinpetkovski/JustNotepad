@@ -236,6 +236,9 @@ struct App {
     std::vector<std::unique_ptr<DocState>> tabs;
     DocState* d = nullptr;
     int tabHover = -1, tabCloseHover = -1;
+    int tabFirst = 0;                         // first tab shown when they do not all fit
+    RECT tabListRect = {};                    // the ▾ listing every tab (empty when all fit)
+    bool tabListHot = false, tabListPress = false;
     std::vector<RECT> tabRects, tabCloseRects;
 
     HINSTANCE inst = nullptr;
@@ -409,6 +412,7 @@ void termFollowFile();
 void fvTheme();
 void toggleFolderView();
 void fvStartSearch();
+std::wstring parentFolder(const std::wstring& p);
 void boxRebuild();
 bool boxPoint(int x, int y, u64& line, int& col);
 void showEncodingMenu(POINT screen);
@@ -8128,16 +8132,59 @@ void paintTabs(HDC dc) {
     g.tabCloseRects.assign(g.tabs.size(), RECT{});
     HGDIOBJ of = SelectObject(dc, g.uiFont);
     SetBkMode(dc, TRANSPARENT);
-    int x = 0;
     const int maxW = MulDiv(240, g.dpi, 96), minW = MulDiv(90, g.dpi, 96);
+    const int n = (int)g.tabs.size();
+    // Each tab's width for its name; when they do not all fit, they shrink
+    // (down to minW), and past that the row scrolls to keep the open tab in
+    // view, with a list of every tab at the right end.
+    std::vector<int> w((size_t)n);
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        std::wstring title = tabTitle(g.tabs[(size_t)i].get());
+        SIZE sz = {};
+        GetTextExtentPoint32W(dc, title.c_str(), (int)title.size(), &sz);
+        w[(size_t)i] = std::clamp((int)sz.cx + 2 * pad + xw, minW, maxW);
+        total += w[(size_t)i] + gap;
+    }
+    const int listW = H;
+    SetRectEmpty(&g.tabListRect);
+    int avail = rc.right;
+    if (total > avail) {
+        avail = std::max(minW, (int)rc.right - listW - gap);
+        g.tabListRect = {(int)rc.right - listW, T0, (int)rc.right, T0 + H};
+        // Shrink the wide ones first: cap every tab at the same width until it fits.
+        int lo = minW, hi = maxW;
+        while (lo < hi) {
+            const int mid = (lo + hi + 1) / 2;
+            int t = 0;
+            for (int x : w) t += std::min(x, mid) + gap;
+            if (t <= avail) lo = mid;
+            else hi = mid - 1;
+        }
+        for (int& x : w) x = std::min(x, lo);
+        // Still too many: scroll so the open tab shows.
+        const int act = tabIndex(g.d);
+        g.tabFirst = std::clamp(g.tabFirst, 0, std::max(0, n - 1));
+        if (act >= 0 && act < g.tabFirst) g.tabFirst = act;
+        auto endOf = [&](int last) {
+            int e = 0;
+            for (int i = g.tabFirst; i <= last; i++) e += w[(size_t)i] + gap;
+            return e;
+        };
+        while (act >= 0 && g.tabFirst < act && endOf(act) > avail) g.tabFirst++;
+        // No empty space at the end when tabs were closed.
+        while (g.tabFirst > 0 && endOf(n - 1) + w[(size_t)(g.tabFirst - 1)] + gap <= avail) g.tabFirst--;
+    } else {
+        g.tabFirst = 0;
+    }
+    int x = 0;
     for (size_t i = 0; i < g.tabs.size(); i++) {
         const DocState* t = g.tabs[i].get();
         const bool active = t == g.d, hot = (int)i == g.tabHover;
+        if ((int)i < g.tabFirst || x >= avail) continue;  // scrolled out of the row
         std::wstring title = tabTitle(t);
-        SIZE sz = {};
-        GetTextExtentPoint32W(dc, title.c_str(), (int)title.size(), &sz);
-        int w = std::clamp((int)sz.cx + 2 * pad + xw, minW, maxW);
-        RECT r = {x, T0, x + w, T0 + H};
+        const int tw = std::min(w[i], avail - x);
+        RECT r = {x, T0, x + tw, T0 + H};
         fillRect(dc, r.left, r.top, r.right, r.bottom, active ? bg : hot ? blend(face, bg, 50) : blend(face, text, 92));
         if (active) fillRect(dc, r.left, r.top, r.right, r.top + MulDiv(2, g.dpi, 96), g.pal.accent);  // the open one
         RECT tr = {r.left + pad, T0, r.right - pad / 2 - xw, T0 + H};
@@ -8153,9 +8200,45 @@ void paintTabs(HDC dc) {
         }
         g.tabRects[i] = r;
         g.tabCloseRects[i] = xr;
-        x += w + gap;
+        x += tw + gap;
+    }
+    // The list of all tabs, when they do not fit.
+    if (!IsRectEmpty(&g.tabListRect)) {
+        RECT lr = g.tabListRect;
+        InflateRect(&lr, -MulDiv(3, g.dpi, 96), -MulDiv(3, g.dpi, 96));
+        const bool held = g.tabListPress;
+        if (g.tabListHot || held) drawButton3D(dc, lr, held ? BTN_PRESSED : BTN_HOT, g.pal, 0);
+        drawGlyph(dc, lr, GLYPH_DOWN, g.tabListHot ? g.pal.fg : blend(text, face, 70), 0, held);
     }
     SelectObject(dc, of);
+}
+
+// The ▾ at the end of a full tab row: every tab, the open one ticked.
+void showTabList() {
+    HMENU m = CreatePopupMenu();
+    for (size_t i = 0; i < g.tabs.size(); i++) {
+        const DocState* t = g.tabs[i].get();
+        std::wstring label = tabTitle(t);
+        if (!t->path.empty()) label += L"\t" + parentFolder(t->path);
+        std::wstring safe;
+        for (wchar_t c : label) {
+            if (c == L'&') safe += L'&';
+            safe += c;
+        }
+        AppendMenuW(m, MF_STRING | (t == g.d ? MF_CHECKED : 0), (UINT)(i + 1), safe.c_str());
+    }
+    themeOwnerDrawPopup(m);
+    themePopupColors(m, g.pal);
+    POINT pt = {g.tabListRect.right, g.tabListRect.bottom};
+    ClientToScreen(g.frame, &pt);
+    g.tabListPress = true;
+    InvalidateRect(g.frame, &g.tabListRect, FALSE);
+    UINT cmd = (UINT)TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, pt.x, pt.y, g.frame, nullptr);
+    g.tabListPress = false;
+    InvalidateRect(g.frame, &g.tabListRect, FALSE);
+    themeReleasePopup(m);
+    DestroyMenu(m);
+    if (cmd) activateTab((int)cmd - 1);
 }
 
 int tabAt(POINT pt, bool* onClose) {
@@ -10040,6 +10123,13 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             TRACKMOUSEEVENT tm = {sizeof(tm), TME_LEAVE, hwnd, 0};
             TrackMouseEvent(&tm);
         }
+        const bool listHot = PtInRect(&g.tabListRect, pt) != 0;
+        if (listHot != g.tabListHot) {
+            g.tabListHot = listHot;
+            InvalidateRect(hwnd, &g.tabListRect, FALSE);
+            TRACKMOUSEEVENT tl = {sizeof(tl), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&tl);
+        }
         bool onX = false;
         int i = tabAt(pt, &onX);
         int x = onX ? i : -1;
@@ -10056,6 +10146,10 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSELEAVE:
+        if (g.tabListHot) {
+            g.tabListHot = false;
+            InvalidateRect(hwnd, &g.tabListRect, FALSE);
+        }
         if (g_tb.menuHover >= 0) {
             g_tb.menuHover = -1;
             invalidateTitle();
@@ -10085,6 +10179,10 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g.dragSplit = 2;
                 SetCapture(hwnd);
             }
+            return 0;
+        }
+        if (msg == WM_LBUTTONDOWN && PtInRect(&g.tabListRect, pt)) {
+            showTabList();
             return 0;
         }
         bool onX = false;
