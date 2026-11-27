@@ -56,8 +56,8 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $exe = Join-Path $out 'JustNotepad.exe'
 # comdlg32 and shell32 are only needed once a dialog opens or a file is
 # dropped, so they are delay-loaded to keep them out of the startup path.
-& cl @common @opt "/Fo:$objDir/obj/" "/Fd:$objDir/obj/" "/Fe:$exe" (Join-Path $root 'src\win\main.cpp') (Join-Path $root 'src\win\vcs.cpp') (Join-Path $root 'src\win\updater.cpp') (Join-Path $root 'src\win\theme.cpp') @core $res `
-    /link @link /SUBSYSTEM:WINDOWS /MANIFEST:NO user32.lib gdi32.lib comdlg32.lib shell32.lib winhttp.lib advapi32.lib comctl32.lib uxtheme.lib dwmapi.lib gdiplus.lib ole32.lib delayimp.lib `
+& cl @common @opt "/Fo:$objDir/obj/" "/Fd:$objDir/obj/" "/Fe:$exe" (Join-Path $root 'src\win\main.cpp') (Join-Path $root 'src\win\vcs.cpp') (Join-Path $root 'src\win\updater.cpp') (Join-Path $root 'src\win\theme.cpp') (Join-Path $root 'src\win\terminal.cpp') @core $res `
+    /link @link /SUBSYSTEM:WINDOWS /MANIFEST:NO user32.lib gdi32.lib comdlg32.lib shell32.lib winhttp.lib advapi32.lib comctl32.lib uxtheme.lib dwmapi.lib gdiplus.lib ole32.lib uuid.lib delayimp.lib `
     /DELAYLOAD:comdlg32.dll /DELAYLOAD:shell32.dll
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 

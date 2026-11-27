@@ -37,6 +37,7 @@ Prefer no installer? [Download the zip](https://github.com/martinpetkovski/JustN
 - **Brackets and indent**: the bracket at the caret and its partner are boxed. Enter after `{`, `[`, `(` (or `:` in Python) indents one level and puts a closing bracket on its own line; typing a closing bracket on a blank line lines it up with its opening one.
 - **Reloads files changed on disk** (sync, checkout, another editor); asks first if you have unsaved edits.
 - **Encoding and line endings**: click the status bar or use File > Encoding / Line Endings to save as UTF-8, UTF-8 with BOM, UTF-16 LE / BE or ANSI, reinterpret a misdetected file, or convert CRLF / LF.
+- **Terminal** (View > Terminal, Ctrl+`): PowerShell in a panel below the editor, started in the current file's folder (PowerShell 7 if installed, else Windows PowerShell). A real console on Windows' pseudo console, so colours, Tab completion, history and interactive tools work. Drag its header to resize; select to copy (Ctrl+C with a selection, or right-click), Ctrl+V or right-click to paste, Shift+PgUp / PgDn or the wheel to scroll back. Ctrl+` again goes back to the editor.
 - File > Open Recent, File > Print (Ctrl+P, also to PDF), View > Show Whitespace, Edit > Line > Sort Lines / Remove Duplicate Lines / Trim Trailing Whitespace.
 
 ## Version control

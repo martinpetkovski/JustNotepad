@@ -18,6 +18,7 @@
 #include <windowsx.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <commctrl.h>
 #include <uxtheme.h>
 
@@ -26,6 +27,9 @@
 #include <wchar.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <functional>
 #include <cmath>
 #include <ctime>
@@ -45,6 +49,7 @@
 #include "../core/lineindex.h"
 #include "../core/utf.h"
 #include "resource.h"
+#include "terminal.h"
 #include "theme.h"
 #include "updater.h"
 #include "vcs.h"
@@ -315,11 +320,30 @@ struct App {
     std::vector<std::wstring> recent;  // File > Open Recent, newest first
     HMENU recentMenu = nullptr, encMenu = nullptr, eolMenu = nullptr;
 
+    // terminal panel (View > Terminal, Ctrl+`), below the editor
+    HWND term = nullptr;
+    bool termOn = false;
+    double termSplit = 0.32;  // share of the window height
+
     std::wstring statusLeft, statusRight, title;
     u64 gotoLine = 0;
 };
 
 App g;
+
+struct FolderView {
+    HWND tree = nullptr, splitter = nullptr;
+    bool on = false;
+    double split = 0.2;  // share of the window width
+    std::wstring root;
+    HTREEITEM rootItem = nullptr;
+    struct Node { std::wstring path; int kind; bool filled; };  // kind: 0 file, 1 folder, 2 ".."
+    std::vector<Node> nodes;  // item lParam -> node
+    bool revealing = false;
+    bool searching = false;  // the tree shows search results
+};
+FolderView g_fv;
+bool g_fvStartOn = false;  // the folder view was open last time
 unsigned g_gen = 0;  // source of unique ids for background work replies
 
 INT_PTR dialogTheme(HWND dlg, UINT msg, WPARAM wp, LPARAM lp);
@@ -378,6 +402,13 @@ void addRecent(const std::wstring& path);
 void rebuildRecentMenu();
 void checkDisk(bool mayAsk);
 void addCaretAt(u64 p);
+int titleH();
+void invalidateTitle();
+void paintTitle(HDC dc);
+void termFollowFile();
+void fvTheme();
+void toggleFolderView();
+void fvStartSearch();
 void boxRebuild();
 bool boxPoint(int x, int y, u64& line, int& col);
 void showEncodingMenu(POINT screen);
@@ -764,6 +795,7 @@ void updateStatus() {
     if (title != g.title) {
         g.title = title;
         SetWindowTextW(g.frame, title.c_str());
+        invalidateTitle();
         invalidateTabs();  // the tab shows the modified dot too
     }
     // Perforce keeps files read-only until they are checked out: check it out
@@ -847,7 +879,7 @@ void refresh(bool followCaret) {
     if (g.diffOn && g.diffPane) {
         InvalidateRect(g.diffPane, nullptr, FALSE);
         InvalidateRect(g.strip, nullptr, FALSE);
-        RECT hd = {0, 0, 32767, tabBarH() + headerH()};
+        RECT hd = {0, 0, 32767, titleH() + tabBarH() + headerH()};
         InvalidateRect(g.frame, &hd, FALSE);
         // Paint all three now, together. Otherwise, while the scroll bar
         // thumb is dragged, Windows repaints the editor (it owns the scroll
@@ -1670,6 +1702,7 @@ void paintStatus(HWND hwnd) {
               DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     DrawTextW(dc, g.statusLeft.c_str(), (int)g.statusLeft.size(), &t,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    paintTitle(dc);
     paintTabs(dc);
     if (!IsRectEmpty(&g.sideSplitRect)) {
         const RECT& sr = g.sideSplitRect;
@@ -1693,13 +1726,13 @@ void paintStatus(HWND hwnd) {
         HGDIOBJ ob = SelectObject(mdc, mb);
         HGDIOBJ of2 = SelectObject(mdc, g.uiFont);
         paintHeader(mdc);
-        BitBlt(dc, 0, tabBarH(), cr.right, hh, mdc, 0, 0, SRCCOPY);
+        BitBlt(dc, 0, titleH() + tabBarH(), cr.right, hh, mdc, 0, 0, SRCCOPY);
         SelectObject(mdc, of2);
         SelectObject(mdc, ob);
         DeleteObject(mb);
         DeleteDC(mdc);
-        OffsetRect(&g.navPrev, 0, tabBarH());
-        OffsetRect(&g.navNext, 0, tabBarH());
+        OffsetRect(&g.navPrev, 0, titleH() + tabBarH());
+        OffsetRect(&g.navNext, 0, titleH() + tabBarH());
     }
     SelectObject(dc, old);
     BitBlt(wdc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top, dc,
@@ -2345,6 +2378,7 @@ bool saveTo(const std::wstring& path) {
     }
     noteDiskState();
     addRecent(path);
+    termFollowFile();  // an Untitled file got a folder
     SetCursor(oldCur);
     refresh(false);
     return true;
@@ -3675,9 +3709,12 @@ struct Bar {
     const wchar_t* label2 = L"";
     std::function<void(int)> action;      // a button, or Enter (id 1) / Shift+Enter (id 2) / Esc (id 3)
     std::function<void()> changed;        // the first box's text changed
+    bool compact = false;                 // one search box filling the bar: icon, placeholder, count inside
+    int statusRight = 0;                  // compact: where the count ends (buttons to its right)
+    const wchar_t* placeholder = nullptr; // grey text while the box is empty
 };
 
-Bar g_findBar, g_dataBar;
+Bar g_findBar, g_dataBar, g_fvBar;  // g_fvBar: the folder view's file search
 const wchar_t* const kBarClass = L"JustNotepadBar";
 enum BarIds { BAR_ENTER = 1, BAR_SHIFTENTER = 2, BAR_ESC = 3, BAR_CASE = 10, BAR_WORD, BAR_PREV, BAR_NEXT, BAR_CLOSE,
               BAR_REPLMODE, BAR_REPLACE, BAR_REPLACEALL };
@@ -3693,9 +3730,43 @@ std::wstring editText(HWND e) {
     return s;
 }
 
+// A compact bar: the box, with the magnifier on its left and the count on its right.
+RECT compactBox(const Bar& b) {
+    RECT rc;
+    GetClientRect(b.wnd, &rc);
+    const int px = MulDiv(1, g.dpi, 96), rh = barRowH(), pad = 6 * px, bh = rh - 12 * px;
+    return {pad, (rh - bh) / 2, std::max(pad + 40 * px, (int)rc.right - pad), (rh - bh) / 2 + bh};
+}
+
+int compactStatusW(const Bar& b) {
+    if (b.status.empty()) return 0;
+    HDC dc = GetDC(b.wnd);
+    HGDIOBJ of = SelectObject(dc, g.uiFont);
+    SIZE sz = {};
+    GetTextExtentPoint32W(dc, b.status.c_str(), (int)b.status.size(), &sz);
+    SelectObject(dc, of);
+    ReleaseDC(b.wnd, dc);
+    return sz.cx + MulDiv(8, g.dpi, 96);
+}
+
 void barLayout(Bar& b) {
     RECT rc;
     GetClientRect(b.wnd, &rc);
+    if (b.compact) {
+        const int px = MulDiv(1, g.dpi, 96);
+        const RECT box = compactBox(b);
+        int right = box.right - 2 * px;
+        for (BarButton& bt : b.buttons) {  // small square buttons inside the box, on the right
+            const int bs = box.bottom - box.top - 4 * px;
+            bt.rc = {right - bs, box.top + 2 * px, right, box.top + 2 * px + bs};
+            right -= bs + 2 * px;
+        }
+        b.statusRight = right;
+        const int icon = 22 * px, sw = compactStatusW(b), eh = std::min<int>(box.bottom - box.top - 4 * px, g.statusH);
+        const int ex = box.left + icon, ew = std::max(20 * px, right - 2 * px - sw - ex);
+        MoveWindow(b.edit, ex, box.top + (box.bottom - box.top - eh) / 2, ew, eh, TRUE);
+        return;
+    }
     const int px = MulDiv(1, g.dpi, 96), rh = barRowH(), bs = rh - 10 * px, pad = 8 * px, gap = 4 * px;
     const int labelW = 58 * px;
     // Buttons from the right, per row.
@@ -3743,6 +3814,44 @@ void paintBar(HWND hwnd) {
     HGDIOBJ of = SelectObject(dc, g.uiFont);
     SetBkMode(dc, TRANSPARENT);
     const int px = MulDiv(1, g.dpi, 96), rh = barRowH(), pad = 8 * px;
+    if (b.compact) {
+        // A flat square box; the edge lights up while it has focus.
+        barLayout(b);
+        const RECT box = compactBox(b);
+        const bool focus = GetFocus() == b.edit;
+        fillRect(dc, box.left, box.top, box.right, box.bottom, focus ? g.pal.accent : blend(g.pal.faceText, g.pal.face, 30));
+        fillRect(dc, box.left + px, box.top + px, box.right - px, box.bottom - px, g.pal.bg);
+        // Magnifier.
+        const COLORREF ic = blend(g.pal.fg, g.pal.bg, focus ? 75 : 50);
+        const int r = 5 * px, cx = box.left + 10 * px, cy = (box.top + box.bottom) / 2 - px;
+        HPEN pen = CreatePen(PS_SOLID, std::max(1, (int)(1.5 * px)), ic);
+        HGDIOBJ op = SelectObject(dc, pen), obr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Ellipse(dc, cx - r, cy - r, cx + r + 1, cy + r + 1);
+        MoveToEx(dc, cx + r - px, cy + r - px, nullptr);
+        LineTo(dc, cx + r + 4 * px, cy + r + 4 * px);
+        SelectObject(dc, obr);
+        SelectObject(dc, op);
+        DeleteObject(pen);
+        for (size_t k = 0; k < b.buttons.size(); k++) {
+            const BarButton& bt = b.buttons[k];
+            const bool hot = b.hot == (int)k, held = hot && b.press == (int)k;
+            if (hot) drawButton3D(dc, bt.rc, held ? BTN_PRESSED : BTN_HOT, g.pal, 0);
+            drawGlyph(dc, bt.rc, (Glyph)bt.glyph, hot ? g.pal.fg : ic, ic, held);
+        }
+        // The count, inside on the right.
+        if (!b.status.empty()) {
+            RECT sr = {box.left, box.top, b.statusRight - 4 * px, box.bottom};
+            SetTextColor(dc, b.noMatch ? (g.pal.dark ? RGB(255, 120, 110) : RGB(190, 30, 30)) : blend(g.pal.fg, g.pal.bg, 50));
+            DrawTextW(dc, b.status.c_str(), -1, &sr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        SelectObject(dc, of);
+        BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, ob);
+        DeleteObject(bmp);
+        DeleteDC(dc);
+        EndPaint(hwnd, &ps);
+        return;
+    }
     // Labels, and a sunken 90s frame around each text box.
     for (int row = 0; row < (b.twoRows ? 2 : 1); row++) {
         HWND e = row == 0 ? b.edit : b.edit2;
@@ -3806,6 +3915,21 @@ int barButtonAt(Bar& b, POINT pt) {
 // Tab moves between the boxes and back to the editor.
 LRESULT CALLBACK barEditProc(HWND e, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
     Bar& b = *(Bar*)ref;
+    if (b.compact && (msg == WM_SETFOCUS || msg == WM_KILLFOCUS)) InvalidateRect(b.wnd, nullptr, FALSE);
+    if (b.placeholder && msg == WM_PAINT && GetWindowTextLengthW(e) == 0) {
+        LRESULT r = DefSubclassProc(e, msg, wp, lp);
+        HDC dc = GetDC(e);
+        RECT rc;
+        GetClientRect(e, &rc);
+        rc.left += LOWORD(SendMessageW(e, EM_GETMARGINS, 0, 0)) + 1;
+        HGDIOBJ of = SelectObject(dc, g.uiFont);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, blend(g.pal.fg, g.pal.bg, 45));
+        DrawTextW(dc, b.placeholder, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        SelectObject(dc, of);
+        ReleaseDC(e, dc);
+        return r;
+    }
     if (msg == WM_KEYDOWN) {
         const bool shift = GetKeyState(VK_SHIFT) < 0;
         if (wp == VK_RETURN) {
@@ -3835,7 +3959,7 @@ LRESULT CALLBACK barProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     Bar* bp = (Bar*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (msg >= WM_CTLCOLORMSGBOX && msg <= WM_CTLCOLORSTATIC && bp) {
         INT_PTR r = themeCtlColor(msg, wp, g.pal);
-        if (msg == WM_CTLCOLOREDIT && (HWND)lp == bp->edit && bp->noMatch)
+        if (msg == WM_CTLCOLOREDIT && (HWND)lp == bp->edit && bp->noMatch && !bp->compact)
             SetTextColor((HDC)wp, g.pal.dark ? RGB(255, 120, 110) : RGB(190, 30, 30));
         return r;
     }
@@ -3910,7 +4034,7 @@ void createBar(Bar& b, HWND parent, bool withSecondBox) {
 }
 
 void themeBars() {
-    for (Bar* b : {&g_findBar, &g_dataBar}) {
+    for (Bar* b : {&g_findBar, &g_dataBar, &g_fvBar}) {
         if (!b->wnd) continue;
         if (b->edit) SendMessageW(b->edit, WM_SETFONT, (WPARAM)g.uiFont, TRUE);
         if (b->edit2) SendMessageW(b->edit2, WM_SETFONT, (WPARAM)g.uiFont, TRUE);
@@ -4248,6 +4372,9 @@ void loadSettings() {
     g.highlight = GetPrivateProfileIntW(L"view", L"highlight", 1, f) != 0;
     g.sideOn = GetPrivateProfileIntW(L"view", L"sidePane", 1, f) != 0;
     g.showWs = GetPrivateProfileIntW(L"view", L"whitespace", 0, f) != 0;
+    g_fv.split = std::clamp((int)GetPrivateProfileIntW(L"view", L"folderSplit", 200, f), 80, 600) / 1000.0;
+    g_fvStartOn = GetPrivateProfileIntW(L"view", L"folderView", 0, f) != 0;
+    g.termSplit = std::clamp((int)GetPrivateProfileIntW(L"view", L"terminalSplit", 320, f), 80, 850) / 1000.0;
     g.recent.clear();
     for (int i = 0; i < 12; i++) {
         wchar_t key[16], val[MAX_PATH * 4];
@@ -4303,6 +4430,9 @@ void saveSettings() {
     putInt(L"view", L"highlight", g.highlight ? 1 : 0, f);
     putInt(L"view", L"sidePane", g.sideOn ? 1 : 0, f);
     putInt(L"view", L"whitespace", g.showWs ? 1 : 0, f);
+    putInt(L"view", L"terminalSplit", (int)(g.termSplit * 1000 + 0.5), f);
+    putInt(L"view", L"folderView", g_fv.on ? 1 : 0, f);
+    putInt(L"view", L"folderSplit", (int)(g_fv.split * 1000 + 0.5), f);
 
     putInt(L"view", L"diffSplit", (int)(g.diffSplit * 1000 + 0.5), f);
     putInt(L"view", L"sideSplit", (int)(g.sideSplit * 1000 + 0.5), f);
@@ -6318,7 +6448,8 @@ LRESULT CALLBACK splitProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_SETCURSOR: SetCursor(LoadCursorW(nullptr, IDC_SIZEWE)); return TRUE;
     case WM_LBUTTONDBLCLK:
-        g.sideSplit = 0.42;
+        if (GetWindowLongPtrW(hwnd, GWLP_USERDATA) == 1) g_fv.split = 0.2;  // the folder view's
+        else g.sideSplit = 0.42;
         layoutFrame();
         saveSettings();
         return 0;
@@ -6335,7 +6466,10 @@ LRESULT CALLBACK splitProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             GetClientRect(g.frame, &rc);
             // Where the divider's left edge goes; the pane gets everything right of it.
             const int x = f.x - g.dragOffset;
-            if (rc.right > 0) g.sideSplit = std::clamp((double)(rc.right - x - splitW()) / rc.right, 0.1, 0.9);
+            if (rc.right > 0 && GetWindowLongPtrW(hwnd, GWLP_USERDATA) == 1)
+                g_fv.split = std::clamp((double)x / rc.right, 0.08, 0.6);  // the folder view: everything left of it
+            else if (rc.right > 0)
+                g.sideSplit = std::clamp((double)(rc.right - x - splitW()) / rc.right, 0.1, 0.9);
             layoutFrame();
             UpdateWindow(g.frame);
         }
@@ -7342,6 +7476,8 @@ void applyTheme() {
     themeMenuColors(g.menu, g.pal);
     themeSidePane();
     themeBars();
+    if (g.term) termSetStyle(g.font, g.uiFont, g.cw, g.ch, MulDiv(5, g.dpi, 96), g.pal);
+    fvTheme();
     if (g.sidePreview) InvalidateRect(g.sidePreview, nullptr, FALSE);
     DrawMenuBar(g.frame);
     RedrawWindow(g.frame, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
@@ -7651,6 +7787,8 @@ HMENU buildMenu() {
     AppendMenuW(view, MF_STRING, IDM_SHOWWS, L"Show White&space");
     AppendMenuW(view, MF_STRING, IDM_SIDEVIEW, L"Data View / &Preview\tCtrl+Shift+V");
     AppendMenuW(view, MF_STRING, IDM_HEXVIEW, L"Show as He&x");
+    AppendMenuW(view, MF_STRING, IDM_TERMINAL, L"&Terminal\tF5 / Ctrl+`");
+    AppendMenuW(view, MF_STRING, IDM_FOLDERVIEW, L"F&older View\tF6");
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, MF_STRING, IDM_FONT, L"&Font...");
     AppendMenuW(view, MF_STRING, IDM_ZOOMIN, L"Zoom &In\tCtrl+Plus");
@@ -7669,7 +7807,7 @@ HMENU buildMenu() {
     AppendMenuW(sc, MF_STRING, IDM_VCS_COMMIT, L"&Submit Current Changelist...");
     AppendMenuW(sc, MF_STRING, IDM_VCS_REVERTFILE, L"&Revert Changes...");
     AppendMenuW(sc, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(sc, MF_STRING, IDM_VCS_REFRESH, L"Re&fresh Status\tF5");
+    AppendMenuW(sc, MF_STRING, IDM_VCS_REFRESH, L"Re&fresh Status");
     AppendMenuW(sc, MF_STRING, IDM_VCS_CONNECT, L"&Connect...");
     HMENU help = CreatePopupMenu();
     AppendMenuW(help, MF_STRING, IDM_CHECKUPDATES, L"Check for &Updates...");
@@ -7746,8 +7884,10 @@ HACCEL buildAccelerators() {
         {FVIRTKEY, VK_F7, IDM_NEXTCHANGE},
         {FVIRTKEY | FSHIFT, VK_F7, IDM_PREVCHANGE},
         {FVIRTKEY | FCONTROL, 'R', IDM_REVERTCHANGE},
-        {FVIRTKEY, VK_F5, IDM_VCS_REFRESH},
+        {FVIRTKEY, VK_F5, IDM_TERMINAL_FOCUS},
+        {FVIRTKEY, VK_F6, IDM_FOLDERVIEW},
         {FVIRTKEY | FCONTROL, 'P', IDM_PRINT},
+        {FVIRTKEY | FCONTROL, VK_OEM_3, IDM_TERMINAL},
         {FVIRTKEY | FALT | FSHIFT, VK_OEM_PERIOD, IDM_ADDNEXT},
         {FVIRTKEY | FALT | FSHIFT, VK_OEM_1, IDM_ADDALL},
         {FVIRTKEY | FALT | FSHIFT, VK_UP, IDM_BOX_UP},
@@ -7759,16 +7899,44 @@ HACCEL buildAccelerators() {
 }
 
 void layoutFrame() {
+    if (!g.d) return;  // no tab yet (the window is still being set up)
     RECT rc;
     GetClientRect(g.frame, &rc);
-    int h = std::max<int>(0, rc.bottom - g.statusH);
-    const int headerTop = tabBarH() + headerH();
+    const int statusTop = std::max<int>(0, rc.bottom - g.statusH);
+    int h = statusTop;
+    if (g.term) {
+        // The terminal spans the width of the window, right above the status bar.
+        if (g.termOn) {
+            const int minH = g.statusH * 3, maxH = std::max(minH, statusTop - titleH() - tabBarH() - MulDiv(120, g.dpi, 96));
+            const int th = std::clamp((int)(rc.bottom * g.termSplit), minH, maxH);
+            h = std::max(0, statusTop - th);
+            MoveWindow(g.term, 0, h, rc.right, statusTop - h, TRUE);
+        }
+        ShowWindow(g.term, g.termOn ? SW_SHOWNA : SW_HIDE);
+    }
+    const int headerTop = titleH() + tabBarH() + headerH();
     // The find bar sits right above the text, across the window.
     const int fb = barHeight(g_findBar);
     if (g_findBar.wnd && fb) MoveWindow(g_findBar.wnd, 0, headerTop, rc.right, fb, TRUE);
     const int top = headerTop + fb;
     int left = 0;
     int right = rc.right;
+    // The folder view on the left, with its own divider.
+    if (g_fv.tree) {
+        if (g_fv.on) {
+            const int gap = splitW(), min = MulDiv(120, g.dpi, 96);
+            const int fw = std::clamp((int)(rc.right * g_fv.split), std::min(min, (int)rc.right / 3), std::max(min, (int)rc.right / 2));
+            const int bh = barRowH();
+            if (g_fvBar.wnd) MoveWindow(g_fvBar.wnd, 0, top, fw, bh, TRUE);
+            MoveWindow(g_fv.tree, 0, top + bh, fw, std::max(0, h - top - bh), TRUE);
+            MoveWindow(g_fv.splitter, fw, top, gap, std::max(0, h - top), TRUE);
+            left = fw + gap;
+        }
+        ShowWindow(g_fv.tree, g_fv.on ? SW_SHOWNA : SW_HIDE);
+        if (g_fvBar.wnd) ShowWindow(g_fvBar.wnd, g_fv.on ? SW_SHOWNA : SW_HIDE);
+        ShowWindow(g_fv.splitter, g_fv.on ? SW_SHOWNA : SW_HIDE);
+    }
+    const int base = left;
     SetRectEmpty(&g.sideSplitRect);
     if (g.sideSplitter && !sideVisible()) ShowWindow(g.sideSplitter, SW_HIDE);
     if (sideVisible()) {
@@ -7793,15 +7961,15 @@ void layoutFrame() {
     if (g.diffOn) {
         // The strip in the middle can be dragged: the left side gets diffSplit of the rest.
         int sw = stripW();
-        const int avail = std::max(0, right - sw), min = MulDiv(120, g.dpi, 96);
-        left = std::clamp((int)(avail * g.diffSplit), std::min(min, avail / 2), std::max(0, avail - min));
-        MoveWindow(g.diffPane, 0, top, left, h - top, TRUE);
+        const int avail = std::max(0, right - base - sw), min = MulDiv(120, g.dpi, 96);
+        left = base + std::clamp((int)(avail * g.diffSplit), std::min(min, avail / 2), std::max(0, avail - min));
+        MoveWindow(g.diffPane, base, top, left - base, h - top, TRUE);
         MoveWindow(g.strip, left, top, sw, h - top, TRUE);
         left += sw;
     }
     g.sideShown = sideVisible();
     MoveWindow(g.view, left, top, right - left, h - top, TRUE);
-    RECT s = {0, h, rc.right, rc.bottom};
+    RECT s = {0, statusTop, rc.right, rc.bottom};
     InvalidateRect(g.frame, &s, FALSE);
     RECT hd = {0, 0, rc.right, headerTop};
     InvalidateRect(g.frame, &hd, FALSE);
@@ -7824,7 +7992,7 @@ int tabIndex(const DocState* d) {
 
 void invalidateTabs() {
     if (!g.frame) return;
-    RECT r = {0, 0, 32767, tabBarH()};
+    RECT r = {0, 0, 32767, titleH() + tabBarH()};
     InvalidateRect(g.frame, &r, FALSE);
 }
 
@@ -7853,6 +8021,7 @@ void activateTab(int i) {
     updateSidePane();
     SetFocus(g.view);
     PostMessageW(g.frame, WM_APP_DISKCHECK, 0, 0);  // changed on disk while in the background?
+    termFollowFile();
 }
 
 // A new empty tab, made active.
@@ -7891,6 +8060,7 @@ bool openInTab(const std::wstring& path) {
         return false;
     }
     addRecent(path);
+    termFollowFile();
     invalidateTabs();
     InvalidateRect(g.diffPane, nullptr, FALSE);
     return true;
@@ -7951,8 +8121,9 @@ void paintTabs(HDC dc) {
     RECT rc;
     GetClientRect(g.frame, &rc);
     const int H = tabBarH(), pad = MulDiv(12, g.dpi, 96), xw = MulDiv(16, g.dpi, 96), gap = MulDiv(1, g.dpi, 96);
+    const int T0 = titleH();  // the tabs sit right below the title bar
     const COLORREF face = g.pal.face, text = g.pal.faceText, bg = g.pal.bg;
-    fillRect(dc, 0, 0, rc.right, H, blend(face, text, 92));
+    fillRect(dc, 0, T0, rc.right, T0 + H, blend(face, text, 92));
     g.tabRects.assign(g.tabs.size(), RECT{});
     g.tabCloseRects.assign(g.tabs.size(), RECT{});
     HGDIOBJ of = SelectObject(dc, g.uiFont);
@@ -7966,14 +8137,14 @@ void paintTabs(HDC dc) {
         SIZE sz = {};
         GetTextExtentPoint32W(dc, title.c_str(), (int)title.size(), &sz);
         int w = std::clamp((int)sz.cx + 2 * pad + xw, minW, maxW);
-        RECT r = {x, 0, x + w, H};
+        RECT r = {x, T0, x + w, T0 + H};
         fillRect(dc, r.left, r.top, r.right, r.bottom, active ? bg : hot ? blend(face, bg, 50) : blend(face, text, 92));
-        if (active) fillRect(dc, r.left, 0, r.right, MulDiv(2, g.dpi, 96), g.pal.accent);  // the open one
-        RECT tr = {r.left + pad, 0, r.right - pad / 2 - xw, H};
+        if (active) fillRect(dc, r.left, r.top, r.right, r.top + MulDiv(2, g.dpi, 96), g.pal.accent);  // the open one
+        RECT tr = {r.left + pad, T0, r.right - pad / 2 - xw, T0 + H};
         SetTextColor(dc, active ? g.pal.fg : blend(text, face, 75));
         DrawTextW(dc, title.c_str(), (int)title.size(), &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
         // Close button: shown on the open tab and the one under the mouse.
-        RECT xr = {r.right - pad / 2 - xw, (H - xw) / 2, r.right - pad / 2, (H - xw) / 2 + xw};
+        RECT xr = {r.right - pad / 2 - xw, T0 + (H - xw) / 2, r.right - pad / 2, T0 + (H - xw) / 2 + xw};
         if (active || hot) {
             // A flat × that rises into a 3D button when hovered, and goes in when pressed.
             const bool xhot = (int)i == g.tabCloseHover, xheld = xhot && g.tabClosePress == (int)i;
@@ -8001,6 +8172,8 @@ void setZoom(int pt) {
     if (pt == g.fontPt) return;
     g.fontPt = pt;
     makeFonts();
+    if (g.term) termSetStyle(g.font, g.uiFont, g.cw, g.ch, MulDiv(5, g.dpi, 96), g.pal);
+    fvTheme();
     themeSidePane();
     refresh(true);
 }
@@ -8143,6 +8316,660 @@ void showEditorMenu(POINT screen) {
     themeReleasePopup(m);
     DestroyMenu(m);
     if (cmd) onCommand((int)cmd);
+}
+
+// ====================================================================== folder view (F6)
+//
+// The folders and files around the current file, on the left. ".." goes up a
+// folder, expanding a folder goes down, a click on a file opens it, a double
+// click (or Enter) on a folder shows that folder instead. It follows the file
+// in front: switching tabs selects that file, going to another folder when
+// the file is not below the one shown.
+
+
+const UINT WM_APP_FOLDER = WM_APP + 50;  // wParam: node to act on (after a click)
+
+std::wstring parentFolder(const std::wstring& p) {
+    std::wstring s = p;
+    while (s.size() > 3 && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+    if (s.size() <= 3 && s.size() >= 2 && s[1] == L':') return L"";  // a drive: nothing above
+    size_t k = s.find_last_of(L"\\/");
+    if (k == std::wstring::npos) return L"";
+    if (k == 2 && s[1] == L':') return s.substr(0, 3);  // "C:\"
+    if (k == 0) return L"";
+    return s.substr(0, k);
+}
+
+std::wstring joinPath(const std::wstring& dir, const std::wstring& name) {
+    if (!dir.empty() && (dir.back() == L'\\' || dir.back() == L'/')) return dir + name;
+    return dir + L"\\" + name;
+}
+
+std::wstring leafName(const std::wstring& p) {
+    std::wstring s = p;
+    while (s.size() > 3 && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+    size_t k = s.find_last_of(L"\\/");
+    return k == std::wstring::npos || s.size() <= 3 ? s : s.substr(k + 1);
+}
+
+int shellIcon(const std::wstring& p, bool dir, bool open) {
+    SHFILEINFOW sfi = {};
+    SHGetFileInfoW(p.c_str(), dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi),
+                   SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES | (open ? SHGFI_OPENICON : 0));
+    return sfi.iIcon;
+}
+
+HTREEITEM fvAdd(HTREEITEM parent, const std::wstring& label, const std::wstring& path, int kind) {
+    g_fv.nodes.push_back({path, kind, false});
+    TVINSERTSTRUCTW is = {};
+    is.hParent = parent;
+    is.hInsertAfter = TVI_LAST;
+    is.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN | TVIF_IMAGE | TVIF_SELECTEDIMAGE;
+    is.item.pszText = (LPWSTR)label.c_str();
+    is.item.lParam = (LPARAM)(g_fv.nodes.size() - 1);
+    is.item.cChildren = kind == 1 ? 1 : 0;
+    is.item.iImage = shellIcon(path, kind != 0, false);
+    is.item.iSelectedImage = kind == 1 ? shellIcon(path, true, true) : is.item.iImage;
+    return TreeView_InsertItem(g_fv.tree, &is);
+}
+
+// Folders first, then files, each by name; hidden and system ones left out.
+void fvFill(HTREEITEM item, size_t node) {
+    g_fv.nodes[node].filled = true;
+    const std::wstring dir = g_fv.nodes[node].path;
+    struct E { std::wstring name; bool dir; u64 size; };
+    std::vector<E> list;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW(joinPath(dir, L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+            list.push_back({fd.cFileName, (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
+                            ((u64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow});
+        } while (list.size() < 20000 && FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::sort(list.begin(), list.end(), [](const E& a, const E& b) {
+        if (a.dir != b.dir) return a.dir;
+        return CompareStringOrdinal(a.name.c_str(), -1, b.name.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+    });
+    for (const E& e : list) {
+        // Files show their size: "main.cpp (1.5 MB)".
+        std::wstring label = e.name;
+        if (!e.dir) label += L"  (" + (e.size < 1024 ? std::to_wstring(e.size) + L" B" : humanSize(e.size)) + L")";
+        fvAdd(item, label, joinPath(dir, e.name), e.dir ? 1 : 0);
+    }
+    if (list.empty()) {
+        TVITEMW it = {};
+        it.mask = TVIF_CHILDREN;
+        it.hItem = item;
+        it.cChildren = 0;
+        TreeView_SetItem(g_fv.tree, &it);
+    }
+}
+
+size_t fvNodeOf(HTREEITEM item) {
+    TVITEMW it = {};
+    it.mask = TVIF_PARAM;
+    it.hItem = item;
+    TreeView_GetItem(g_fv.tree, &it);
+    return (size_t)it.lParam;
+}
+
+// Opens a folder in the tree, listing it first if needed.
+void fvOpen(HTREEITEM item) {
+    const size_t n = fvNodeOf(item);
+    if (n < g_fv.nodes.size() && !g_fv.nodes[n].filled) fvFill(item, n);
+    TreeView_Expand(g_fv.tree, item, TVE_EXPAND);
+}
+
+// The tree: ".." to go up, then every drive (closed), except the one holding
+// `root`, which is opened down to it. `root` is the folder searches look in;
+// it shows in bold.
+void fvSetRoot(const std::wstring& root) {
+    g_fv.root = root;
+    SendMessageW(g_fv.tree, WM_SETREDRAW, FALSE, 0);
+    g_fv.revealing = true;
+    TreeView_DeleteAllItems(g_fv.tree);
+    g_fv.nodes.clear();
+    const std::wstring up = parentFolder(root);
+    if (!up.empty()) fvAdd(TVI_ROOT, L"..", up, 2);
+    HTREEITEM drive = nullptr;
+    wchar_t buf[512] = {};
+    const DWORD n = GetLogicalDriveStringsW(511, buf);
+    for (const wchar_t* d = buf; n && *d; d += wcslen(d) + 1) {
+        const std::wstring path = d;  // "C:\"
+        HTREEITEM it = fvAdd(TVI_ROOT, path.substr(0, 2), path, 1);
+        if (root.size() >= 2 && _wcsnicmp(root.c_str(), path.c_str(), 2) == 0) drive = it;
+    }
+    HTREEITEM item = drive;
+    if (item) {
+        std::wstring rest = root.size() > 3 ? root.substr(3) : L"";
+        while (item && !rest.empty()) {
+            size_t k = rest.find_first_of(L"\\/");
+            const std::wstring part = rest.substr(0, k);
+            rest = k == std::wstring::npos ? L"" : rest.substr(k + 1);
+            if (part.empty()) continue;
+            fvOpen(item);
+            HTREEITEM c = TreeView_GetChild(g_fv.tree, item), found = nullptr;
+            for (; c; c = TreeView_GetNextSibling(g_fv.tree, c))
+                if (_wcsicmp(leafName(g_fv.nodes[fvNodeOf(c)].path).c_str(), part.c_str()) == 0) {
+                    found = c;
+                    break;
+                }
+            item = found;
+        }
+    }
+    if (!item) item = fvAdd(TVI_ROOT, leafName(root), root, 1);  // not on a drive letter (\\server\share)
+    g_fv.rootItem = item;
+    fvOpen(item);
+    TreeView_SetItemState(g_fv.tree, item, TVIS_BOLD, TVIS_BOLD);
+    g_fv.revealing = false;
+    SendMessageW(g_fv.tree, WM_SETREDRAW, TRUE, 0);
+    TreeView_SelectSetFirstVisible(g_fv.tree, item);  // the folder at the top; its drive and parents above it
+    InvalidateRect(g_fv.tree, nullptr, TRUE);
+}
+
+bool isUnder(const std::wstring& path, const std::wstring& folder) {
+    if (folder.empty() || path.size() <= folder.size()) return false;
+    if (_wcsnicmp(path.c_str(), folder.c_str(), folder.size()) != 0) return false;
+    const wchar_t c = path[folder.size()];
+    return c == L'\\' || c == L'/' || folder.back() == L'\\';
+}
+
+// Shows `file` in the tree (opening the folders on the way) and selects it.
+void fvReveal(const std::wstring& file) {
+    if (!g_fv.tree || file.empty()) return;
+    if (!isUnder(file, g_fv.root)) fvSetRoot(parentFolder(file));
+    HTREEITEM item = g_fv.rootItem;
+    std::wstring rest = file.substr(g_fv.root.size());
+    while (!rest.empty() && (rest[0] == L'\\' || rest[0] == L'/')) rest.erase(0, 1);
+    g_fv.revealing = true;
+    while (item && !rest.empty()) {
+        size_t k = rest.find_first_of(L"\\/");
+        const std::wstring part = rest.substr(0, k);
+        rest = k == std::wstring::npos ? L"" : rest.substr(k + 1);
+        fvOpen(item);
+        HTREEITEM c = TreeView_GetChild(g_fv.tree, item), found = nullptr;
+        for (; c; c = TreeView_GetNextSibling(g_fv.tree, c))
+            if (_wcsicmp(leafName(g_fv.nodes[fvNodeOf(c)].path).c_str(), part.c_str()) == 0) {
+                found = c;
+                break;
+            }
+        item = found;
+    }
+    if (item) {
+        TreeView_SelectItem(g_fv.tree, item);
+        TreeView_EnsureVisible(g_fv.tree, item);
+    }
+    g_fv.revealing = false;
+}
+
+void fvTheme() {
+    if (!g_fv.tree) return;
+    SetWindowTheme(g_fv.tree, g.pal.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    TreeView_SetBkColor(g_fv.tree, g.pal.bg);
+    TreeView_SetTextColor(g_fv.tree, g.pal.fg);
+    SendMessageW(g_fv.tree, WM_SETFONT, (WPARAM)g.uiFont, TRUE);
+    InvalidateRect(g_fv.tree, nullptr, TRUE);
+    if (g_fv.splitter) InvalidateRect(g_fv.splitter, nullptr, FALSE);
+}
+
+// What a click, Enter or a double click does to node `n`.
+void fvActivate(size_t n, bool open) {
+    if (n >= g_fv.nodes.size()) return;
+    const FolderView::Node node = g_fv.nodes[n];
+    if (node.kind == 2) {  // "..": the folder above, with the one we came from selected
+        const std::wstring from = g_fv.root;
+        fvSetRoot(node.path);
+        g_fv.revealing = true;
+        for (HTREEITEM c = TreeView_GetChild(g_fv.tree, g_fv.rootItem); c; c = TreeView_GetNextSibling(g_fv.tree, c))
+            if (_wcsicmp(g_fv.nodes[fvNodeOf(c)].path.c_str(), from.c_str()) == 0) {
+                TreeView_SelectItem(g_fv.tree, c);
+                TreeView_EnsureVisible(g_fv.tree, c);
+            }
+        g_fv.revealing = false;
+        if (g_fv.searching) fvStartSearch();
+    } else if (node.kind == 1) {
+        if (open) fvSetRoot(node.path);  // into that folder
+        if (open && g_fv.searching) fvStartSearch();
+    } else {
+        openInTab(node.path);
+    }
+}
+
+// Right click: the Windows context menu for that file or folder (Open with,
+// Send to, Copy, Delete, Properties, whatever the shell offers).
+IContextMenu2* g_shellMenu2 = nullptr;
+IContextMenu3* g_shellMenu3 = nullptr;
+
+void fvShellMenu(const std::wstring& path, POINT screen) {
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    if (FAILED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr))) return;
+    IShellFolder* folder = nullptr;
+    PCUITEMID_CHILD child = nullptr;
+    if (FAILED(SHBindToParent(pidl, IID_IShellFolder, (void**)&folder, &child))) {
+        CoTaskMemFree(pidl);
+        return;
+    }
+    IContextMenu* cm = nullptr;
+    folder->GetUIObjectOf(g.frame, 1, &child, IID_IContextMenu, nullptr, (void**)&cm);
+    folder->Release();
+    if (!cm) {
+        CoTaskMemFree(pidl);
+        return;
+    }
+    HMENU m = CreatePopupMenu();
+    const UINT first = 1, last = 0x7FFF;
+    if (SUCCEEDED(cm->QueryContextMenu(m, 0, first, last, CMF_NORMAL | CMF_EXPLORE | (GetKeyState(VK_SHIFT) < 0 ? CMF_EXTENDEDVERBS : 0)))) {
+        // Submenus such as "Open with" and "Send to" are drawn by the shell.
+        cm->QueryInterface(IID_IContextMenu3, (void**)&g_shellMenu3);
+        if (!g_shellMenu3) cm->QueryInterface(IID_IContextMenu2, (void**)&g_shellMenu2);
+        UINT cmd = (UINT)TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, g.frame, nullptr);
+        if (g_shellMenu3) g_shellMenu3->Release();
+        if (g_shellMenu2) g_shellMenu2->Release();
+        g_shellMenu3 = nullptr;
+        g_shellMenu2 = nullptr;
+        if (cmd >= first) {
+            CMINVOKECOMMANDINFOEX ci = {};
+            ci.cbSize = sizeof(ci);
+            ci.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
+            ci.hwnd = g.frame;
+            ci.lpVerb = MAKEINTRESOURCEA(cmd - first);
+            ci.lpVerbW = MAKEINTRESOURCEW(cmd - first);
+            ci.nShow = SW_SHOWNORMAL;
+            ci.ptInvoke = screen;
+            cm->InvokeCommand((LPCMINVOKECOMMANDINFO)&ci);
+            // It may have renamed, deleted or added something: show the folder again.
+            const std::wstring sel = path;
+            fvSetRoot(g_fv.root);
+            if (GetFileAttributesW(sel.c_str()) != INVALID_FILE_ATTRIBUTES) fvReveal(sel);
+        }
+    }
+    DestroyMenu(m);
+    cm->Release();
+    CoTaskMemFree(pidl);
+}
+
+// While the shell's menu is up, its owner-drawn items are the shell's to draw.
+bool shellMenuMessage(UINT msg, WPARAM wp, LPARAM lp, LRESULT& out) {
+    if (!g_shellMenu3 && !g_shellMenu2) return false;
+    if (msg != WM_INITMENUPOPUP && msg != WM_DRAWITEM && msg != WM_MEASUREITEM && msg != WM_MENUCHAR) return false;
+    if (g_shellMenu3) return SUCCEEDED(g_shellMenu3->HandleMenuMsg2(msg, wp, lp, &out));
+    out = 0;
+    return msg != WM_MENUCHAR && SUCCEEDED(g_shellMenu2->HandleMenuMsg(msg, wp, lp));
+}
+
+LRESULT onFolderNotify(NMHDR* h) {
+    switch (h->code) {
+    case TVN_ITEMEXPANDINGW: {
+        auto* nm = (NMTREEVIEWW*)h;
+        const size_t n = (size_t)nm->itemNew.lParam;
+        if ((nm->action & TVE_EXPAND) && n < g_fv.nodes.size() && !g_fv.nodes[n].filled) fvFill(nm->itemNew.hItem, n);
+        return 0;
+    }
+    case NM_CLICK:
+    case NM_DBLCLK: {
+        TVHITTESTINFO ht = {};
+        GetCursorPos(&ht.pt);
+        ScreenToClient(g_fv.tree, &ht.pt);
+        HTREEITEM item = TreeView_HitTest(g_fv.tree, &ht);
+        if (!item || !(ht.flags & (TVHT_ONITEM | TVHT_ONITEMRIGHT))) return 0;
+        const size_t n = fvNodeOf(item);
+        if (n >= g_fv.nodes.size()) return 0;
+        const int kind = g_fv.nodes[n].kind;
+        if (h->code == NM_CLICK && kind == 1) return 0;  // a folder: the click selects it, its button opens it
+        // Act after the tree has finished with the click (acting can rebuild it).
+        PostMessageW(g.frame, WM_APP_FOLDER, (WPARAM)n, h->code == NM_DBLCLK);
+        return h->code == NM_DBLCLK ? 1 : 0;
+    }
+    case NM_RCLICK: {
+        TVHITTESTINFO ht = {};
+        GetCursorPos(&ht.pt);
+        POINT screen = ht.pt;
+        ScreenToClient(g_fv.tree, &ht.pt);
+        HTREEITEM item = TreeView_HitTest(g_fv.tree, &ht);
+        if (!item || !(ht.flags & (TVHT_ONITEM | TVHT_ONITEMRIGHT))) return 0;
+        const size_t n = fvNodeOf(item);
+        if (n >= g_fv.nodes.size() || g_fv.nodes[n].kind == 2) return 1;
+        TreeView_SelectItem(g_fv.tree, item);
+        fvShellMenu(g_fv.nodes[n].path, screen);
+        return 1;  // handled: no WM_CONTEXTMENU
+    }
+    case TVN_KEYDOWN: {
+        auto* k = (NMTVKEYDOWN*)h;
+        HTREEITEM sel = TreeView_GetSelection(g_fv.tree);
+        if (k->wVKey == VK_RETURN && sel) PostMessageW(g.frame, WM_APP_FOLDER, (WPARAM)fvNodeOf(sel), 1);
+        else if (k->wVKey == VK_BACK && !g_fv.nodes.empty() && g_fv.nodes[0].kind == 2) PostMessageW(g.frame, WM_APP_FOLDER, 0, 1);
+        return 0;
+    }
+    }
+    return 0;
+}
+
+// ---- searching for files below the folder shown
+//
+// Fast: the folder's files are listed once into an index (several threads
+// walk the folders at the same time), and every keystroke only filters that
+// list in memory. The index is refreshed in the background each time a new
+// search starts, so it does not go stale.
+
+std::atomic<unsigned> g_fvSearchGen{0};
+const UINT WM_APP_FVINDEX = WM_APP + 51;
+const UINT_PTR kTimerFvSearch = 8;
+
+struct FileIndex {
+    struct Entry { std::wstring path, lowerName; u64 size; };
+    std::wstring root;
+    std::vector<Entry> files;
+    bool capped = false, stopped = false;
+    unsigned gen = 0;
+};
+std::unique_ptr<FileIndex> g_fvIndex;  // the last one finished (or stopped)
+std::atomic<bool> g_fvStop{false};       // the × in the box while indexing
+std::atomic<size_t> g_fvIndexCount{0};   // files listed so far, for the progress
+const UINT_PTR kTimerFvProgress = 9;
+bool g_fvIndexing = false;
+std::wstring g_fvIndexingRoot;
+
+std::wstring lowerW(std::wstring s) {
+    if (!s.empty()) CharLowerBuffW(&s[0], (DWORD)s.size());
+    return s;
+}
+
+// Lists every file below `root` with a few threads, then posts the index.
+void buildFileIndex(std::wstring root, unsigned gen, HWND frame) {
+    auto* idx = new FileIndex;
+    idx->root = root;
+    idx->gen = gen;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<std::wstring> dirs{root};
+    int busy = 0;
+    std::atomic<size_t> count{0};
+    const size_t kMax = 3000000;
+    auto worker = [&]() {
+        std::vector<FileIndex::Entry> mine;
+        for (;;) {
+            std::wstring dir;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return !dirs.empty() || busy == 0; });
+                if (dirs.empty()) break;  // nothing queued and nobody can add more
+                dir = std::move(dirs.back());
+                dirs.pop_back();
+                busy++;
+            }
+            if (g_fvStop.load() || g_fvSearchGen.load() != gen) {  // stopped, or a newer index started
+                std::lock_guard<std::mutex> lk(mu);
+                dirs.clear();
+                busy--;
+                cv.notify_all();
+                continue;
+            }
+            std::vector<std::wstring> found;
+            WIN32_FIND_DATAW fd;
+            HANDLE h = FindFirstFileExW(joinPath(dir, L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
+                                        FIND_FIRST_EX_LARGE_FETCH);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    const wchar_t* n = fd.cFileName;
+                    if (n[0] == L'.' && (!n[1] || (n[1] == L'.' && !n[2]))) continue;
+                    if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                        // Never worth searching: tool caches; links could loop.
+                        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+                        if (!_wcsicmp(n, L"node_modules") || !_wcsicmp(n, L".git") || !_wcsicmp(n, L".vs") ||
+                            !_wcsicmp(n, L".svn") || !_wcsicmp(n, L".hg"))
+                            continue;
+                        found.push_back(joinPath(dir, n));
+                        continue;
+                    }
+                    if (count.fetch_add(1) >= kMax) break;
+                    g_fvIndexCount.store(count.load(), std::memory_order_relaxed);
+                    mine.push_back({joinPath(dir, n), lowerW(n), ((u64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow});
+                } while (FindNextFileW(h, &fd));
+                FindClose(h);
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                busy--;
+                for (auto& f : found) dirs.push_back(std::move(f));
+            }
+            cv.notify_all();
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        for (auto& e : mine) idx->files.push_back(std::move(e));
+    };
+    const unsigned n = std::clamp(std::thread::hardware_concurrency(), 2u, 8u);
+    std::vector<std::thread> pool;
+    for (unsigned i = 0; i < n; i++) pool.emplace_back(worker);
+    for (auto& t : pool) t.join();
+    idx->capped = count.load() >= kMax;
+    idx->stopped = g_fvStop.load();
+    if (g_fvSearchGen.load() != gen) {  // replaced by a newer one
+        delete idx;
+        return;
+    }
+    if (!PostMessageW(frame, WM_APP_FVINDEX, 0, (LPARAM)idx)) delete idx;
+}
+
+void fvStartIndex() {
+    if (g_fvIndexing && _wcsicmp(g_fvIndexingRoot.c_str(), g_fv.root.c_str()) == 0) return;
+    g_fvIndexing = true;
+    g_fvIndexingRoot = g_fv.root;
+    g_fvStop = false;
+    g_fvIndexCount = 0;
+    // While it runs: the count goes up in the box, and × stops it.
+    g_fvBar.buttons = {{BAR_CLOSE, nullptr, GLYPH_CLOSE, false, false, 0, {}, L"Stop indexing"}};
+    SetTimer(g.frame, kTimerFvProgress, 200, nullptr);
+    std::thread(buildFileIndex, g_fv.root, ++g_fvSearchGen, g.frame).detach();
+}
+
+bool indexCovers(const FileIndex* x, const std::wstring& root) {
+    return x && (_wcsicmp(x->root.c_str(), root.c_str()) == 0 || isUnder(root, x->root));
+}
+
+std::wstring g_fvQuery;  // what the results show
+
+// Filters the index for the text in the box and shows the matches.
+void fvFilter() {
+    const std::wstring q = g_fvQuery;
+    const FileIndex* x = g_fvIndex.get();
+    if (!indexCovers(x, g_fv.root)) {
+        g_fvBar.noMatch = false;
+        g_fvBar.status = L"Indexing\x2026 " + std::to_wstring(g_fvIndexCount.load());
+        InvalidateRect(g_fvBar.wnd, nullptr, FALSE);
+        return;
+    }
+    // Best first: name starts with it, then shorter names, then by path.
+    struct Hit { const FileIndex::Entry* e; int rank; };
+    std::vector<Hit> hits;
+    const bool sameRoot = _wcsicmp(x->root.c_str(), g_fv.root.c_str()) == 0;
+    for (const auto& e : x->files) {
+        const size_t at = e.lowerName.find(q);
+        if (at == std::wstring::npos) continue;
+        if (!sameRoot && !isUnder(e.path, g_fv.root)) continue;
+        hits.push_back({&e, at == 0 ? 0 : 1});
+    }
+    const size_t total = hits.size(), shown = std::min<size_t>(total, 2000);
+    std::partial_sort(hits.begin(), hits.begin() + (std::ptrdiff_t)shown, hits.end(), [](const Hit& a, const Hit& b) {
+        if (a.rank != b.rank) return a.rank < b.rank;
+        if (a.e->lowerName.size() != b.e->lowerName.size()) return a.e->lowerName.size() < b.e->lowerName.size();
+        return CompareStringOrdinal(a.e->path.c_str(), -1, b.e->path.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+    });
+    SendMessageW(g_fv.tree, WM_SETREDRAW, FALSE, 0);
+    g_fv.revealing = true;
+    TreeView_DeleteAllItems(g_fv.tree);
+    g_fv.nodes.clear();
+    g_fv.rootItem = nullptr;
+    for (size_t i = 0; i < shown; i++) {
+        const auto& e = *hits[i].e;
+        std::wstring rel = e.path.substr(std::min(e.path.size(), g_fv.root.size()));
+        while (!rel.empty() && (rel[0] == L'\\' || rel[0] == L'/')) rel.erase(0, 1);
+        rel += L"  (" + (e.size < 1024 ? std::to_wstring(e.size) + L" B" : humanSize(e.size)) + L")";
+        fvAdd(TVI_ROOT, rel, e.path, 0);
+    }
+    if (shown) TreeView_SelectItem(g_fv.tree, TreeView_GetRoot(g_fv.tree));
+    g_fv.revealing = false;
+    SendMessageW(g_fv.tree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_fv.tree, nullptr, TRUE);
+    g_fvBar.noMatch = total == 0;
+    g_fvBar.status = total == 0 ? L"No files" : total == 1 ? L"1 file" : std::to_wstring(total) + L" files";
+    if (g_fvIndexing) g_fvBar.status += L" \x2026";  // a fresh list is still coming
+    else if (x->stopped) g_fvBar.status += L" (stopped)";
+    InvalidateRect(g_fvBar.wnd, nullptr, FALSE);
+}
+
+void fvIndexingDone() {
+    g_fvIndexing = false;
+    g_fvBar.buttons.clear();
+    KillTimer(g.frame, kTimerFvProgress);
+    InvalidateRect(g_fvBar.wnd, nullptr, FALSE);
+}
+
+void fvIndexReady(FileIndex* r) {
+    std::unique_ptr<FileIndex> idx(r);
+    if (_wcsicmp(r->root.c_str(), g_fvIndexingRoot.c_str()) == 0) fvIndexingDone();
+    // Keep it if it is for this folder (or one above it).
+    if (indexCovers(r, g_fv.root) || !indexCovers(g_fvIndex.get(), g_fv.root)) g_fvIndex = std::move(idx);
+    if (g_fv.searching) fvFilter();
+}
+
+// The box changed: filter, or back to the folder tree.
+void fvStartSearch() {
+    std::wstring q = editText(g_fvBar.edit);
+    while (!q.empty() && q.back() == L' ') q.pop_back();
+    while (!q.empty() && q[0] == L' ') q.erase(0, 1);
+    g_fvBar.noMatch = false;
+    if (q.empty()) {
+        g_fvQuery.clear();
+        g_fvBar.status.clear();
+        InvalidateRect(g_fvBar.wnd, nullptr, FALSE);
+        InvalidateRect(g_fvBar.edit, nullptr, TRUE);
+        if (g_fv.searching) {
+            g_fv.searching = false;
+            fvSetRoot(g_fv.root);
+            fvReveal(g.d->path);
+        }
+        return;
+    }
+    if (!g_fv.searching || !indexCovers(g_fvIndex.get(), g_fv.root)) fvStartIndex();  // a fresh list for this search
+    g_fv.searching = true;
+    g_fvQuery = lowerW(q);
+    fvFilter();  // at once, from the last index
+}
+
+void onFvBarAction(int id) {
+    if (id == BAR_CLOSE) {  // stop indexing: search what was listed so far
+        g_fvStop = true;
+        return;
+    }
+    if (id == BAR_ESC) {
+        SetWindowTextW(g_fvBar.edit, L"");
+        fvStartSearch();
+        SetFocus(g_fv.tree);
+        return;
+    }
+    if (id == BAR_ENTER || id == BAR_SHIFTENTER) {
+        // Enter searches; Enter again (same text) opens the selected result.
+        std::wstring q = lowerW(editText(g_fvBar.edit));
+        while (!q.empty() && q.back() == L' ') q.pop_back();
+        while (!q.empty() && q[0] == L' ') q.erase(0, 1);
+        if (q != g_fvQuery || !g_fv.searching) {
+            fvStartSearch();
+            return;
+        }
+        HTREEITEM it = TreeView_GetSelection(g_fv.tree);
+        if (!it) it = TreeView_GetRoot(g_fv.tree);
+        if (it) PostMessageW(g.frame, WM_APP_FOLDER, (WPARAM)fvNodeOf(it), 1);
+    }
+}
+
+void setupFvBar() {
+    createBar(g_fvBar, g.frame, false);
+    g_fvBar.compact = true;
+    g_fvBar.placeholder = L"Search files (Enter)";
+    g_fvBar.action = onFvBarAction;
+    g_fvBar.changed = []() {
+        InvalidateRect(g_fvBar.edit, nullptr, TRUE);  // the placeholder goes or comes back
+        // Searching waits for Enter; an emptied box goes back to the folder tree at once.
+        if (GetWindowTextLengthW(g_fvBar.edit) == 0) fvStartSearch();
+    };
+}
+
+void toggleFolderView() {
+    if (!g_fv.tree) {
+        g_fv.tree = CreateWindowExW(0, WC_TREEVIEWW, L"",
+                                    WS_CHILD | WS_TABSTOP | TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_FULLROWSELECT |
+                                        TVS_TRACKSELECT,
+                                    0, 0, 0, 0, g.frame, (HMENU)(INT_PTR)2, g.inst, nullptr);
+        TreeView_SetExtendedStyle(g_fv.tree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
+        SHFILEINFOW sfi = {};
+        HIMAGELIST il = (HIMAGELIST)SHGetFileInfoW(L"C:\\", 0, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+        TreeView_SetImageList(g_fv.tree, il, TVSIL_NORMAL);
+        g_fv.splitter = CreateWindowExW(0, kSplitClass, L"", WS_CHILD, 0, 0, 0, 0, g.frame, nullptr, g.inst, nullptr);
+        SetWindowLongPtrW(g_fv.splitter, GWLP_USERDATA, 1);  // the folder view's divider
+        setupFvBar();
+        fvTheme();
+    }
+    g_fv.on = !g_fv.on;
+    if (g_fv.on) {
+        std::wstring folder = parentFolder(g.d->path);
+        if (folder.empty()) {
+            wchar_t home[MAX_PATH];
+            if (GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH)) folder = home;
+        }
+        if (g_fv.root.empty() || !(g.d->path.empty() || isUnder(g.d->path, g_fv.root))) fvSetRoot(folder);
+        fvReveal(g.d->path);
+    }
+    layoutFrame();
+    SetFocus(g_fv.on ? g_fv.tree : g.view);
+    if (IsWindowVisible(g.frame)) saveSettings();  // not while starting up (the window is not placed yet)
+}
+
+// The folder of the file in front ("" for Untitled).
+std::wstring fileFolder() {
+    if (g.d->path.empty()) return L"";
+    size_t k = g.d->path.find_last_of(L"\\/");
+    return k == std::wstring::npos ? std::wstring() : g.d->path.substr(0, k);
+}
+
+// The terminal follows the file in front: it goes to that file's folder.
+// (and so does the folder view).
+void termFollowFile() {
+    if (g.term && g.termOn) termCd(fileFolder());
+    if (g_fv.on && !g_fv.revealing && !g_fv.searching) fvReveal(g.d->path);
+}
+
+// Ctrl+`: shows the terminal (starting PowerShell in the current file's
+// folder the first time), goes to it, or hides it when it already has focus.
+void toggleTerminal() {
+    if (!g.term) {
+        g.term = termCreate(g.frame, g.inst);
+        termSetStyle(g.font, g.uiFont, g.cw, g.ch, MulDiv(5, g.dpi, 96), g.pal);
+    }
+    if (g.termOn && GetFocus() != g.term) {
+        termFollowFile();
+        SetFocus(g.term);
+        return;
+    }
+    g.termOn = !g.termOn;
+    layoutFrame();
+    if (g.termOn) {
+        std::wstring folder = fileFolder();
+        if (folder.empty()) {
+            wchar_t home[MAX_PATH];
+            if (GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH)) folder = home;
+        }
+        if (termRunning()) termFollowFile();
+        else termStart(folder);
+        SetFocus(g.term);
+    } else {
+        SetFocus(g.view);
+    }
+    refresh(false);
 }
 
 void onCommand(int id) {
@@ -8328,6 +9155,16 @@ void onCommand(int id) {
     case IDM_VCS_HISTORY: cmdHistory(); break;
     case IDM_ABOUT: DialogBoxParamW(g.inst, MAKEINTRESOURCEW(IDD_ABOUT), g.frame, aboutProc, 0); break;
     case IDM_PRINT: cmdPrint(); break;
+    case IDM_TERMINAL: toggleTerminal(); break;
+    case IDM_FOLDERVIEW: toggleFolderView(); break;
+    case IDM_TERMINAL_FOCUS:  // F5: open the terminal, or go to it; never hides it
+        if (g.termOn && g.term) {
+            termFollowFile();
+            SetFocus(g.term);
+        } else {
+            toggleTerminal();
+        }
+        break;
     case IDM_RECENTCLEAR:
         g.recent.clear();
         saveRecent();
@@ -8395,6 +9232,8 @@ void updateMenu() {
     for (int k = 0; k < 3; k++)
         CheckMenuItem(g.menu, IDM_THEME_SYSTEM + k, MF_BYCOMMAND | (g.themeMode == k ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(g.menu, IDM_SHOWWS, MF_BYCOMMAND | (g.showWs ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(g.menu, IDM_TERMINAL, MF_BYCOMMAND | (g.termOn ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(g.menu, IDM_FOLDERVIEW, MF_BYCOMMAND | (g_fv.on ? MF_CHECKED : MF_UNCHECKED));
     checkEncodingItems(g.menu);
 }
 
@@ -8477,6 +9316,7 @@ void onKeyDown(WPARAM vk) {
         break;
     case VK_ESCAPE:
         if (findBarOpen()) closeFindBar();
+        else if (g.termOn) PostMessageW(g.frame, WM_APP_TERM, TERM_CLOSE, 0);
         break;
     case VK_INSERT:
         if (ctrl) doCopy();
@@ -8735,11 +9575,376 @@ LRESULT CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// ====================================================================== title bar
+//
+// Our own, as in Visual Studio: icon, the menus, the file name and the window
+// buttons in one strip at the top. Windows still provides the frame (resize
+// borders, shadow, snapping): WM_NCCALCSIZE gives the caption area to the
+// client, and WM_NCHITTEST tells Windows which parts of it act as caption,
+// buttons or resize edge.
+
+int titleH() { return MulDiv(32, g.dpi, 96); }
+
+int frameBorder(HWND hwnd) {
+    const UINT dpi = GetDpiForWindow(hwnd);
+    return GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+}
+
+struct TitleBar {
+    std::vector<RECT> menus;  // top-level menu names
+    RECT icon{}, minB{}, maxB{}, closeB{};
+    int menuHover = -1, menuOpen = -1, menuNext = -1;
+    bool menuInTop = true, menuSelPopup = false, menuKeys = false;
+    int capHot = 0, capPress = 0;  // HTMINBUTTON / HTMAXBUTTON / HTCLOSE
+    bool active = true;
+    HICON smallIcon = nullptr;
+    int iconDpi = 0;
+};
+TitleBar g_tb;
+
+std::wstring menuName(int i) {
+    wchar_t b[64] = {};
+    GetMenuStringW(g.menu, (UINT)i, b, 64, MF_BYPOSITION);
+    return b;
+}
+
+void layoutTitle() {
+    RECT rc;
+    GetClientRect(g.frame, &rc);
+    const int H = titleH(), bw = MulDiv(46, g.dpi, 96), pad = MulDiv(9, g.dpi, 96);
+    g_tb.closeB = {rc.right - bw, 0, rc.right, H};
+    g_tb.maxB = {rc.right - 2 * bw, 0, rc.right - bw, H};
+    g_tb.minB = {rc.right - 3 * bw, 0, rc.right - 2 * bw, H};
+    g_tb.icon = {0, 0, H + MulDiv(4, g.dpi, 96), H};
+    const int n = g.menu ? GetMenuItemCount(g.menu) : 0;
+    g_tb.menus.assign((size_t)std::max(0, n), RECT{});
+    HDC dc = GetDC(g.frame);
+    HGDIOBJ of = SelectObject(dc, g.uiFont);
+    int x = g_tb.icon.right;
+    for (int i = 0; i < n; i++) {
+        std::wstring t = menuName(i);
+        RECT m = {0, 0, 0, 0};
+        DrawTextW(dc, t.c_str(), (int)t.size(), &m, DT_CALCRECT | DT_SINGLELINE);
+        const int w = m.right + 2 * pad;
+        g_tb.menus[(size_t)i] = {x, 0, x + w, H};
+        x += w;
+    }
+    SelectObject(dc, of);
+    ReleaseDC(g.frame, dc);
+}
+
+int menuAt(POINT pt) {
+    for (size_t i = 0; i < g_tb.menus.size(); i++)
+        if (PtInRect(&g_tb.menus[i], pt)) return (int)i;
+    return -1;
+}
+
+void invalidateTitle() {
+    if (!g.frame) return;
+    RECT r = {0, 0, 32767, titleH()};
+    InvalidateRect(g.frame, &r, FALSE);
+}
+
+void line(HDC dc, int x0, int y0, int x1, int y1) {
+    MoveToEx(dc, x0, y0, nullptr);
+    LineTo(dc, x1, y1);
+}
+
+void paintTitle(HDC dc) {
+    layoutTitle();
+    RECT rc;
+    GetClientRect(g.frame, &rc);
+    const int H = titleH();
+    const COLORREF face = g.pal.face;
+    const COLORREF text = g_tb.active ? g.pal.faceText : blend(g.pal.faceText, face, 55);
+    fillRect(dc, 0, 0, rc.right, H, face);
+
+    // The app's icon.
+    if (!g_tb.smallIcon || g_tb.iconDpi != g.dpi) {
+        if (g_tb.smallIcon) DestroyIcon(g_tb.smallIcon);
+        const int sz = MulDiv(16, g.dpi, 96);
+        g_tb.smallIcon = nullptr;
+        LoadIconWithScaleDown(g.inst, MAKEINTRESOURCEW(IDI_APP), sz, sz, &g_tb.smallIcon);
+        g_tb.iconDpi = g.dpi;
+    }
+    if (g_tb.smallIcon) {
+        const int sz = MulDiv(16, g.dpi, 96);
+        DrawIconEx(dc, (g_tb.icon.right - sz) / 2, (H - sz) / 2, g_tb.smallIcon, sz, sz, 0, nullptr, DI_NORMAL);
+    }
+
+    // Menus.
+    HGDIOBJ of = SelectObject(dc, g.uiFont);
+    SetBkMode(dc, TRANSPARENT);
+    for (size_t i = 0; i < g_tb.menus.size(); i++) {
+        RECT r = g_tb.menus[i];
+        const bool open = (int)i == g_tb.menuOpen, hot = (int)i == g_tb.menuHover;
+        if (open || hot) fillRect(dc, r.left, r.top + MulDiv(4, g.dpi, 96), r.right, r.bottom - MulDiv(4, g.dpi, 96), g.pal.hot);
+        SetTextColor(dc, open || hot ? g.pal.faceText : text);
+        std::wstring t = menuName((int)i);
+        DrawTextW(dc, t.c_str(), (int)t.size(), &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | (g_tb.menuKeys ? 0 : DT_HIDEPREFIX));
+    }
+
+    // File name and app, centred on the window if there is room.
+    {
+        const int pad = MulDiv(16, g.dpi, 96);
+        const int l = (g_tb.menus.empty() ? g_tb.icon.right : g_tb.menus.back().right) + pad, r = g_tb.minB.left - pad;
+        if (r > l) {
+            SIZE sz = {};
+            GetTextExtentPoint32W(dc, g.title.c_str(), (int)g.title.size(), &sz);
+            int x = (int)(rc.right - sz.cx) / 2;
+            x = std::clamp(x, l, std::max(l, r - (int)sz.cx));
+            RECT tr = {x, 0, r, H};
+            SetTextColor(dc, blend(text, face, 75));
+            DrawTextW(dc, g.title.c_str(), (int)g.title.size(), &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
+    }
+
+    // Window buttons: minimise, maximise / restore, close.
+    const int g1 = std::max(1, MulDiv(1, g.dpi, 96)), gs = MulDiv(10, g.dpi, 96);
+    auto button = [&](const RECT& r, int code) {
+        const bool hot = g_tb.capHot == code, down = hot && g_tb.capPress == code;
+        COLORREF bg = face, fg = text;
+        if (code == HTCLOSE && hot) {
+            bg = down ? RGB(241, 112, 122) : RGB(232, 17, 35);
+            fg = RGB(255, 255, 255);
+        } else if (hot) {
+            bg = down ? blend(g.pal.hot, g.pal.faceText, 80) : g.pal.hot;
+        }
+        fillRect(dc, r.left, r.top, r.right, r.bottom, bg);
+        HPEN pen = CreatePen(PS_SOLID, g1, fg);
+        HGDIOBJ op = SelectObject(dc, pen);
+        HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        const int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2, x0 = cx - gs / 2, y0 = cy - gs / 2;
+        if (code == HTMINBUTTON) {
+            line(dc, x0, cy, x0 + gs, cy);
+        } else if (code == HTMAXBUTTON) {
+            if (IsZoomed(g.frame)) {  // restore: two squares
+                const int k = MulDiv(2, g.dpi, 96);
+                Rectangle(dc, x0, y0 + k, x0 + gs - k, y0 + gs);
+                line(dc, x0 + k, y0 + k, x0 + k, y0);
+                line(dc, x0 + k, y0, x0 + gs, y0);
+                line(dc, x0 + gs - g1, y0, x0 + gs - g1, y0 + gs - k);
+                line(dc, x0 + gs - g1, y0 + gs - k, x0 + gs - k, y0 + gs - k);
+            } else {
+                Rectangle(dc, x0, y0, x0 + gs, y0 + gs);
+            }
+        } else {
+            line(dc, x0, y0, x0 + gs + 1, y0 + gs + 1);
+            line(dc, x0 + gs, y0, x0 - 1, y0 + gs + 1);
+        }
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(pen);
+    };
+    button(g_tb.minB, HTMINBUTTON);
+    button(g_tb.maxB, HTMAXBUTTON);
+    button(g_tb.closeB, HTCLOSE);
+    SelectObject(dc, of);
+}
+
+// ---- menus dropping down from the title bar
+
+HHOOK g_menuHook = nullptr;
+
+LRESULT CALLBACK menuHookProc(int code, WPARAM wp, LPARAM lp) {
+    if (code == MSGF_MENU) {
+        MSG* m = (MSG*)lp;
+        const int n = (int)g_tb.menus.size();
+        if (m->message == WM_KEYDOWN && n > 0) {
+            // Left / right on the first level move to the next menu, as in a menu bar.
+            if (m->wParam == VK_LEFT && g_tb.menuInTop) {
+                g_tb.menuNext = (g_tb.menuOpen + n - 1) % n;
+                EndMenu();
+                return TRUE;
+            }
+            if (m->wParam == VK_RIGHT && g_tb.menuInTop && !g_tb.menuSelPopup) {
+                g_tb.menuNext = (g_tb.menuOpen + 1) % n;
+                EndMenu();
+                return TRUE;
+            }
+        } else if (m->message == WM_MOUSEMOVE || m->message == WM_LBUTTONDOWN) {
+            POINT pt = m->pt;
+            ScreenToClient(g.frame, &pt);
+            const int j = menuAt(pt);
+            if (m->message == WM_MOUSEMOVE && j >= 0 && j != g_tb.menuOpen) {  // slide to another menu
+                g_tb.menuNext = j;
+                g_tb.menuKeys = false;
+                EndMenu();
+                return TRUE;
+            }
+            if (m->message == WM_LBUTTONDOWN && j == g_tb.menuOpen) {  // its own name again: close it
+                g_tb.menuNext = -1;
+                EndMenu();
+                return TRUE;
+            }
+        }
+    }
+    return CallNextHookEx(g_menuHook, code, wp, lp);
+}
+
+void openMenu(int i, bool keyboard) {
+    if (!g.menu) return;
+    const int n = GetMenuItemCount(g.menu);
+    g_tb.menuKeys = keyboard;
+    while (i >= 0 && i < n && i < (int)g_tb.menus.size()) {
+        g_tb.menuOpen = i;
+        g_tb.menuNext = -1;
+        g_tb.menuInTop = true;
+        g_tb.menuSelPopup = false;
+        g_tb.menuHover = -1;
+        invalidateTitle();
+        UpdateWindow(g.frame);
+        RECT r = g_tb.menus[(size_t)i];
+        MapWindowPoints(g.frame, nullptr, (POINT*)&r, 2);
+        TPMPARAMS tp = {sizeof(tp)};
+        tp.rcExclude = r;
+        if (g_tb.menuKeys) PostMessageW(g.frame, WM_KEYDOWN, VK_DOWN, 0);  // first item selected
+        g_menuHook = SetWindowsHookExW(WH_MSGFILTER, menuHookProc, nullptr, GetCurrentThreadId());
+        TrackPopupMenuEx(GetSubMenu(g.menu, i), TPM_LEFTALIGN | TPM_TOPALIGN | TPM_VERTICAL, r.left, r.bottom, g.frame, &tp);
+        if (g_menuHook) UnhookWindowsHookEx(g_menuHook);
+        g_menuHook = nullptr;
+        i = g_tb.menuNext;
+    }
+    g_tb.menuOpen = -1;
+    g_tb.menuKeys = false;
+    invalidateTitle();
+}
+
+// Alt+letter: the menu with that underlined letter. Alt alone or F10: the first.
+bool openMenuByKey(wchar_t ch) {
+    if (!ch) {
+        openMenu(0, true);
+        return true;
+    }
+    for (size_t i = 0; i < g_tb.menus.size(); i++) {
+        std::wstring t = menuName((int)i);
+        size_t k = t.find(L'&');
+        if (k != std::wstring::npos && k + 1 < t.size() && towlower(t[k + 1]) == towlower(ch)) {
+            openMenu((int)i, true);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Frame messages for the title bar; true when handled.
+bool titleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT& out) {
+    if (!g.frame && msg != WM_NCCALCSIZE) return false;  // still being created
+    switch (msg) {
+    case WM_NCCALCSIZE:
+        if (wp) {
+            // The client area takes the caption; the other three borders stay
+            // for resizing. Maximised, Windows puts the border off screen.
+            RECT& r = ((NCCALCSIZE_PARAMS*)lp)->rgrc[0];
+            const int b = frameBorder(hwnd);
+            r.left += b;
+            r.right -= b;
+            r.bottom -= b;
+            if (IsZoomed(hwnd)) r.top += b;
+            out = 0;
+            return true;
+        }
+        return false;
+    case WM_NCACTIVATE:
+        g_tb.active = wp != 0;
+        invalidateTitle();
+        out = DefWindowProcW(hwnd, msg, wp, -1);  // -1: do not repaint the (hidden) caption
+        return true;
+    case WM_NCHITTEST: {
+        LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
+        if (hit != HTCLIENT) {
+            out = hit;
+            return true;
+        }
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd, &pt);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        const int b = frameBorder(hwnd);
+        if (!IsZoomed(hwnd) && pt.y < b) {
+            out = pt.x < 2 * b ? HTTOPLEFT : pt.x >= rc.right - 2 * b ? HTTOPRIGHT : HTTOP;
+            return true;
+        }
+        if (pt.y >= titleH()) {
+            out = HTCLIENT;
+            return true;
+        }
+        layoutTitle();
+        if (PtInRect(&g_tb.closeB, pt)) out = HTCLOSE;
+        else if (PtInRect(&g_tb.maxB, pt)) out = HTMAXBUTTON;  // also brings up Snap layouts on Windows 11
+        else if (PtInRect(&g_tb.minB, pt)) out = HTMINBUTTON;
+        else if (PtInRect(&g_tb.icon, pt)) out = HTSYSMENU;
+        else if (menuAt(pt) >= 0) out = HTCLIENT;
+        else out = HTCAPTION;
+        return true;
+    }
+    case WM_NCMOUSEMOVE: {
+        const int hot = wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE ? (int)wp : 0;
+        if (hot != g_tb.capHot || g_tb.menuHover >= 0) {
+            g_tb.capHot = hot;
+            g_tb.menuHover = -1;
+            invalidateTitle();
+        }
+        TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE | TME_NONCLIENT, hwnd, 0};
+        TrackMouseEvent(&tme);
+        if (!hot) return false;
+        out = 0;
+        return true;
+    }
+    case WM_NCMOUSELEAVE:
+        if (g_tb.capHot || g_tb.capPress) {
+            g_tb.capHot = g_tb.capPress = 0;
+            invalidateTitle();
+        }
+        return false;
+    case WM_NCLBUTTONDOWN:
+    case WM_NCLBUTTONDBLCLK:
+        if (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) {
+            g_tb.capPress = (int)wp;
+            invalidateTitle();
+            out = 0;
+            return true;
+        }
+        return false;
+    case WM_NCLBUTTONUP:
+        if (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) {
+            const int pressed = g_tb.capPress;
+            g_tb.capPress = 0;
+            invalidateTitle();
+            if (pressed == (int)wp) {
+                const WPARAM cmd = wp == HTCLOSE ? SC_CLOSE : wp == HTMINBUTTON ? SC_MINIMIZE : IsZoomed(hwnd) ? SC_RESTORE : SC_MAXIMIZE;
+                PostMessageW(hwnd, WM_SYSCOMMAND, cmd, 0);
+            }
+            out = 0;
+            return true;
+        }
+        return false;
+    case WM_MENUSELECT:
+        if (g_tb.menuOpen >= 0) {
+            g_tb.menuInTop = (HMENU)lp == GetSubMenu(g.menu, g_tb.menuOpen);
+            g_tb.menuSelPopup = (HIWORD(wp) & MF_POPUP) != 0;
+        }
+        return false;
+    case WM_SYSCOMMAND:
+        if ((wp & 0xFFF0) == SC_KEYMENU && lp != ' ') {
+            if (!openMenuByKey((wchar_t)lp)) MessageBeep(0);
+            out = 0;
+            return true;
+        }
+        return false;
+    case WM_SIZE:
+        invalidateTitle();  // the maximise button's shape, the centred title
+        return false;
+    }
+    return false;
+}
+
 // ====================================================================== frame window
 
 LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    LRESULT themed = 0;
-    if (themeMenuBarMessage(hwnd, msg, wp, lp, &themed, g.pal)) return themed;
+    LRESULT handled = 0;
+    if (shellMenuMessage(msg, wp, lp, handled)) return handled;
+    if (titleMessage(hwnd, msg, wp, lp, handled)) return handled;
     if (msg == WM_MEASUREITEM && wp == 0) {
         themeMeasureMenuItem(hwnd, (MEASUREITEMSTRUCT*)lp, g.uiFont);
         return TRUE;
@@ -8826,6 +10031,15 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             UpdateWindow(hwnd);
             return 0;
         }
+        // Menu names in the title bar light up under the mouse.
+        const int mh = pt.y < titleH() ? menuAt(pt) : -1;
+        if (mh != g_tb.menuHover || g_tb.capHot) {
+            g_tb.menuHover = mh;
+            g_tb.capHot = 0;
+            invalidateTitle();
+            TRACKMOUSEEVENT tm = {sizeof(tm), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&tm);
+        }
         bool onX = false;
         int i = tabAt(pt, &onX);
         int x = onX ? i : -1;
@@ -8834,7 +10048,7 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.tabHover = i;
             g.tabCloseHover = x;
             g.navHover = nav;
-            RECT r = {0, 0, 32767, tabBarH() + headerH()};
+            RECT r = {0, 0, 32767, titleH() + tabBarH() + headerH()};
             InvalidateRect(hwnd, &r, FALSE);
             TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
             TrackMouseEvent(&tme);
@@ -8842,17 +10056,26 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSELEAVE:
+        if (g_tb.menuHover >= 0) {
+            g_tb.menuHover = -1;
+            invalidateTitle();
+        }
         if (GetCapture() == hwnd) return 0;
         if (g.tabHover >= 0 || g.navHover) {
             g.tabHover = g.tabCloseHover = -1;
             g.navHover = 0;
-            RECT r = {0, 0, 32767, tabBarH() + headerH()};
+            RECT r = {0, 0, 32767, titleH() + tabBarH() + headerH()};
             InvalidateRect(hwnd, &r, FALSE);
         }
         return 0;
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (pt.y < titleH()) {
+            const int j = menuAt(pt);
+            if (j >= 0 && msg == WM_LBUTTONDOWN) openMenu(j, false);
+            return 0;
+        }
         if (PtInRect(&g.sideSplitRect, pt)) {
             if (msg == WM_LBUTTONDBLCLK) {  // double click: back to the usual width
                 g.sideSplit = 0.42;
@@ -8887,7 +10110,7 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         SetCapture(hwnd);
-        RECT r = {0, 0, 32767, tabBarH() + headerH()};
+        RECT r = {0, 0, 32767, titleH() + tabBarH() + headerH()};
         InvalidateRect(hwnd, &r, FALSE);
         return 0;
     }
@@ -8911,7 +10134,7 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (nav == 1 && PtInRect(&g.navPrev, pt)) gotoChange(false);
         else if (nav == 2 && PtInRect(&g.navNext, pt)) gotoChange(true);
         SetFocus(g.view);
-        RECT r = {0, 0, 32767, tabBarH() + headerH()};
+        RECT r = {0, 0, 32767, titleH() + tabBarH() + headerH()};
         InvalidateRect(hwnd, &r, FALSE);
         return 0;
     }
@@ -8920,7 +10143,7 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g.tabClosePress >= 0 || g.navPress) {
             g.tabClosePress = -1;
             g.navPress = 0;
-            RECT r = {0, 0, 32767, tabBarH() + headerH()};
+            RECT r = {0, 0, 32767, titleH() + tabBarH() + headerH()};
             InvalidateRect(hwnd, &r, FALSE);
         }
         return 0;
@@ -8957,9 +10180,28 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return TRUE;
     case WM_NOTIFY:
         if (((NMHDR*)lp)->hwndFrom == g.sideTree) return onTreeNotify((NMHDR*)lp);
+        if (g_fv.tree && ((NMHDR*)lp)->hwndFrom == g_fv.tree) return onFolderNotify((NMHDR*)lp);
         return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_APP_P4ASK: onP4Ask(); return 0;
     case WM_APP_DISKCHECK: checkDisk(IsWindowEnabled(hwnd) != 0); return 0;
+    case WM_APP_FOLDER: fvActivate((size_t)wp, lp != 0); return 0;
+    case WM_APP_FVINDEX: fvIndexReady((FileIndex*)lp); return 0;
+    case WM_APP_TERM:
+        if (wp == TERM_CLOSE || wp == TERM_TOGGLE) {
+            if (g.termOn) {
+                g.termOn = false;
+                layoutFrame();
+                SetFocus(g.view);
+                refresh(false);
+            }
+        } else if (wp == TERM_RESIZE) {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            if (rc.bottom > 0) g.termSplit = std::clamp((double)(int)lp / rc.bottom, 0.08, 0.85);
+            layoutFrame();
+            UpdateWindow(hwnd);
+        }
+        return 0;
     case WM_ACTIVATEAPP:
         if (wp) PostMessageW(hwnd, WM_APP_DISKCHECK, 0, 0);
         return 0;
@@ -8988,6 +10230,15 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             autosaveSession();
             return 0;
         }
+        if (wp == kTimerFvProgress) {
+            if (g_fv.searching && !indexCovers(g_fvIndex.get(), g_fv.root)) fvFilter();  // the count so far
+            return 0;
+        }
+        if (wp == kTimerFvSearch) {
+            KillTimer(hwnd, kTimerFvSearch);
+            fvStartSearch();
+            return 0;
+        }
         if (wp == kTimerDisk) {
             // Unsaved edits are only asked about while this window is in front.
             checkDisk(GetForegroundWindow() == hwnd && IsWindowEnabled(hwnd));
@@ -9004,7 +10255,7 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g.diffOn) {
                 InvalidateRect(g.diffPane, nullptr, FALSE);
                 InvalidateRect(g.strip, nullptr, FALSE);
-                RECT hd = {0, 0, 32767, tabBarH() + headerH()};
+                RECT hd = {0, 0, 32767, titleH() + tabBarH() + headerH()};
                 InvalidateRect(hwnd, &hd, FALSE);
             }
             updateStatus();
@@ -9021,6 +10272,7 @@ LRESULT CALLBACK frameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g.themeMode == 0 && lp && lstrcmpiW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) applyTheme();
         return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_DESTROY:
+        termShutdown();
         for (auto& t : g.tabs) t->index.reset();
         PostQuitMessage(0);
         return 0;
@@ -9141,6 +10393,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     dcl.style = CS_DBLCLKS;
     RegisterClassExW(&dcl);
 
+    OleInitialize(nullptr);  // the shell's context menus need COM on this thread
     g.menu = buildMenu();
     themeOwnerDrawMenu(g.menu);
     markEncodingRadios(g.menu);
@@ -9159,7 +10412,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         if (!MonitorFromRect(&probe, MONITOR_DEFAULTTONULL)) x = y = CW_USEDEFAULT;
     }
     CreateWindowExW(WS_EX_ACCEPTFILES, kFrameClass, kAppName, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y, w, h,
-                    nullptr, g.menu, inst, nullptr);
+                    nullptr, nullptr, inst, nullptr);  // the menus live in our title bar
     if (!g.frame || !g.view) return 1;
 
     // Load the document before the window is shown, so the first frame the
@@ -9172,6 +10425,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         if (__wargv[i][0]) openInTab(__wargv[i]);
 
     applyTheme();
+    if (g_fvStartOn) toggleFolderView();
     g_lastSessionStamp = sessionStamp();
     SetTimer(g.frame, kTimerSession, 5000, nullptr);
     ShowWindow(g.frame, (g_savedMax && show == SW_SHOWNORMAL) ? SW_SHOWMAXIMIZED : show);
@@ -9186,6 +10440,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         if (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN || msg.message == WM_CHAR) {
             wchar_t cls[8] = L"";
             HWND f = GetFocus();
+            // The terminal takes every key (Ctrl+C, Ctrl+V, Tab ... belong to the shell).
+            if (f && f == g.term) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+                continue;
+            }
             if (f && GetClassNameW(f, cls, 8) && lstrcmpiW(cls, L"Edit") == 0) {
                 const bool ctrl = GetKeyState(VK_CONTROL) < 0;
                 const bool findKey = msg.message == WM_KEYDOWN &&
